@@ -1,0 +1,287 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI gate for the Interactive VLM Feedback Loop Blueprint. See
+# docs/Engineering_Spec.md Appendix B "CI / pre-commit pipeline"
+# for acceptance items.
+#
+# Jobs run in parallel: six core jobs (lint + tests + typecheck for
+# the backend; lint + tests + build for the frontend — mirrored
+# locally by scripts/ci-local.sh), plus dependency-audit (pip-audit +
+# pnpm audit backstop) and compose-smoke (containerized-mode build +
+# health check — the delivery mode the core jobs never exercise).
+# Total wall-clock target: under 10 minutes; compose-smoke may run
+# longer on a cold image cache (its own timeout caps it). Mirrors the
+# Retail Blueprint CI shape
+# (Retail-Agentic-Commerce/.github/workflows/ci.yml).
+#
+# Integration tests are intentionally not in this CI scope: they require live
+# services, credentials, or Docker and are run by the separately scheduled
+# live-validation harness.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  backend-lint:
+    name: Backend lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dev dependencies
+        run: uv sync --frozen
+
+      - name: Ruff check
+        run: uv run ruff check .
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      # AGENTS.md and CLAUDE.md are deliberate identical twins; their
+      # headers require the diff to stay empty. Enforce it.
+      - name: Agent instruction files are identical
+        run: diff AGENTS.md CLAUDE.md
+
+  backend-tests:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # Exercise the requires-python claim (>=3.11,<3.14) instead of
+      # asserting it while testing only one interpreter.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    env:
+      # Pin uv's interpreter choice to the matrix entry for both the sync
+      # and every `uv run` step.
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dev dependencies
+        run: uv sync --frozen
+
+      # Coverage gate: [tool.coverage.report] fail_under in pyproject.toml
+      # fires on this run. The coverage.xml artifact is CI-local — the
+      # SonarQube workflow's org template runs its own pytest+coverage
+      # pass and does not consume this file.
+      - name: Run backend unit tests (with coverage gate)
+        run: >
+          uv run pytest tests/unit/ -q --maxfail=5
+          --cov=src/backend/vlm_feedback_loop
+          --cov-report=term --cov-report=xml
+
+  frontend-lint:
+    name: Frontend lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: src/ui/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: src/ui
+
+      - name: ESLint
+        run: pnpm exec eslint .
+        working-directory: src/ui
+
+      - name: Prettier check
+        run: pnpm run format:check
+        working-directory: src/ui
+
+      - name: TypeScript typecheck
+        run: pnpm run typecheck
+        working-directory: src/ui
+
+  frontend-tests:
+    name: Frontend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: src/ui/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: src/ui
+
+      - name: Run frontend unit tests
+        run: pnpm test
+        working-directory: src/ui
+
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: src/ui/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: src/ui
+
+      - name: Build frontend
+        run: pnpm build
+        working-directory: src/ui
+
+  backend-typecheck:
+    # Pyright strict mode on src/backend/. Mirrors the only Blueprint
+    # precedent (Retail-Agentic-Commerce).
+    name: Backend typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dev dependencies
+        run: uv sync --frozen
+
+      - name: Run pyright
+        run: uv run pyright src/backend/
+
+  dependency-audit:
+    # Advisory backstop for public forks/mirrors: the org-level SonarQube
+    # scan (sonarqube.yml) only runs inside the NVIDIA-AI-Blueprints org,
+    # so this job keeps known-CVE checking alive everywhere else too.
+    # Audits the LOCKED dependency sets — no resolution, no installs.
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: pip-audit (locked backend dependencies)
+        run: |
+          uv export --frozen --no-hashes --no-emit-project \
+            --format requirements-txt > /tmp/requirements-audit.txt
+          uvx pip-audit -r /tmp/requirements-audit.txt --no-deps
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: pnpm audit (production dependencies, high severity and up)
+        run: pnpm audit --prod --audit-level high
+        working-directory: src/ui
+
+  compose-smoke:
+    # The containerized delivery mode is a first-class product surface
+    # (CLAUDE.md: both modes must stay healthy) but none of the core jobs
+    # builds an image — a fully broken `docker compose up --build` once
+    # shipped with every check green (commit 219b289). Build the stack,
+    # bring it up, and require a healthy edge.
+    name: Compose smoke (containerized mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images (compose)
+        run: docker compose build
+
+      - name: Bring up the stack
+        run: docker compose up -d --no-build
+
+      - name: Wait for a healthy edge
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:3000/health >/dev/null 2>&1; then
+              echo "edge healthy after ${i} polls"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "edge never became healthy; container state:"
+          docker compose ps
+          docker compose logs --tail 100
+          exit 1
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

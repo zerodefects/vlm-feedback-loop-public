@@ -1,0 +1,31 @@
+# Frontend build context excludes — keeps image builds reproducible and fast.
+
+node_modules
+dist
+coverage
+.turbo
+.vite
+.eslintcache
+
+# Tests aren't needed for the production bundle
+**/__tests__
+**/*.test.ts
+**/*.test.tsx
+**/*.spec.ts
+**/*.spec.tsx
+
+# Editor and OS cruft
+.DS_Store
+.vscode
+.idea
+.cursor
+.claude
+
+# Env files must come from the deployment, not the image
+.env
+.env.*
+!.env.example
+
+# Misc
+*.log
+*.tmp

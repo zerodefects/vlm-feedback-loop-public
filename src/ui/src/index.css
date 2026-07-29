@@ -1,0 +1,657 @@
+@import "tailwindcss/theme.css";
+@import "tailwindcss/preflight.css";
+@import "tailwindcss/utilities.css";
+@import "@kui/react/base.css";
+@import "./components/nebula/dist/styles.css";
+
+/* Apply KUI theme background and text to html and body.
+ *
+ * NOTE on the color token: KUI's `--text-color-default` is unset on the
+ * nv-dark theme in this bundled release, so referencing it silently
+ * falls through to the user-agent default (rgb(0,0,0)), which renders
+ * as near-invisible black-on-dark for any `<Text>` element that does
+ * not set its own color. The app's own `--text-primary` token is
+ * correctly defined as rgba(255,255,255,0.92), so the default body
+ * color points at it directly — this is the single source of truth for
+ * inherited text color across every screen. */
+html,
+body {
+  background-color: #0c0c0c;
+  color: var(--text-primary);
+  min-height: 100vh;
+}
+
+/* Force Nebula to take full height (from Retail Agentic Commerce) */
+[data-testid="nv-nebula"] {
+  width: 100% !important;
+  height: 100% !important;
+  min-height: 100% !important;
+}
+
+[data-testid="nv-nebula"] canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Smooth scrolling (shared Retail Blueprint pattern) */
+html {
+  scroll-behavior: smooth;
+}
+
+/* ============================================
+   Custom Design Tokens
+   ============================================
+   Extend KUI's theme with app-specific values.
+   Matches Retail Agentic Commerce globals.css.
+*/
+:root {
+  /* Glassmorphic Panel Design — values from Agentic Commerce */
+  --glass-bg: linear-gradient(180deg, rgba(12, 12, 12, 0.75), rgba(12, 12, 12, 0.65));
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-border-subtle: rgba(255, 255, 255, 0.08);
+  --glass-shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+  --glass-radius: 18px;
+  --glass-radius-sm: 14px;
+
+  /* Accent Colors — NVIDIA Green */
+  --accent-green: #76b900;
+  --accent-green-glow: rgba(118, 185, 0, 0.15);
+  --accent-green-border: rgba(118, 185, 0, 0.35);
+  --accent-green-bg: rgba(118, 185, 0, 0.12);
+  --accent-green-subtle: rgba(118, 185, 0, 0.08);
+
+  /* Secondary Accent — Amber/Yellow (from Agentic Commerce) */
+  --accent-yellow: #ffd36b;
+  --accent-yellow-border: rgba(255, 211, 107, 0.3);
+  --accent-yellow-bg: rgba(255, 211, 107, 0.1);
+
+  /* Error / Warning.
+   *
+   * --error-red aligns with KUI Foundations --color-red-500 (#e52020), the
+   * same value --text-color-feedback-danger resolves to in both Retail
+   * Blueprints (Agentic Commerce + Catalog Enrichment). Keeping our
+   * destructive chromaticity on the same KUI scale means the three
+   * KUI-based apps render identical "failure" color side-by-side.
+   * rgb(229, 32, 32) is the canonical hex; the -bg and -border tokens are
+   * alpha composites.
+   *
+   * Fill vs text split: --error-red is a FILL/BORDER color only — as small
+   * text on the red-tinted --error-red-bg it measures ~3.7:1, below the
+   * WCAG AA 4.5:1 floor. All error TEXT (banner headings, .text-error,
+   * failed pills) uses --error-red-text, a lighter red that clears AA on
+   * both the plain dark surface and the -bg tint. */
+  --error-red: #e52020;
+  --error-red-bg: rgba(229, 32, 32, 0.15);
+  --error-red-border: rgba(229, 32, 32, 0.3);
+  --error-red-text: #ff6b6b;
+  --warning-amber: #f59e0b;
+
+  /* Text Colors — from Agentic Commerce */
+  --text-primary: rgba(255, 255, 255, 0.92);
+  --text-secondary: rgba(255, 255, 255, 0.82);
+  --text-muted: rgba(255, 255, 255, 0.62);
+  --text-faint: rgba(255, 255, 255, 0.4);
+
+  /* Block / Input backgrounds */
+  --block-bg: rgba(255, 255, 255, 0.045);
+  --block-bg-elevated: rgba(255, 255, 255, 0.06);
+  --block-bg-terminal: rgba(0, 0, 0, 0.3);
+  --bar-track: rgba(255, 255, 255, 0.18);
+
+  /* Shadows — from Agentic Commerce */
+  --shadow-card-hover:
+    0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+}
+
+/* ============================================
+   Glass Utility Classes
+   ============================================
+   Reusable CSS classes following the Retail
+   Agentic Commerce glassmorphic pattern.
+*/
+
+/* Glass card — the primary container (matches .glass-panel from Agentic Commerce) */
+.glass-card {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--glass-radius);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  box-shadow: var(--glass-shadow);
+  transition:
+    transform 200ms ease,
+    box-shadow 200ms ease;
+}
+
+.glass-card:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-card-hover);
+}
+
+/* Glass card — elevated variant. Lifted border, opaque fill, inner highlight
+   + drop shadow so the card reads as an anchored surface against the nebula
+   background (not a translucent overlay that blurs into it). Used by Project
+   List cards, NIM Connection service rows, and similar onboarding surfaces.
+   Neutralizes the base :hover transform so expanded non-clickable panels
+   don't twitch on mouseover.
+
+   Hover affordance follows interactivity, not elevation — pair either card
+   flavor with one of the modifiers below:
+     .glass-card--interactive  → opt back INTO the hover lift on clickable
+                                 cards (e.g. active Project List cards).
+     .glass-card--static       → opt OUT of the base hover lift on
+                                 non-clickable status cards (e.g. training
+                                 JobCard) so hover doesn't imply a click. */
+.glass-card--elevated {
+  border-color: rgba(255, 255, 255, 0.36);
+  background: rgba(26, 28, 26, 0.92);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.glass-card--elevated:hover {
+  transform: none;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.glass-card--interactive:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-card-hover);
+}
+/* Keeps the elevated inset highlight while deepening the drop shadow on lift. */
+.glass-card--elevated.glass-card--interactive:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    0 10px 28px rgba(0, 0, 0, 0.45);
+}
+.glass-card--static:hover {
+  transform: none;
+  box-shadow: var(--glass-shadow);
+}
+
+/* KUI modal backdrop — darken + blur so dialogs command focus.
+   KUI renders the overlay via Radix DialogOverlay with class
+   .nv-modal-overlay. The default theme token leaves it almost
+   transparent on this app's dark surface, which lets the dialog
+   blend into the background. Override with an explicit dimmed
+   overlay so Create Project / Project Lock / Edit Guidance
+   confirm dialogs pull focus. */
+.nv-modal-overlay {
+  background-color: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(10px) saturate(120%);
+  -webkit-backdrop-filter: blur(10px) saturate(120%);
+}
+
+/* KUI modal surface — glass-card treatment so dialogs share the app's
+   glassmorphic language. Mirrors .glass-card--elevated: lifted rgba border,
+   near-opaque dark fill, inset highlight + drop shadow. Applies globally to
+   every KUI <Modal> (CreateProjectDialog, ProjectLockDialog, EditGuidance
+   confirm, and any future modal) — single source of truth. Keeps KUI's
+   layout/padding tokens; overrides only surface treatment. */
+.nv-modal-content {
+  background-color: rgba(26, 28, 26, 0.92);
+  border-color: rgba(255, 255, 255, 0.36);
+  border-radius: var(--glass-radius);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    0 8px 24px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+}
+
+/* Form inputs inside KUI modals — give KUI's .nv-input base a translucent
+   fill that matches .glass-input so fields don't read as opaque black voids
+   against the glass surface above. Scoped to .nv-modal-content so it cannot
+   affect inputs outside modals (e.g. dense field builders). Keeps KUI
+   <FormField> + <TextInput> + <TextArea> wiring intact — this is the
+   "dialogs and settings" exception documented in CLAUDE.md. */
+.nv-modal-content .nv-input {
+  background-color: var(--block-bg-elevated);
+  border-color: var(--glass-border);
+}
+.nv-modal-content .nv-input:focus-within {
+  border-color: var(--accent-green-border);
+  box-shadow: 0 0 0 1px var(--accent-green-border);
+}
+/* Align modal placeholders with .glass-input::placeholder — KUI's own
+   placeholder token (--color-gray-300) renders brighter than --text-muted,
+   making example text read as a pre-filled value. The :not() clause ties
+   KUI's selector specificity so this rule wins by cascade order. */
+.nv-modal-content .nv-input:not(.nv-input--disabled) ::placeholder {
+  color: var(--text-faint);
+}
+
+/* KUI Select menu min-width — KUI sets `min-width: var(--popover-anchor-width)`
+   which truncates menu labels to the trigger width. Selects with `size="small"`
+   triggers (e.g., the SchemaCore field-type dropdown in the Create Guidance
+   field builder) end up rendering options as `E...`, `B...`, `St...`. Raise
+   the floor to 10rem so labels always render in full; wider-trigger Selects
+   keep their natural anchor-based width because we only raise the min, never
+   cap it. */
+.nv-select-content {
+  min-width: max(var(--popover-anchor-width), 10rem);
+}
+
+/* Glass input — text inputs, textareas, selects */
+.glass-input {
+  background: var(--block-bg-elevated);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md, 8px);
+  color: var(--text-primary);
+  transition:
+    border-color 200ms ease,
+    box-shadow 200ms ease;
+}
+
+.glass-input::placeholder {
+  color: var(--text-faint);
+}
+
+.glass-input:focus {
+  border-color: var(--accent-green-border);
+  outline: none;
+  box-shadow: 0 0 0 1px var(--accent-green-border);
+}
+
+/* Error state — opt-in via aria-invalid so proper a11y semantics drive the
+ * visual. Overrides the :focus green ring so a field that just failed a
+ * submit does not also read as affirmative-green. Used by the ingest path
+ * input when a 404/403 inline error is rendered below it. */
+.glass-input[aria-invalid="true"],
+.glass-input[aria-invalid="true"]:focus {
+  border-color: var(--error-red-border);
+  box-shadow: 0 0 0 1px var(--error-red-border);
+}
+
+/* Native checkboxes/radios inside a glass card pick up the NVIDIA-green
+   accent so their tick reads as Blueprint-native instead of the OS blue.
+   Scoped to the .glass-input class so it only affects controls we've
+   opted into (CLAUDE.md's "raw HTML + .glass-input" pattern). */
+.glass-input[type="checkbox"],
+.glass-input[type="radio"] {
+  accent-color: var(--accent-green);
+  background: transparent;
+  border: none;
+  width: 14px;
+  height: 14px;
+}
+
+/* Native <select> chrome: replace the OS caret with a Blueprint-themed
+   chevron so the control reads as Blueprint-native inside a glass card.
+   The SVG is inlined (no extra HTTP request) and coloured via
+   rgba(white) so it matches --text-secondary regardless of theme. */
+select.glass-input {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none' stroke='rgba(255,255,255,0.75)' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='3 5 6 8 9 5'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 12px;
+  padding-right: 32px;
+}
+
+/* Native <option> popover colors. The parent select inherits
+   --text-primary (near-white) from .glass-input, which the browser then
+   applies to options in the OS dropdown. The glass fill is translucent
+   and cannot paint the popover, so the OS picks a light default behind
+   the inherited light text — options become white-on-white. Force an
+   opaque dark fill + light text (matching .glass-card--elevated /
+   .nv-modal-content) so options stay readable in every OS/browser combo. */
+select.glass-input option {
+  background-color: rgb(26, 28, 26);
+  color: var(--text-primary);
+}
+
+/* Section eyebrow — tracked uppercase caption for content sections inside
+   glass cards. Mirrors the Retail Agentic dashboard pattern (REVENUE OVER TIME
+   / AGENT PERFORMANCE / PROMOTION IMPACT) and the Catalog "CONFIGURATION"
+   eyebrow. Used by ProposalForm and GuidanceCards (Core Fields / Aux Fields)
+   and ResultsPanel (ACCURACY COMPARISON / PER-FIELD MATCH RATES /
+   COVERAGE GAPS) so all in-card section captions read as eyebrows rather
+   than competing headings. Pair with KUI <Text kind="label/regular/xs">. */
+.section-eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+/* Glass info block — info banners, explainer strips. Carries the same
+   backdrop blur as .glass-card so starfield particles don't show through
+   the translucent fill as sharp stray glyphs. */
+.glass-info {
+  background: var(--block-bg);
+  border: 1px solid var(--glass-border-subtle);
+  border-radius: var(--glass-radius-sm);
+  color: var(--text-muted);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+}
+
+/* Glass callout — small value-prop / "why this matters" blocks. Used
+   above credential inputs in the NIM Configuration screen.
+   Lighter than .glass-info so the bordered-left
+   accent color does the visual lifting; the call site is expected to
+   set ``borderLeft`` inline with a semantic color (accent-green for
+   primary, text-muted for optional). */
+.glass-callout {
+  background: var(--block-bg);
+  border: 1px solid var(--glass-border-subtle);
+  color: var(--text-secondary);
+}
+
+/* Glass inner panel — nested/secondary card surface. Used when a block of
+   content (credential inputs, nested Action Request body, missing-prereqs
+   checklist) sits NEXT TO or INSIDE a .glass-card / .glass-card--elevated
+   and needs to read as a peer/child surface without competing with the
+   parent's elevation. Border is strong enough to delimit the block against
+   both the nebula background (when free-standing) and a dark opaque parent
+   card (when nested). Radius is left to the call site via Tailwind
+   rounded-* utilities. */
+.glass-inner-panel {
+  background: var(--block-bg-elevated);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: var(--text-primary);
+}
+
+/* Glass terminal block — code, JSON, and shell-command blocks. Darker than
+   .glass-info so monospace content reads clearly against the starfield.
+   Radius is intentionally left to the call site (short inline command vs.
+   tall multi-line preview) via Tailwind rounded-* utilities. */
+.glass-terminal {
+  background: var(--block-bg-terminal);
+  border: 1px solid var(--glass-border);
+  color: var(--text-primary);
+}
+
+/* Glass button — small interactive controls (from Agentic Commerce .glass-btn) */
+.glass-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 140ms ease;
+  user-select: none;
+}
+
+.glass-btn:hover {
+  transform: translateY(-1px);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.glass-btn:active {
+  transform: translateY(0);
+}
+
+.glass-btn.green {
+  border-color: var(--accent-green-border);
+  background: var(--accent-green-bg);
+  color: var(--accent-green);
+}
+
+.glass-btn.green:hover {
+  background: var(--accent-green-glow);
+}
+
+.glass-btn.muted {
+  border-color: var(--glass-border);
+  background: var(--block-bg);
+  color: var(--text-muted);
+}
+
+/* Glass pill — chips, tags, role badges (from Agentic Commerce .glass-pill) */
+.glass-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.12);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+
+.glass-pill.green {
+  border-color: rgba(118, 185, 0, 0.28);
+  background: var(--accent-green-subtle);
+  color: var(--accent-green);
+}
+
+.glass-pill.yellow {
+  border-color: var(--accent-yellow-border);
+  background: var(--accent-yellow-bg);
+  color: var(--accent-yellow);
+}
+
+/* Image-viewer controls sit over arbitrary photography, so the generic
+   translucent pill needs a darker backing to keep icons and zoom text legible
+   against both bright and dark images. */
+.image-zoom-controls {
+  background: rgba(9, 11, 9, 0.68);
+  border-color: rgba(255, 255, 255, 0.2);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(12px) saturate(120%);
+  -webkit-backdrop-filter: blur(12px) saturate(120%);
+}
+
+/* Glass caption — small section label (Agentic Commerce .glass-caption) */
+.glass-caption {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* Navigation links — from Agentic Commerce .nav-link / .nav-link-active */
+.nav-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-decoration: none;
+  transition: all 140ms ease;
+}
+
+.nav-link:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+
+.nav-link-active {
+  color: var(--accent-green);
+  background: var(--accent-green-bg);
+  box-shadow: 0 0 12px var(--accent-green-glow);
+}
+
+/* Success toast / banner. Shares the inner-surface radius token and the
+   glass backdrop blur with .glass-info so a banner slot keeps identical
+   chrome as it moves between states; the blur also stops sharp starfield
+   particles showing through the translucent fill. */
+.toast-success {
+  background: var(--accent-green-glow);
+  color: var(--accent-green);
+  border: 1px solid var(--accent-green-border);
+  border-radius: var(--glass-radius-sm);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+}
+
+/* Error toast / banner — text uses the AA-safe --error-red-text (the
+   #e52020 fill red falls below 4.5:1 as small text on the tinted bg). */
+.toast-error {
+  background: var(--error-red-bg);
+  color: var(--error-red-text);
+  border: 1px solid var(--error-red-border);
+  border-radius: var(--glass-radius-sm);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+}
+
+/* Inline error text */
+.text-error {
+  color: var(--error-red-text);
+}
+
+/* Core section accent border */
+.border-accent-core {
+  border-left: 3px solid var(--accent-green);
+}
+
+/* Aux section subtle border */
+.border-accent-aux {
+  border-left: 3px solid var(--glass-border-subtle);
+}
+
+/* NVIDIA green primary button (from Retail Catalog Enrichment).
+ *
+ * The :not(:disabled) gate on the base rule is intentional: with it in
+ * place, disabled buttons fall back to KUI's native disabled tokens
+ * (--background-color-interaction-disabled / --text-color-disabled)
+ * instead of rendering as a faded-green button that reads as "still
+ * clickable" at a glance. The 0.5 opacity alone on a green background
+ * was not enough visual signal that an action is gated. This matches
+ * how Retail Agentic Commerce handles disabled primaries.
+ */
+.nvidia-green-button:not(:disabled) {
+  background-color: #76b900 !important;
+  border-color: #76b900 !important;
+  color: rgba(0, 0, 0, 0.85) !important;
+}
+
+.nvidia-green-button:hover:not(:disabled) {
+  background-color: #6aa200 !important;
+  border-color: #6aa200 !important;
+}
+
+.nvidia-green-button:active:not(:disabled) {
+  background-color: #5e8f00 !important;
+  border-color: #5e8f00 !important;
+}
+
+.nvidia-green-button:disabled {
+  cursor: not-allowed !important;
+  /* Background, border, and text color are inherited from KUI's native
+   * [data-kind="primary"]:disabled tokens so the button visibly reads
+   * as "disabled" rather than "faded green". */
+}
+
+/* KUI secondary button — soften for the glass-on-dark surface.
+ *
+ * KUI's nv-dark theme resolves the secondary button's border token
+ * (--border-color-interaction-strong) to pure white (--color-gray-000)
+ * and its text to near-white. On this app's glass surfaces, the solid
+ * 1px white border perceptually slabs the whole button as white,
+ * out-weighting the adjacent NVIDIA-green primary. The override below
+ * retones border and text to the subdued rgba-white family already
+ * used by .glass-btn / .glass-pill, matching the Retail Blueprint
+ * dark-theme tonal-secondary convention while preserving KUI's
+ * shape, padding, radius, font-size, and height.
+ *
+ * Scope: .nv-button--kind-secondary:not(:disabled). Disabled state
+ * falls back to KUI's native disabled tokens so the gated-state cue
+ * is not lost (mirrors the .nvidia-green-button:disabled pattern).
+ * The :where() selector and :not() gate preserve KUI's specificity
+ * rules; no !important is needed because KUI base.css uses custom
+ * properties (--_bg, --_border, --_color) that are inherited, not
+ * painted at higher specificity.
+ */
+.nv-button--kind-secondary:not(:disabled) {
+  background-color: transparent !important;
+  border-color: rgba(255, 255, 255, 0.24) !important;
+  color: var(--text-secondary) !important;
+}
+
+.nv-button--kind-secondary:not(:disabled):hover {
+  background-color: rgba(255, 255, 255, 0.06) !important;
+  border-color: rgba(255, 255, 255, 0.36) !important;
+  color: var(--text-primary) !important;
+}
+
+.nv-button--kind-secondary:not(:disabled):active {
+  background-color: rgba(255, 255, 255, 0.09) !important;
+}
+
+.nv-button--kind-secondary:not(:disabled):focus-visible {
+  outline: 2px solid var(--accent-green-border);
+  outline-offset: 2px;
+}
+
+/* MiniSpinner tone inheritance. KUI paints the spinner arrows (and their
+ * glow) with --background-color-interaction-primary-base, which the dark
+ * theme re-declares on every descendant via :where(.nv-dark, .nv-dark *)
+ * — so a wrapper-level override is undone on the arrow elements
+ * themselves. Redeclaring across the wrapper's subtree (any real class
+ * beats :where()'s zero specificity) makes the spinner take the host's
+ * text color: blue info pills get a blue spinner, green stays green. */
+.mini-spinner,
+.mini-spinner * {
+  --background-color-interaction-primary-base: currentColor;
+}
+
+/* ============================================
+   Animations (from Retail Agentic Commerce)
+   ============================================
+*/
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in {
+  animation: fadeIn 300ms ease-out forwards;
+}
+
+/* ============================================
+   Custom Scrollbar (Retail Agentic Commerce)
+   ============================================
+   Pill-shaped thumb with transparent track
+*/
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+  background-clip: padding-box;
+}

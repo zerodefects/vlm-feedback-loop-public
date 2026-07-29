@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local pre-commit hygiene gate — see docs/Engineering_Spec.md
+# Appendix B "Secret scanning + SonarQube delegate" for acceptance
+# items.
+#
+# Hooks, ordered cheapest-first so common no-ops fail fast:
+#   - trailing-whitespace, end-of-file-fixer, check-yaml (instant)
+#   - ruff lint + format (sub-second on most diffs)
+#   - gitleaks (~1 second, scans staged content for secret patterns)
+#   - agents-claude-twins (instant; AGENTS.md/CLAUDE.md must stay identical)
+#
+# Bootstrap:
+#     pip install pre-commit
+#     pre-commit install
+#
+# Run all hooks against the entire repo (the repo-wide smoke check):
+#     pre-commit run --all-files
+#
+# Why gitleaks at the local boundary, not just in CI:
+#   This is an open-source repo. NVIDIA_API_KEY and NGC_API_KEY are
+#   the documented minimal-setup credentials (README "Quick Start").
+#   The blast radius of a leaked key reaching origin is high; the
+#   local boundary catches it before it leaves the developer's
+#   workstation. None of the three reference Blueprints run gitleaks,
+#   but none of them ship hosted-NIM keys as the minimal-setup credential.
+
+# Files that formatting hooks must not rewrite:
+#   - src/ui/pnpm-lock.yaml, uv.lock: dependency lockfiles, managed
+#     by their respective package managers, not by lint hooks.
+#   - src/ui/assets/*.tgz: vendored KUI tarball, opaque binary.
+#   - LICENSE-3rd-party.txt: generated third-party license text whose original
+#     whitespace must not be normalized by repository formatting hooks.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(LICENSE-3rd-party\.txt|src/ui/pnpm-lock\.yaml|uv\.lock|src/ui/assets/kui-foundations-react-external-.*\.tgz)$
+      - id: end-of-file-fixer
+        exclude: ^(LICENSE-3rd-party\.txt|src/ui/pnpm-lock\.yaml|uv\.lock|src/ui/assets/kui-foundations-react-external-.*\.tgz)$
+      - id: check-yaml
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Track the same minor as the project's resolved ruff
+    # (uv-managed via pyproject.toml's `ruff>=0.9,<1.0`). Pinning to a
+    # version older than the resolved one causes pre-commit and CI to
+    # disagree about rules — UP038 was demoted between 0.9 and 0.15.
+    rev: v0.15.10
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.4
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      # AGENTS.md and CLAUDE.md are deliberate identical twins (same
+      # content, two filenames, so every agent tool finds it). Nothing
+      # else enforces the "diff must stay empty" contract their headers
+      # declare — this hook does.
+      - id: agents-claude-twins
+        name: AGENTS.md and CLAUDE.md are identical
+        entry: diff AGENTS.md CLAUDE.md
+        language: system
+        files: ^(AGENTS|CLAUDE)\.md$
+        pass_filenames: false

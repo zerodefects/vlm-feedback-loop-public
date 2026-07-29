@@ -1,0 +1,47 @@
+# Dependencies. Bare names only match at the context root under Docker's
+# filepath.Match semantics — the **/ prefix is required for nested matches
+# (e.g. src/ui/node_modules, src/backend/**/__pycache__).
+**/node_modules
+.venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+
+# Frontend source tree. The only build that uses the repo-root context is
+# the backend image, which COPYs pyproject.toml, uv.lock, README.md, and
+# src/backend/ — the ui image builds from the src/ui context with its own
+# .dockerignore.
+src/ui
+
+# Build outputs
+build
+*.egg-info
+
+# Git and IDE
+.git
+.gitignore
+.cursor
+.vscode
+.idea
+.claude
+
+# Documentation
+docs
+
+# Tests
+tests
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.db
+
+# Misc
+.DS_Store
+*.log
+*.tmp
+
+# Local coverage artifacts at the repo root
+.coverage
+coverage.xml

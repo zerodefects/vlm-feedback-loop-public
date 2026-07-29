@@ -1,0 +1,176 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vlm-feedback-loop"
+version = "0.1.0"
+description = "Interactive VLM labeling with ICL, fine-tuning via Cosmos-RL / TAO VLM, and Student deployment via NIM."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11,<3.14"
+authors = [
+    { name = "NVIDIA", email = "noreply@nvidia.com" },
+]
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.32,<1.0",
+    "pydantic>=2.11,<3.0",
+    "sqlalchemy>=2.0,<3.0",
+    "httpx>=0.28,<1.0",
+    "alembic>=1.14,<2.0",
+    "pyyaml>=6.0,<7.0",
+    "jinja2>=3.1,<4.0",
+    "tiktoken>=0.9,<1.0",
+    "python-dotenv>=1.0,<2.0",
+    "pillow>=12.2,<13.0",
+    # Vectorized diversity selection. The review selector scores every
+    # eligible candidate's CLIP cosine / pHash hamming against the recent
+    # window on the interactive request path (the labeling screen waits on
+    # it before loading the next image); at real pool sizes (10k+
+    # embeddings, dim 2048) the pure-Python inner loop cost seconds per
+    # pick. numpy turns that into a single matmul
+    # (services/review_selector_service.py::_window_max_similarity).
+    "numpy>=2.4.4,<3.0",
+    # TAO workspace S3 uploads. SeaweedFS / AWS S3 / Azure Blob
+    # compatible. Wrapped via asyncio.to_thread in the upload service.
+    # botocore is boto3's own core, declared explicitly because the S3 shim
+    # (services/_boto3_shim.py) imports botocore.config directly.
+    "boto3>=1.34,<2.0",
+    "botocore>=1.34,<2.0",
+]
+
+[project.optional-dependencies]
+# NIM benchmark adapter. The primary load
+# driver is genai-perf via subprocess; an httpx fallback ships in core
+# install (services/benchmark_adapter.py::HttpxAdapter) so CI / Profile A
+# does not need this extra. Install with:
+#   uv sync --extra benchmarking
+# Pin lower bound only — genai-perf is being deprecated upstream in favor
+# of AIPerf and we don't want to lock to a release that may not stay
+# published on PyPI.
+benchmarking = [
+    "genai-perf>=0.0.10",
+]
+
+[project.scripts]
+vlm-feedback-loop = "vlm_feedback_loop.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/backend/vlm_feedback_loop"]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.408",
+    "pytest>=8.0,<10.0",
+    "pytest-asyncio>=0.25,<2.0",
+    "pytest-cov>=7.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.9,<1.0",
+]
+
+[tool.pytest.ini_options]
+# Bare `pytest` runs the unit suite only; integration is opt-in via an
+# explicit path (`uv run pytest tests/integration/ -q -n 0`) because it
+# spawns live servers on fixed ports and refuses xdist.
+testpaths = ["tests/unit"]
+asyncio_mode = "auto"
+# -n auto parallelizes via pytest-xdist (one worker per CPU).
+# --dist loadfile assigns every test in one file to the same worker so
+# module-scoped fixtures aren't re-run per worker (matters for tests
+# that share heavy fixtures within a file).
+# --timeout=30 catches hung tests; --timeout-method=thread avoids
+# signal-based interruption that breaks asyncio. Integration tests
+# that legitimately exceed 30s should set @pytest.mark.timeout(N).
+addopts = "-n auto --dist loadfile --timeout=30 --timeout-method=thread"
+markers = [
+    "integration: live / cross-service integration tests (may require external services)",
+    "real_migrations: run the true Alembic baseline instead of the template-DB fast path (tests/unit/conftest.py)",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src/backend/vlm_feedback_loop"]
+omit = [
+    # Migration files: imperative side-effects, tested via end-to-end DB
+    # behavior rather than unit assertions. Including them inflates the
+    # denominator and makes the headline number meaningless.
+    "src/backend/vlm_feedback_loop/migrations/*",
+]
+
+[tool.coverage.report]
+# Enforced by the CI backend-tests job (--cov). The threshold sits just
+# below the measured unit-test coverage and gates against regression;
+# raising it toward 85 is coverage-hardening work, not a config edit.
+fail_under = 80
+show_missing = true
+exclude_also = [
+    # Defensive branches that can't trigger in v1 (single-user assumption).
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    # Standard pragma for explicitly-uncoverable lines.
+    "pragma: no cover",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "ARG",  # flake8-unused-arguments
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",  # line too long, handled by ruff format
+    "B008",  # function call in default argument (standard FastAPI pattern with Depends/Query)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests idiomatically pass pytest fixtures by name (unused args), use `open()`
+# for file-descriptor manipulation, and nest `with` statements for mock
+# layering. ARG/SIM115/SIM117 produce overwhelmingly false positives here.
+"tests/**/*.py" = ["ARG001", "ARG002", "ARG005", "SIM115", "SIM117"]
+# clip_embedding_service.py defines `_process_batch` inside the multi-pass
+# `while` loop and dispatches every batch via ``asyncio.gather`` *within*
+# the same iteration — every closure terminates before the loop iterates,
+# so the late-binding-of-loop-variables footgun B023 warns about cannot
+# fire here. Refactoring to bind via default args would obscure the
+# concurrency structure.
+"src/backend/vlm_feedback_loop/services/clip_embedding_service.py" = ["B023"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vlm_feedback_loop"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# Strict-mode pyright gate. Two deliberate scoping choices:
+#   - include is "src/backend" (not "src") because the repo also hosts
+#     "src/ui" (TypeScript, covered by the frontend-lint CI job).
+#   - exclude adds the Alembic migrations directory; it is also
+#     omitted from [tool.coverage.run].omit above for the same reason
+#     (imperative side-effects, validated by end-to-end DB tests).
+[tool.pyright]
+typeCheckingMode = "strict"
+# Match the requires-python floor (and ruff's py311 target) so the
+# checker validates the oldest supported interpreter.
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+include = ["src/backend"]
+exclude = [
+    "**/__pycache__",
+    "**/node_modules/**",
+    "src/backend/vlm_feedback_loop/migrations/**",
+]

@@ -1,0 +1,14 @@
+{#-
+Structured generation capability probe (Engineering Spec §6.2).
+
+Sent once per ModelConfig when the runtime checks whether the endpoint
+honors `response_format: {"type": "json_schema", ...}`. The paired JSON
+schema (a trivial `{"ok": boolean}`) is supplied by
+services/model_config_service.py::_probe_structured_generation alongside
+this prompt; the model is expected to return that single-field JSON object.
+
+Variables: none.
+-#}
+===SYSTEM===
+===USER===
+Return exactly this JSON object: {"ok": true}

@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Gitleaks v8 config. Extends the default rule set with NVIDIA-specific
+# credential patterns (the documented minimal-setup credentials, per
+# README "Quick Start"):
+#
+#   - NVIDIA_API_KEY: hosted NIM API Catalog. Format: ``nvapi-<token>``
+#     where ``<token>`` is ~64 base64-shaped chars.
+#   - NGC_API_KEY: NGC registry token (also rendered as ``nvapi-...``
+#     in `ngc.nvidia.com/setup/api-key`).
+#
+# Used by .pre-commit-config.yaml (the ``gitleaks/gitleaks`` hook
+# auto-detects this file at repo root).
+
+title = "VLM Feedback Loop — gitleaks rules"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "nvidia-api-key"
+description = "NVIDIA API Key (nvapi-) — used for hosted NIM and NGC registry access"
+regex = '''nvapi-[A-Za-z0-9_\-]{40,80}'''
+keywords = ["nvapi-"]
+
+[allowlist]
+description = "Synthetic placeholder values only"
+# Short-suffix fixtures used in unit tests (e.g., "nvapi-test", "nvapi-fake",
+# "nvapi-stub", "nvapi-1234"). Real keys are always >= 40 chars after the
+# prefix; the rule's `{40,80}` quantifier already excludes them, but the
+# allowlist is the second layer for clarity if a longer test suffix
+# enters the codebase.
+regexes = [
+  '''nvapi-(test|fake|stub|placeholder|example|dummy)[A-Za-z0-9_\-]{0,32}''',
+]

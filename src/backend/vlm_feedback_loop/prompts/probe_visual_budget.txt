@@ -1,0 +1,17 @@
+{#-
+Visual-budget capability probe (Engineering Spec §6.9.2).
+
+Sent twice per ModelConfig when the runtime checks whether the endpoint
+honors `mm_processor_kwargs` for visual-token preprocessing. Stage 1 runs
+this prompt WITHOUT `mm_processor_kwargs`; stage 2 runs it WITH the
+model-family-specific kwargs. The probe is supported only when stage 1
+baselines successfully AND stage 2 also succeeds.
+
+A deterministic 512×512 RGB PNG probe image is spliced into the user
+message by services/model_config_service.py::_probe_visual_budget.
+
+Variables: none.
+-#}
+===SYSTEM===
+===USER===
+Reply with OK.

@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+# The prebuilt @kui-contrib/nebula package is a documented vendored frontend
+# dependency, not a generated application build. A fresh public repository
+# must stage it even though generic dist directories remain ignored.
+!src/ui/src/components/nebula/dist/
+!src/ui/src/components/nebula/dist/**
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv
+.python-version
+
+# Node / Frontend
+node_modules/
+src/ui/dist/
+src/ui/.vite/
+src/ui/test-results/
+src/ui/playwright-report/
+src/ui/blob-report/
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment and secrets
+.env
+*.env.local
+
+# Runtime data — never committed anywhere
+*.db
+*.db-wal
+*.db-shm
+*.db.backup.*
+
+# Logs and line-record outputs are ignored by default. Never force-add raw
+# operational output without reviewing and scanning it first.
+*.log
+*.jsonl
+# Pinned test-set example lists are product-critical data, not run logs —
+# without this exception the pv-2026-07 "exact retest" pins ship without
+# their example lists (bitten 2026-07-13).
+!docs/fixtures/pinned/**/labels*.jsonl
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+src/ui/coverage/
+
+# Build artifacts — archives are never committed (no force-add exception)
+*.tar.gz
+*.zip
+
+# Operator notes / credentials kept locally at the top of docs/ — never
+# committed. Anything that could plausibly carry a secret (access keys,
+# install scripts with embedded tokens, SSH passwords) goes there as plain
+# .txt and stays out of git. Real documentation lives in .md files.
+docs/*.txt
+coverage.xml
+
+# Operator-local notes that reference private resources are named INTERNAL_*
+# and must never ship.
+docs/**/INTERNAL_*

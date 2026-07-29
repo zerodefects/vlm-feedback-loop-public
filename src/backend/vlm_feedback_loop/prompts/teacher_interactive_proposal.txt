@@ -1,0 +1,109 @@
+{#-
+Teacher interactive proposal prompt (Engineering Spec Appendix D.1).
+
+Rendered by services/prompt_service.py::render_prompt and used by every
+Teacher inference — interactive proposals, evaluation, and Batch Labeling.
+Image content is spliced into the USER turn by the caller after rendering.
+
+Variables provided at render time:
+  GUIDANCE_DESCRIPTION / RULES    — accepted for the shared renderer but
+                                    intentionally omitted by this compact
+                                    production prompt; the schema and
+                                    demonstrations define the task
+  STRUCTURED_GENERATION_ATTEMPTED — bool: whether a JSON schema is attached
+                                    to the outbound request (§6.2)
+  ICL_RENDERED_EXAMPLES           — list[dict]; one dict per ICL example
+                                    already rendered per the Inference Contract
+                                    (§6.11). Markers E01..E0N are generated here,
+                                    not by the caller — example_key must NEVER
+                                    appear in the prompt text (§A.1).
+  ATTACH_ICL_IMAGES               — bool. When True, each ICL example is
+                                    rendered as an image-then-label block
+                                    with explicit "ICL Example N image (E0N):"
+                                    and "ICL Example N label (E0N): {json}"
+                                    anchors so multi-image teachers (Qwen,
+                                    Mistral, Nemotron) can bind image-N to
+                                    label-N positionally — see Position-
+                                    binding contract below. The caller splits
+                                    the rendered text on the
+                                    ``<<<__VLM_ICL_IMG_SLOT_N__>>>`` sentinels
+                                    and interleaves image content parts (spec
+                                    §6.3 inline ICL image injection). When
+                                    False, no slot sentinels — ICL is
+                                    text-only and renders as the legacy
+                                    compact "E0N: {json}" form (used by
+                                    single-image fallback teachers like Llama
+                                    3.2 Vision). The QUERY image slot is
+                                    always emitted because the query image is
+                                    always attached.
+  RATIONALE_NOTE_ENABLED          — bool. True only when the active Guidance
+                                    contains the reserved rationale_note Aux
+                                    field. Rationale instructions are omitted
+                                    entirely when False.
+
+Position-binding contract (added by §6.3 quality fix, 2026-04):
+  When ATTACH_ICL_IMAGES is True, every ICL example is rendered with
+  redundant text anchors so multi-image teachers can bind image-N to
+  label-N positionally:
+    1. A pre-image header line ("ICL Example N image (E0N):") names the
+       position BEFORE the visual tokens, committing the model to a
+       position before processing them.
+    2. The image (sentinel-replaced content_part).
+    3. A post-image label line ("ICL Example N label (E0N): {json}")
+       names the position again AFTER the visual tokens, freshly
+       anchoring the JSON label to the just-seen image.
+  This is purely a prompt-quality knob; spec §6.3 is silent on per-image
+  text wording around ICL example images. Storage labels and the
+  rendered JSON payload itself are unchanged.
+
+The production prompt omits verbose Guidance prose and keeps demonstrations
+Core-only. When Guidance opts into rationale_note, it asks for the rationale
+after the label and makes grounding task-conditional. ``render_prompt``
+prepends a compact schema contract so the same prompt remains self-contained
+when guided decoding is unavailable.
+
+ICL example objects are serialized with the ``compact_json`` filter (not
+Jinja's built-in ``tojson``) so dict insertion order is preserved. Production
+demonstrations contain Core fields only, in canonical order.
+
+Sentinel format ``<<<__VLM_*_SLOT_*__>>>`` is chosen so collisions with
+user-provided text are essentially impossible; ``invoke_teacher`` raises
+on collision before dispatching.
+-#}
+===SYSTEM===
+You are a vision labeling assistant. Output valid JSON only.
+===USER===
+{%- if ICL_RENDERED_EXAMPLES %}
+
+{% if ATTACH_ICL_IMAGES -%}
+ICL Examples (each block is the IMAGE for that position followed by its JSON label):
+Each JSON label applies only to its paired example image. Use the examples to infer field meanings and decision boundaries. Determine the QUERY values independently from the QUERY image.
+{% for rendered in ICL_RENDERED_EXAMPLES %}
+ICL Example {{ loop.index }} image (E{{ "%02d" | format(loop.index) }}):
+<<<__VLM_ICL_IMG_SLOT_{{ loop.index }}__>>>
+ICL Example {{ loop.index }} label (E{{ "%02d" | format(loop.index) }}): {{ rendered | compact_json }}
+{% endfor -%}
+{%- else -%}
+ICL Examples (text-only labels — image not attached for this model):
+Each JSON label applies only to its paired example image. Use the examples to infer field meanings and decision boundaries. Determine the QUERY values independently from the QUERY image.
+{%- for rendered in ICL_RENDERED_EXAMPLES %}
+E{{ "%02d" | format(loop.index) }}: {{ rendered | compact_json }}
+{%- endfor %}
+{%- endif %}
+{%- endif %}
+
+Now label the QUERY image below.
+{%- if ICL_RENDERED_EXAMPLES %}
+Apply the demonstrated field meanings and decision boundaries, then determine every value independently from the QUERY image.
+{%- endif %}
+<<<__VLM_QUERY_IMG_SLOT__>>>
+
+Return one JSON object matching the label schema above.
+{%- if STRUCTURED_GENERATION_ATTEMPTED %} The attached JSON schema is authoritative.{% endif %}
+{% if RATIONALE_NOTE_ENABLED -%}
+Add rationale_note last. Keep it to one or two short, image-specific sentences.
+Describe the subject the task asks about. Distinguish a physical carrier from content shown on it only when that distinction matters to the task.
+State uncertainty when needed. Do not invent evidence or merely repeat the label.
+{% endif -%}
+
+Return JSON only.

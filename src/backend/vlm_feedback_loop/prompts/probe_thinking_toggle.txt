@@ -1,0 +1,15 @@
+{#-
+Thinking-toggle acceptance probe (Engineering Spec §6.7.4).
+
+Sent once per ModelConfig to check whether the endpoint honors the
+model-family thinking-off request field (Qwen `enable_thinking=false` or
+Kimi `thinking=false`). services/model_config_service.py::_probe_thinking_toggle
+attaches the mode-specific `chat_template_kwargs` alongside this prompt.
+The probe is considered supported if the model responds successfully; any
+4xx attributable to `chat_template_kwargs` flips capability to unsupported.
+
+Variables: none.
+-#}
+===SYSTEM===
+===USER===
+Reply with OK.

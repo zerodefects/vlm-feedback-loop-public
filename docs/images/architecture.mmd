@@ -1,0 +1,26 @@
+%% Architecture diagram source — render with:
+%%   python3 scripts/render_architecture_diagram.py
+flowchart LR
+  UI["<b>React 19 + Vite SPA</b><br/>KUI Foundations + Tailwind"]
+  NGINX["<b>nginx edge proxy</b><br/>:3000 (containerized mode)"]
+
+  subgraph BACKEND["FastAPI backend  :8000"]
+    API["<b>REST /v1</b> + SSE hint channel"]
+    SVC["<b>services/</b><br/>guidance & schema · ICL<br/>evaluation · Scale-Up gate<br/>batch labeling · training"]
+    DB[("<b>SQLite per project</b><br/>WAL · Alembic migrations")]
+    API --> SVC
+    SVC -- "project state" --> DB
+  end
+
+  subgraph NIM["NVIDIA NIM"]
+    direction TB
+    TEACHER["<b>Teacher / Student VLM</b><br/>hosted (build.nvidia.com)<br/>or local Docker · one NIM per GPU"]
+    EMB["<b>NeMo Retriever VL 1B v2</b><br/>image embeddings"]
+  end
+
+  TAO["<b>TAO FTMS / Cosmos-RL</b><br/>Student fine-tuning<br/>(Cosmos Reason2 · Cosmos 3 reasoner)"]
+
+  UI -- "REST + SSE" --> NGINX --> API
+  SVC -- "OpenAI-compatible /v1" --> TEACHER
+  SVC -- "/v1/embeddings" --> EMB
+  SVC -- "train · evaluate · quantize" --> TAO

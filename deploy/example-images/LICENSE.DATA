@@ -1,0 +1,20 @@
+Sample Image Data License
+=========================
+
+The images under this directory (rock/, paper/, scissors/) are a subset of
+15 images, otherwise unmodified, from the test split of the Rock Paper
+Scissors dataset by Laurence Moroney.
+
+  Copyright (c) Laurence Moroney (lmoroney@gmail.com / laurencemoroney.com)
+  Source: https://laurencemoroney.com/datasets.html
+
+The dataset is released under the Creative Commons Attribution 2.0 license
+(CC BY 2.0, https://creativecommons.org/licenses/by/2.0/): free to share and
+adapt for all uses, commercial or non-commercial, provided appropriate credit
+is given to Laurence Moroney and no additional restrictions are placed on
+downstream users.
+
+These images are bundled solely as first-run sample input so the Blueprint's
+labeling loop can be exercised from a clean clone. They are licensed
+separately from the application source code, which is governed by the
+repository's Apache-2.0 LICENSE.

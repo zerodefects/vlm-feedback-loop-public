@@ -1,0 +1,115 @@
+# Interactive VLM Feedback Loop — Application Configuration
+#
+# Non-secret application settings. Copy this file to
+# ~/.vlm_feedback_loop/config.yaml (or run `vlm-feedback-loop init` to
+# generate a commented equivalent covering every setting), then
+# uncomment values you want to override. Anything not set here falls
+# back to the built-in defaults in
+# src/backend/vlm_feedback_loop/_defaults.py — a commented line keeps
+# tracking the shipped default across upgrades; an uncommented line
+# pins the value written here.
+#
+# Secrets (NVIDIA_API_KEY, NGC_API_KEY, TAO_*, HF_TOKEN) belong in .env,
+# NOT here. See .env.example for the secrets template.
+#
+# Configuration precedence (Engineering_Spec §1.9):
+#   1. Process environment variables
+#   2. Explicit --env-file or VLM_FEEDBACK_LOOP_ENV_FILE
+#   3. ~/.vlm_feedback_loop/.env
+#   4. ~/.vlm_feedback_loop/config.yaml  ← this file
+#   5. Built-in defaults
+
+# ── Workspace ──────────────────────────────────────────────
+# Absolute path where project data is stored (databases, exports,
+# artifacts, logs). REQUIRED — no built-in default.
+WORKSPACE_ROOT: /path/to/workspace
+
+# ── Logging ────────────────────────────────────────────────
+# 'info' (default) or 'debug' for ICL/token-budget/selector decision
+# traces during development.
+# LOG_LEVEL: info
+
+# ── Server bind ────────────────────────────────────────────
+# Loopback by default. When BIND_HOST is non-loopback, IMAGE_ROOT
+# MUST be set to one absolute directory (Spec §12.2).
+# BIND_HOST: 127.0.0.1
+# BIND_PORT: 8000
+# IMAGE_ROOT:
+# When unset on loopback, Ingest opens at "/" and the filesystem is
+# unrestricted. To start in one dataset directory instead:
+# IMAGE_ROOT: /absolute/path/to/vlm-feedback-loop/deploy/example-images
+
+# ── Hosted NIM ─────────────────────────────────────────────
+# HOSTED_NIM_BASE_URL: https://integrate.api.nvidia.com/v1
+
+# ── Image transport ────────────────────────────────────────
+# Max longest edge (pixels) for images transmitted to models. Larger
+# source images are downscaled (aspect-preserving, LANCZOS) before
+# base64 encoding; stored originals, exports, and training data are
+# never modified. Default 2090 = the high-detail visual-budget geometry
+# for 4:3 images, which a 7-model acuity study found at-or-above the
+# perception ceiling of most hosted teachers, while keeping worst-case
+# 8-image ICL payloads inside hosted-provider gateway limits (full-res
+# phone photos otherwise 504 at the provider edge on some models).
+# Set 0 to disable (send source images as-is).
+# IMAGE_TRANSPORT_MAX_LONGEST_EDGE: 2090
+
+# ── Local NIM ports ────────────────────────────────────────
+# Preferred host ports for locally deployed NIM containers. The teacher
+# default (8000) collides with the backend's own BIND_PORT default when
+# both run on one box; the deploy flow probes the preferred port and
+# auto-bumps to the next available one, so the collision resolves itself.
+# Set an explicit free port here to make placement deterministic.
+# LOCAL_NIM_TEACHER_PORT: 8000
+# LOCAL_NIM_NVCLIP_PORT: 8001
+
+# ── New-project defaults ───────────────────────────────────
+# What model gets seeded as the Teacher on freshly-created projects.
+# Built-in default is hosted MiniMax-M3 — works on any machine with
+# NVIDIA_API_KEY set, no GPU required.
+#
+# DEFAULT_TEACHER_MODEL: minimaxai/minimax-m3
+# DEFAULT_TEACHER_LOCAL_BASE_URL: null
+#
+# To use a locally-deployed Teacher NIM (e.g. on a GPU rental with
+# cosmos-reason2-8b running on port 8001), uncomment the block below. At
+# project-creation time the backend will probe the URL's /health/ready
+# and rebind the Teacher's model_config to a freshly-seeded self_hosted
+# endpoint — required because the hosted catalog at build.nvidia.com
+# doesn't currently serve cosmos-reason2-8b.
+#
+# DEFAULT_TEACHER_MODEL: nvidia/cosmos-reason2-8b
+# DEFAULT_TEACHER_LOCAL_BASE_URL: http://127.0.0.1:8001/v1
+
+# ── UI secret persistence ──────────────────────────────────
+# When true (default), an API key pasted in the NIM Configuration UI may
+# be persisted to ~/.vlm_feedback_loop/.env (written 0600). Set false
+# where .env is managed externally — keys pasted in the UI then apply
+# for the process lifetime only. The shipped docker-compose.yml sets
+# this false via process env (the in-container .env is ephemeral).
+# ALLOW_UI_SECRET_PERSIST: true
+
+# ── Embedding model identity (see README §Embedding model override) ──
+# The supported Blueprint model is NVIDIA NeMo Retriever VL 1B v2 (2048-dim).
+# Advanced replacements must expose the same OpenAI-compatible embeddings API;
+# the system-managed local launch profile supports only the shipped model.
+# EMBEDDING_MODEL_ID: nvidia/llama-nemotron-embed-vl-1b-v2
+# EMBEDDING_DIM: 2048
+
+# ── Foreground-priority dispatch hold ─────────────────────────
+# true (default): an in-flight interactive proposal (the SME clicking
+# through Review) holds NEW background HTTP dispatches (evaluation /
+# batch-label traffic) so the human never queues behind batch work.
+# Set false for batch/AutoRun-driven campaigns: a continuous AutoRun
+# proposal stream otherwise starves background evaluation dispatch
+# indefinitely (process-global gate).
+# FOREGROUND_HOLD_ENABLED: true
+
+# ── Student training ───────────────────────────────────────
+# TAO's stale-heartbeat reaper kills quiet jobs after 60 minutes when no
+# per-job timeout is supplied. cosmos-rl does not emit a heartbeat while it
+# trains, so the Blueprint sends this generous 24-hour ceiling on every
+# training-suite job. It is a dead-job backstop, not an ETA; increase it for
+# unusually long runs. Student Training preflight fails closed if the TAO v2
+# API does not support this field (install guide §13.15).
+# TAO_JOB_TIMEOUT_MINUTES: 1440
