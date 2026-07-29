@@ -113,7 +113,7 @@ Commands and results:
 
 ```bash
 uv run pytest tests/unit/ -q
-# 2743 passed
+# 2745 passed
 
 uv run pytest tests/integration/ -q -n 0
 # 21 passed, 6 skipped (environment-gated live integrations)
