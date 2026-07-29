@@ -331,6 +331,7 @@ test infrastructure.
 | [`docs/deployment.md`](docs/deployment.md) | Container, source, persistence, networking, and GPU operation |
 | [`docs/tao-ftms-install.md`](docs/tao-ftms-install.md) | TAO operator install, health validation, and Blueprint bootstrap |
 | [`docs/local_nim_dev_setup.md`](docs/local_nim_dev_setup.md) | Local NIM operator setup |
+| [`docs/public-release-validation.md`](docs/public-release-validation.md) | Exact public snapshot, anonymous acquisition, and two-mode validation evidence |
 | [`docs/Engineering_Spec_Brief.md`](docs/Engineering_Spec_Brief.md) | Cross-cutting normative-contract map |
 | [`docs/Engineering_Spec.md`](docs/Engineering_Spec.md) | Authoritative implementation contract |
 | [`docs/changelog.md`](docs/changelog.md) | Public release history |
