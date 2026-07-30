@@ -38,6 +38,14 @@ import {
 } from "@/types/training";
 
 const POLL_INTERVAL_MS = 5000;
+const AUTO_SKIP_REASON_PREFIX = "auto-skip:";
+
+function isAutoSkippedJob(job: TrainingSuiteChain["jobs"][number]): boolean {
+  return (
+    job.status === "canceled" &&
+    (job.chain_halted_reason ?? "").startsWith(AUTO_SKIP_REASON_PREFIX)
+  );
+}
 
 function suiteAllTerminal(suite: TrainingSuite | undefined): boolean {
   if (!suite) return false;
@@ -48,12 +56,19 @@ function suiteAllTerminal(suite: TrainingSuite | undefined): boolean {
   );
 }
 
-function chainAllSucceeded(chain: TrainingSuiteChain): boolean {
-  return chain.jobs.length > 0 && chain.jobs.every((job) => job.status === "succeeded");
+function chainAllComplete(chain: TrainingSuiteChain): boolean {
+  return (
+    chain.jobs.length > 0 &&
+    chain.jobs.every(
+      (job) => job.status === "succeeded" || isAutoSkippedJob(job),
+    )
+  );
 }
 
-function countSucceeded(chain: TrainingSuiteChain): number {
-  return chain.jobs.filter((job) => job.status === "succeeded").length;
+function countComplete(chain: TrainingSuiteChain): number {
+  return chain.jobs.filter(
+    (job) => job.status === "succeeded" || isAutoSkippedJob(job),
+  ).length;
 }
 
 function findHaltedReasonJob(
@@ -69,7 +84,9 @@ function findHaltedReasonJob(
   if (rootFailed)
     return { action: rootFailed.action, chainSequence: rootFailed.chain_sequence };
   const firstHalted = chain.jobs
-    .filter((j) => j.chain_halted_reason)
+    .filter(
+      (j) => j.chain_halted_reason && !isAutoSkippedJob(j),
+    )
     .sort((a, b) => a.chain_sequence - b.chain_sequence)[0];
   if (firstHalted)
     return {
@@ -170,7 +187,7 @@ export function TrainingJobMonitorPage() {
     () =>
       suite !== undefined &&
       suite.chains.length > 0 &&
-      suite.chains.every(chainAllSucceeded),
+      suite.chains.every(chainAllComplete),
     [suite],
   );
 
@@ -204,10 +221,10 @@ export function TrainingJobMonitorPage() {
   const overallProgress = suite.chains
     .map((chain) => {
       const label = shortBaseLabel(chain.base_model_name);
-      const succeeded = countSucceeded(chain);
+      const completed = countComplete(chain);
       const total = chain.jobs.length;
-      if (succeeded === total) return `${label}: done`;
-      return `${label}: ${succeeded} of ${total}`;
+      if (completed === total) return `${label}: done`;
+      return `${label}: ${completed} of ${total}`;
     })
     .join(" · ");
 
@@ -335,7 +352,7 @@ export function TrainingJobMonitorPage() {
       )}
 
       {suite.chains.map((chain) => {
-        const succeeded = countSucceeded(chain);
+        const completed = countComplete(chain);
         const total = chain.jobs.length;
         const halted = findHaltedReasonJob(chain);
         const quantLabels = computeQuantLabels(chain, quantSchemes);
@@ -348,7 +365,7 @@ export function TrainingJobMonitorPage() {
             data-base-model={chain.base_model_name}
           >
             <SectionHeading
-              trailing={<ChainProgressLine succeeded={succeeded} total={total} />}
+              trailing={<ChainProgressLine succeeded={completed} total={total} />}
             >
               {formatModelDisplayName(chain.base_model_name, "upper")}
             </SectionHeading>

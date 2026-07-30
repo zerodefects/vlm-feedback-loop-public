@@ -350,6 +350,64 @@ describe("TrainingJobMonitorPage", () => {
     ).toContain("Chain halted: evaluate failed.");
   });
 
+  it("treats an auto-skipped baseline evaluation as progress, not a halted chain", async () => {
+    const autoSkipReason =
+      "auto-skip: action=evaluate auto-skipped; trained checkpoint is adapter-only";
+    const suite = makeSuite([
+      {
+        chain_id: "chain-2b",
+        baseModelName: "nvidia/cosmos-reason2-2b",
+        modelConfigId: "mc-2b",
+        jobs: [
+          ["train-1", "train", 1, "succeeded", null],
+          ["eval-1", "evaluate", 2, "canceled", autoSkipReason],
+          ["quant-1", "quantize", 3, "running", null],
+          ["eval-q-1", "evaluate", 4, "not_started", null],
+        ],
+      },
+    ]);
+    mockGetSuite.mockResolvedValue(suite);
+
+    renderPage();
+    await screen.findByTestId("training-job-monitor-page");
+
+    expect(screen.queryByTestId("chain-halted-banner-chain-2b")).toBeNull();
+    expect(screen.getByTestId("monitor-overall-progress")).toHaveTextContent(
+      "2B: 2 of 4",
+    );
+  });
+
+  it("enables Compare when all executed jobs complete and evaluation legs auto-skip", async () => {
+    const autoSkipReason =
+      "auto-skip: action=evaluate auto-skipped; trained checkpoint is adapter-only";
+    const suite = {
+      ...makeSuite([
+        {
+          chain_id: "chain-2b",
+          baseModelName: "nvidia/cosmos-reason2-2b",
+          modelConfigId: "mc-2b",
+          jobs: [
+            ["train-1", "train", 1, "succeeded", null],
+            ["eval-1", "evaluate", 2, "canceled", autoSkipReason],
+            ["quant-1", "quantize", 3, "succeeded", null],
+            ["eval-q-1", "evaluate", 4, "canceled", autoSkipReason],
+          ],
+        },
+      ]),
+      status: "completed" as const,
+    };
+    mockGetSuite.mockResolvedValue(suite);
+
+    renderPage();
+    await screen.findByTestId("training-job-monitor-page");
+
+    expect(screen.queryByTestId("chain-halted-banner-chain-2b")).toBeNull();
+    expect(screen.getByTestId("monitor-overall-progress")).toHaveTextContent(
+      "2B: done",
+    );
+    expect(screen.getByTestId("monitor-compare-students")).toBeEnabled();
+  });
+
   // ── Running card shows epoch progress + ETA + metrics ──
   it("running card renders epoch progress bar, ETA, and metrics", async () => {
     const suite = makeSuite([
