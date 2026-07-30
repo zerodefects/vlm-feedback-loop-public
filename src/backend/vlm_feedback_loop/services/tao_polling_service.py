@@ -2131,9 +2131,28 @@ async def tick(settings: Settings) -> None:
             logger.info(
                 "tao_polling: revived %d legacy LoRA baseline auto-skip(s) "
                 "for merged Student NIM evaluation (project=%s)",
-                revived,
+                len(revived),
                 project_id,
             )
+            # Legacy chains may already have a remote quantize sibling in
+            # flight. Start the independent local baseline immediately rather
+            # than waiting for that remote job, and keep the poll tick
+            # non-blocking while merge/NIM work runs.
+            for eval_id, chain_id, parent_sequence in revived:
+                background_manager.try_register(
+                    f"local-baseline-recovery-{eval_id}",
+                    _advance_after_terminal(
+                        project_id,
+                        chain_id=chain_id,
+                        chain_sequence=parent_sequence,
+                        engine=engine,
+                        settings=settings,
+                    ),
+                    no_loop_warning=(
+                        "Could not schedule legacy LoRA baseline recovery "
+                        f"for {eval_id}"
+                    ),
+                )
 
         # Chain advance/halt recovery: resume chains frozen by a crash
         # between a terminal commit and its continuation (N+1 submit, or
@@ -2370,7 +2389,7 @@ def _migrate_legacy_lora_baseline_skips(
     project_id: str,
     *,
     engine: Engine,
-) -> int:
+) -> list[tuple[str, str, int]]:
     """Requeue baseline rows canceled by the former adapter-only policy.
 
     Releases before 2026-07-30 deliberately auto-skipped these rows because
@@ -2379,7 +2398,7 @@ def _migrate_legacy_lora_baseline_skips(
     precise to revive once. Ordinary user cancellations and base blocklist
     skips are untouched.
     """
-    revived = 0
+    revived: list[tuple[str, str, int]] = []
     with Session(engine) as session:
         rows = (
             session.query(TAOJob)
@@ -2398,13 +2417,16 @@ def _migrate_legacy_lora_baseline_skips(
                 and _is_lora_baseline_evaluate(session, row)
             ):
                 continue
+            parent = session.get(TAOJob, row.parent_tao_job_id)
+            if parent is None or row.chain_id is None or parent.chain_sequence is None:
+                continue
             row.status = "not_started"
             row.completed_at = None
             row.chain_halted_reason = None
             row.error_ref = None
             row.tao_status_raw = None
             row.progress = None
-            revived += 1
+            revived.append((row.tao_job_id, row.chain_id, int(parent.chain_sequence)))
         if revived:
             session.commit()
     return revived

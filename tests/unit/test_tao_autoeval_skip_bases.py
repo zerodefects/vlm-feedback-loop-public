@@ -592,8 +592,10 @@ class TestAdapterOnlyBaselineEvaluation:
             )
             session.commit()
 
-        assert _migrate_legacy_lora_baseline_skips(PID, engine=engine) == 1
-        assert _migrate_legacy_lora_baseline_skips(PID, engine=engine) == 0
+        revived = _migrate_legacy_lora_baseline_skips(PID, engine=engine)
+        assert len(revived) == 1
+        assert revived[0][0] == eval_id
+        assert _migrate_legacy_lora_baseline_skips(PID, engine=engine) == []
         with Session(engine) as session:
             row = session.query(TAOJob).filter_by(tao_job_id=eval_id).one()
             assert row.status == "not_started"
