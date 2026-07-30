@@ -392,6 +392,51 @@ class TestPollSingleJob:
         assert job.last_polled_at is not None
 
     @pytest.mark.asyncio
+    async def test_quantize_poll_clears_stale_generic_progress(
+        self, tmp_path, monkeypatch
+    ):
+        engine, workspace = _setup(tmp_path)
+        _add_minimal_fixtures(engine, workspace / "projects" / PID)
+        job_id = _add_chain_job(
+            engine,
+            status="running",
+            action="quantize",
+            chain_sequence=1,
+        )
+        with Session(engine) as session:
+            job = session.query(TAOJob).filter_by(tao_job_id=job_id).one()
+            job.progress = {
+                "epoch_current": None,
+                "epoch_total": 100,
+                "eta_seconds": 1000,
+                "metrics_latest": {"time_per_epoch": "0:00:01"},
+            }
+            session.commit()
+
+        mock_poll = AsyncMock(
+            return_value={
+                "success": True,
+                "tao_status_raw": "Running",
+                "progress": None,
+                "outputs": None,
+                "error": None,
+            }
+        )
+        monkeypatch.setattr(tao_job_service, "poll_tao_job", mock_poll)
+        monkeypatch.setattr(tao_polling_service.sse_manager, "emit", AsyncMock())
+
+        await tao_polling_service._poll_single_job(
+            PID, job_id, engine=engine, settings=_make_settings(workspace)
+        )
+
+        with Session(engine) as session:
+            job = session.query(TAOJob).filter_by(tao_job_id=job_id).one()
+            assert job.progress is None
+        mock_poll.assert_awaited_once()
+        assert mock_poll.call_args.args == ("ext-1",)
+        assert mock_poll.call_args.kwargs["action"] == "quantize"
+
+    @pytest.mark.asyncio
     async def test_poll_error_updates_poll_error_ref_only(self, tmp_path, monkeypatch):
         engine, workspace = _setup(tmp_path)
         _add_minimal_fixtures(engine, workspace / "projects" / PID)
@@ -1223,7 +1268,7 @@ class TestTick:
 
         called_ids: list[str] = []
 
-        async def fake_poll(external_id, *, settings):  # noqa: ARG001
+        async def fake_poll(external_id, *, settings, action):  # noqa: ARG001
             called_ids.append(external_id)
             return {
                 "success": True,

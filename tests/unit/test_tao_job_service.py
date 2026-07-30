@@ -628,7 +628,7 @@ class TestProgressDerivation:
             "metrics_history_ref": None,
         }
 
-    def test_quantize_drops_generic_epoch_telemetry_but_keeps_eta(self):
+    def test_quantize_drops_generic_epoch_and_static_eta_telemetry(self):
         """FTMS reuses JobResult for quantization and populates its epoch
         slots with generic work-unit values.  They must not be presented as
         training epoch metrics."""
@@ -648,13 +648,7 @@ class TestProgressDerivation:
             network_arch="cosmos-rl",
             action="quantize",
         )
-        assert progress == {
-            "epoch_current": None,
-            "epoch_total": None,
-            "eta_seconds": 1000.0,
-            "metrics_latest": None,
-            "metrics_history_ref": None,
-        }
+        assert progress is None
 
     @pytest.mark.parametrize(
         ("raw", "expected"),
@@ -721,6 +715,51 @@ class TestProgressDerivation:
         assert result["tao_status_raw"] == "Running"
         assert result["progress"] is not None
         assert result["progress"]["epoch_total"] == 1
+
+    @pytest.mark.asyncio
+    async def test_poll_uses_authoritative_local_action_when_tao_omits_it(
+        self, tmp_path, monkeypatch
+    ):
+        """Some live quantize responses omit the top-level action.  The
+        caller-provided local action must still suppress generic epoch/ETA
+        placeholders."""
+        from vlm_feedback_loop.services import tao_auth, tao_job_service
+
+        body = _load_tao_fixture("job_status_running_early.json")
+        body.pop("action", None)
+        entry = next(iter(body["job_details"].values()))
+        entry.update(
+            {
+                "max_epoch": 100,
+                "eta": "0:16:40",
+                "time_per_epoch": "0:00:01",
+            }
+        )
+
+        async def fake_request(method: Any, url: Any, **kwargs: Any) -> Any:
+            class _R:
+                status_code = 200
+                error_class = None
+                error_detail = None
+
+            _R.body = body
+            return _R()
+
+        async def fake_bearer(_settings: Any) -> str:
+            return "fresh"
+
+        monkeypatch.setattr(tao_job_service, "resilient_request", fake_request)
+        monkeypatch.setattr(tao_auth, "resilient_request", fake_request)
+        monkeypatch.setattr(tao_auth, "get_tao_bearer", fake_bearer)
+
+        result = await tao_job_service.poll_tao_job(
+            _LIVE_EXTERNAL_ID,
+            settings=make_tao_settings(tmp_path, TAO_API_KEY="jwt-test"),
+            action="quantize",
+        )
+
+        assert result["success"] is True
+        assert result["progress"] is None
         assert result["status_msg"] == "Starting Cosmos-RL SFT training"
 
 

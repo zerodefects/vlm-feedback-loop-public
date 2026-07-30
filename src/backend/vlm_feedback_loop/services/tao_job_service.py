@@ -317,7 +317,10 @@ def apply_poll_result(
     status is mapped and persisted when the transition is legal,
     ``started_at`` / ``completed_at`` are stamped on first entry into
     ``running`` / a terminal status, and progress/outputs are updated
-    when present.
+    when present. Training keeps its last-known progress across sparse
+    provider responses to avoid UI flicker. Non-training actions clear
+    progress when an action-aware poll finds no valid telemetry, which
+    removes stale generic epoch/ETA placeholders from older polls.
 
     When a job lands on ``failed`` because the worker crashed (HF gated
     repo, parallelism mismatch, compile refusal, etc), FTMS's
@@ -370,6 +373,8 @@ def apply_poll_result(
 
     if poll_result["progress"] is not None:
         job.progress = poll_result["progress"]
+    elif job.action != "train":
+        job.progress = None
     if poll_result["outputs"] is not None:
         job.outputs = poll_result["outputs"]
 
@@ -741,9 +746,10 @@ def _derive_progress_from_job_details(
     # currently fills ``max_epoch`` and ``time_per_epoch`` with its generic
     # work-unit telemetry (for example 100 and 0:00:01).  Those values are
     # not training epochs and presenting them as such is actively
-    # misleading.  Epoch-specific fields are therefore valid only for
-    # train jobs; action-neutral ETA and iteration telemetry remain useful
-    # for the other actions.
+    # misleading.  The same is true of ``eta``: quantize reports a fixed
+    # nominal duration that does not decrease across polls.  Epoch timing
+    # and ETA are therefore valid only for train jobs; action-neutral
+    # iteration telemetry remains available for the other actions.
     is_epoch_action = action in (None, "train")
     epoch_raw: Any = job_entry.get("epoch")
     max_epoch_raw: Any = job_entry.get("max_epoch")
@@ -753,7 +759,7 @@ def _derive_progress_from_job_details(
     epoch_total = (
         max_epoch_raw if is_epoch_action and isinstance(max_epoch_raw, int) else None
     )
-    eta_seconds = _parse_eta_seconds(job_entry.get("eta"))
+    eta_seconds = _parse_eta_seconds(job_entry.get("eta")) if is_epoch_action else None
 
     metrics_latest: dict[str, Any] = {}
     key_metric_raw: Any = job_entry.get("key_metric")
@@ -794,6 +800,7 @@ async def poll_tao_job(
     tao_external_job_id: str,
     *,
     settings: Settings,
+    action: str | None = None,
 ) -> dict[str, Any]:
     """GET the current state of a TAO job (one-shot poll).
 
@@ -857,12 +864,17 @@ async def poll_tao_job(
     if progress is None and job_entry is not None:
         network_arch_raw: Any = body.get("network_arch")
         action_raw: Any = body.get("action")
+        effective_action = (
+            action
+            if action is not None
+            else (action_raw if isinstance(action_raw, str) else None)
+        )
         progress = _derive_progress_from_job_details(
             job_entry,
             network_arch=(
                 network_arch_raw if isinstance(network_arch_raw, str) else None
             ),
-            action=action_raw if isinstance(action_raw, str) else None,
+            action=effective_action,
         )
 
     # Extract any container-side status message (cosmos-rl crash detail,
@@ -1569,6 +1581,7 @@ async def get_tao_job(
     # ── Read current state and decide whether to poll ───────────────────
     should_poll = False
     external_id: str | None = None
+    action: str | None = None
     with Session(engine) as session:
         job = (
             session.query(TAOJob)
@@ -1587,13 +1600,14 @@ async def get_tao_job(
         ):
             should_poll = True
             external_id = job.tao_external_job_id
+            action = job.action
 
         if not should_poll:
             return _job_to_dict(job)
 
     # ── Poll outside any transaction ───────────────────────────────────
     assert external_id is not None  # narrowed by should_poll
-    poll_result = await poll_tao_job(external_id, settings=settings)
+    poll_result = await poll_tao_job(external_id, settings=settings, action=action)
 
     # ── Short write txn #2: persist refreshed state ─────────────────────
     now = utc_now()

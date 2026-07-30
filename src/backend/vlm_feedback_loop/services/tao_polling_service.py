@@ -1267,7 +1267,9 @@ async def _poll_single_job(
         return  # no external handle to query yet
 
     # Remote poll (no txn).
-    poll_result = await tao_job_service.poll_tao_job(external_id, settings=settings)
+    poll_result = await tao_job_service.poll_tao_job(
+        external_id, settings=settings, action=action
+    )
     now = utc_now()
 
     with Session(engine) as session:
