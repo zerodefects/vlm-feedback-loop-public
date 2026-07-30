@@ -157,7 +157,55 @@ async def run_training_preflight(
     )
     checks.extend(be_checks)
 
-    # 5. Per-model student_base role. Query in a single short session.
+    # 5. Gated-model credential for first-use provisioning.  Already-ready
+    # bases do not need Hugging Face access merely to submit a training job,
+    # but every automatic Cosmos base pull does.  Surface this before the SME
+    # starts the workflow instead of letting the provisioning endpoint be the
+    # first place that reports the missing deployment secret.
+    provisioning_required = any(
+        check.get("provisioning_required") is True for check in be_checks
+    )
+    hf_token_configured = bool((settings.HF_TOKEN or "").strip())
+    if provisioning_required:
+        checks.append(
+            {
+                "check_name": "hf_token_configured",
+                "passed": hf_token_configured,
+                "message": (
+                    "Hugging Face token configured for gated Cosmos Student "
+                    "base provisioning."
+                    if hf_token_configured
+                    else (
+                        "HF_TOKEN is required to provision the selected gated "
+                        "Cosmos Student base. Add it to the Blueprint "
+                        "deployment secrets and retry readiness."
+                    )
+                ),
+                "model_config_id": None,
+                "remediation": (
+                    None
+                    if hf_token_configured
+                    else (
+                        "Set HF_TOKEN in ~/.vlm_feedback_loop/.env, restart "
+                        "the Blueprint backend, then rerun readiness."
+                    )
+                ),
+            }
+        )
+    else:
+        checks.append(
+            {
+                "check_name": "hf_token_configured",
+                "passed": True,
+                "message": (
+                    "Hugging Face token is not required because the selected "
+                    "Student bases are already provisioned."
+                ),
+                "model_config_id": None,
+            }
+        )
+
+    # 6. Per-model student_base role. Query in a single short session.
     engine = get_project_engine(project_id, settings.WORKSPACE_ROOT)
     role_results: dict[str, dict[str, Any]] = {}
     resolved_presets: dict[str, dict[str, Any]] = {}
@@ -224,7 +272,7 @@ async def run_training_preflight(
                 }
             )
 
-    # 6. Training data availability. Training exports select Verified
+    # 7. Training data availability. Training exports select Verified
     #    labels under the ACTIVE guidance outside the Test Pool
     #    (dataset_export_service) — an empty selection means a
     #    training suite cannot start, so surface that here instead of

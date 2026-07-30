@@ -4,10 +4,11 @@
 """Pydantic schemas for the training preflight endpoint.
 
 The training preflight confirms TAO reachability, safe job-timeout support,
-workspace readiness, per-student-base experiment readiness, ``student_base``
-role on each selected base model, and that the training-export selection is
-non-empty (``verified_train_examples``). Deliberately distinct from the NIM
-deployment preflight which does Docker / GPU / NGC checks.
+workspace readiness, per-student-base experiment readiness, gated-model
+credential availability when first-use provisioning is required,
+``student_base`` role on each selected base model, and that the training-export
+selection is non-empty (``verified_train_examples``). Deliberately distinct
+from the NIM deployment preflight which does Docker / GPU / NGC checks.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ class TrainingPreflightCheck(BaseModel):
         "tao_job_timeout_supported",
         "tao_workspace_reachable",
         "tao_base_experiment_ready",
+        "hf_token_configured",
         "student_base_role",
         "verified_train_examples",
     ]

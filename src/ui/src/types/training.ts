@@ -52,6 +52,7 @@ export type TrainingPreflightCheckName =
   | "tao_job_timeout_supported"
   | "tao_workspace_reachable"
   | "tao_base_experiment_ready"
+  | "hf_token_configured"
   | "student_base_role"
   | "verified_train_examples";
 

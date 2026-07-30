@@ -367,6 +367,42 @@ describe("StudentTrainingPage", () => {
     expect(screen.getByTestId("training-start")).toBeDisabled();
   });
 
+  it("blocks Go when a gated Student base needs provisioning without HF_TOKEN", async () => {
+    mockRunPreflight.mockResolvedValueOnce({
+      ...preflight(),
+      status: "failed",
+      checks: [
+        {
+          check_name: "tao_base_experiment_ready",
+          passed: true,
+          message:
+            "Base experiment is not registered. Start Training will provision it automatically.",
+          model_config_id: "mc-2b",
+          provisioning_required: true,
+          remediation: null,
+        },
+        {
+          check_name: "hf_token_configured",
+          passed: false,
+          message:
+            "HF_TOKEN is required to provision the selected gated Cosmos Student base.",
+          model_config_id: null,
+          provisioning_required: false,
+          remediation:
+            "Set HF_TOKEN in ~/.vlm_feedback_loop/.env, restart the Blueprint backend, then rerun readiness.",
+        },
+        preflight().checks[1],
+      ],
+    });
+
+    renderPage();
+    await screen.findByText(
+      "HF_TOKEN is required to provision the selected gated Cosmos Student base.",
+    );
+    expect(screen.getByText("Training setup is incomplete")).toBeInTheDocument();
+    expect(screen.getByTestId("training-start")).toBeDisabled();
+  });
+
   it("requires confirmation and submits the exact four-job validation suite", async () => {
     renderPage();
     await screen.findByText("Ready to create the training jobs");

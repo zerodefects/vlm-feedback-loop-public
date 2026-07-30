@@ -107,6 +107,14 @@ def _patch_train_examples_pass():
     )
 
 
+def _set_hf_token(client, value: str | None) -> None:
+    """Set the deployment-scoped HF token on the injected test settings."""
+    from vlm_feedback_loop.routers.projects import get_current_settings
+
+    settings = client.app.dependency_overrides[get_current_settings]()
+    settings.HF_TOKEN = value
+
+
 def _seed_active_guidance(client, project_id: str) -> str:
     """Create + activate a minimal guidance; returns its guidance_id."""
     resp = client.post(
@@ -267,6 +275,7 @@ class TestPreflightRouter:
         assert "tao_job_timeout_supported" in check_names
         assert "tao_workspace_reachable" in check_names
         assert "tao_base_experiment_ready" in check_names
+        assert "hf_token_configured" in check_names
         assert "student_base_role" in check_names
         assert "verified_train_examples" in check_names
         for c in body["checks"]:
@@ -500,6 +509,7 @@ class TestProfileDDifferentiation:
             "tao_job_timeout_supported",
             "tao_workspace_reachable",
             "tao_base_experiment_ready",
+            "hf_token_configured",
             "student_base_role",
             "verified_train_examples",
         }
@@ -758,6 +768,7 @@ class TestPreflightWorkspaceAndBaseExperimentChecks:
         """A selected missing base is explicit first-use work, not a blocker."""
         pid = _seed_project_with_catalog(test_app_client)
         sb_id = _student_base_model_id(test_app_client, pid)
+        _set_hf_token(test_app_client, "hf_test_provisioning")
         # Look up the model_name for assertions.
         resp = test_app_client.get(
             f"/v1/projects/{pid}/model_configs",
@@ -799,6 +810,7 @@ class TestPreflightWorkspaceAndBaseExperimentChecks:
         """The normal SME path no longer asks for a separate provisioning CLI."""
         pid = _seed_project_with_catalog(test_app_client)
         sb_id = _student_base_model_id(test_app_client, pid)
+        _set_hf_token(test_app_client, "hf_test_provisioning")
         with _patch_probe_success(), _patch_workspace_check_pass():
             resp = test_app_client.post(
                 f"/v1/projects/{pid}/training_preflight",
@@ -817,6 +829,58 @@ class TestPreflightWorkspaceAndBaseExperimentChecks:
         assert be["remediation"] is None
         assert "tao-pull-base-experiments" not in be["message"]
 
+    def test_missing_base_without_hf_token_fails_before_go(self, test_app_client):
+        """Gated-base provisioning credentials are part of readiness."""
+        pid = _seed_project_with_catalog(test_app_client)
+        sb_id = _student_base_model_id(test_app_client, pid)
+        _set_hf_token(test_app_client, None)
+
+        with (
+            _patch_probe_success(),
+            _patch_workspace_check_pass(),
+            _patch_train_examples_pass(),
+        ):
+            resp = test_app_client.post(
+                f"/v1/projects/{pid}/training_preflight",
+                json={"student_base_model_config_ids": [sb_id]},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        hf = next(
+            c for c in body["checks"] if c["check_name"] == "hf_token_configured"
+        )
+        assert hf["passed"] is False
+        assert "HF_TOKEN is required" in hf["message"]
+        assert "~/.vlm_feedback_loop/.env" in hf["remediation"]
+        assert body["status"] == "failed"
+
+    def test_ready_base_does_not_require_hf_token(self, test_app_client):
+        """Training an already-provisioned base does not require a new pull."""
+        pid = _seed_project_with_catalog(test_app_client)
+        sb_id = _student_base_model_id(test_app_client, pid)
+        _set_hf_token(test_app_client, None)
+
+        with (
+            _patch_probe_success(),
+            _patch_workspace_check_pass(),
+            _patch_base_experiment_pass_for([sb_id]),
+            _patch_train_examples_pass(),
+        ):
+            resp = test_app_client.post(
+                f"/v1/projects/{pid}/training_preflight",
+                json={"student_base_model_config_ids": [sb_id]},
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        hf = next(
+            c for c in body["checks"] if c["check_name"] == "hf_token_configured"
+        )
+        assert hf["passed"] is True
+        assert "not required" in hf["message"]
+        assert body["status"] == "passed"
+
     def test_every_missing_selected_base_is_marked_for_provisioning(
         self, test_app_client
     ):
@@ -829,6 +893,7 @@ class TestPreflightWorkspaceAndBaseExperimentChecks:
         assert resp.status_code == 200
         sb_ids = [m["model_config_id"] for m in resp.json()["items"]][:2]
         assert len(sb_ids) == 2, "seed catalog should have >= 2 student_base entries"
+        _set_hf_token(test_app_client, "hf_test_provisioning")
 
         # No base-experiment patch — seeded rows have NULL ids.
         with (
