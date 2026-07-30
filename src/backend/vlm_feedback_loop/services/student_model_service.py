@@ -215,7 +215,9 @@ def _resolve_merge_python(settings: Settings) -> str:
        (``uv venv $WORKSPACE_ROOT/merge-lora-venv && uv pip install
        --python $WORKSPACE_ROOT/merge-lora-venv/bin/python
        -r scripts/merge_lora_requirements.txt``).
-    3. ``sys.executable`` — works only if the operator installed the
+    3. ``~/.local/share/vlm-feedback-loop/merge-lora-venv/bin/python`` —
+       the shared Profile C runtime provisioned by ``scripts/setup-dev.sh``.
+    4. ``sys.executable`` — works only if the operator installed the
        merge requirements into the backend venv; the failure message
        below says how to provision when the import fails.
     """
@@ -228,16 +230,65 @@ def _resolve_merge_python(settings: Settings) -> str:
         )
         if venv_python.exists():
             return str(venv_python)
+    shared_python = (
+        Path.home()
+        / ".local"
+        / "share"
+        / "vlm-feedback-loop"
+        / "merge-lora-venv"
+        / "bin"
+        / "python"
+    )
+    if shared_python.exists():
+        return str(shared_python)
     return sys.executable
 
 
 _MERGE_PROVISION_HINT = (
     "The merge interpreter lacks transformers/peft/torch. Provision a "
-    'dedicated venv: uv venv "$WORKSPACE_ROOT/merge-lora-venv" && '
-    'uv pip install --python "$WORKSPACE_ROOT/merge-lora-venv/bin/python" '
+    "dedicated venv by rerunning scripts/setup-dev.sh, or manually: "
+    'uv venv "$HOME/.local/share/vlm-feedback-loop/merge-lora-venv" && '
+    "uv pip install --python "
+    '"$HOME/.local/share/vlm-feedback-loop/merge-lora-venv/bin/python" '
     "-r scripts/merge_lora_requirements.txt — or point MERGE_LORA_PYTHON "
     "at an interpreter that has them."
 )
+
+
+async def check_lora_merge_readiness(settings: Settings) -> tuple[bool, str]:
+    """Verify that the isolated LoRA merge interpreter is usable.
+
+    This is intentionally a package-discovery probe rather than importing
+    torch/transformers into the FastAPI process. It is cheap enough for the
+    Student Training readiness gate and catches the exact environment failure
+    that would otherwise appear only after a remote training job completes.
+    """
+    python = _resolve_merge_python(settings)
+    if not Path(python).is_file():
+        return False, f"LoRA merge interpreter does not exist: {python}"
+    probe = (
+        "import importlib.util,sys;"
+        "missing=[m for m in "
+        "('torch','transformers','peft','accelerate','safetensors') "
+        "if importlib.util.find_spec(m) is None];"
+        "print(','.join(missing));sys.exit(bool(missing))"
+    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            python,
+            "-c",
+            probe,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+    except (OSError, TimeoutError) as exc:
+        return False, f"LoRA merge runtime probe failed: {exc}"
+    if proc.returncode != 0:
+        missing = stdout.decode(errors="replace").strip()
+        detail = missing or stderr.decode(errors="replace").strip()
+        return False, f"LoRA merge runtime is missing required packages: {detail}"
+    return True, f"LoRA merge runtime ready at {python}."
 
 
 async def _run_merge_lora_subprocess(
@@ -968,6 +1019,119 @@ def _has_in_flight_deploy(project_id: str) -> bool:
     return any(tid.startswith(prefix) for tid in background_manager.active_task_ids)
 
 
+async def run_automatic_baseline_evaluation(
+    *,
+    project_id: str,
+    evaluate_tao_job_id: str,
+    settings: Settings,
+) -> dict[str, Any]:
+    """Merge/package and evaluate a LoRA baseline through the local Student NIM.
+
+    TAO's v2 ``evaluate`` action cannot consume an adapter-only checkpoint.
+    The Blueprint therefore owns this baseline path: retry idempotent
+    packaging (which merges the adapter), run the normal local Student NIM
+    lifecycle against the Test Pool, and return its durable outcome for the
+    synthetic evaluate TAOJob row.
+    """
+    engine = get_project_engine(project_id, settings.WORKSPACE_ROOT)
+    if engine is None:
+        return {"success": False, "error": "project_not_found"}
+
+    with Session(engine) as session:
+        evaluate_job = (
+            session.query(TAOJob)
+            .filter_by(project_id=project_id, tao_job_id=evaluate_tao_job_id)
+            .first()
+        )
+        if evaluate_job is None:
+            return {"success": False, "error": "evaluate_job_not_found"}
+        student = find_student_for_evaluate_job(
+            session, project_id=project_id, evaluate_job=evaluate_job
+        )
+        parent_job_id = evaluate_job.parent_tao_job_id
+        student_id = student.student_model_id if student is not None else None
+
+    # Registration is idempotent and is also the retry mechanism for a merge
+    # runtime that was provisioned after the first packaging attempt.
+    if parent_job_id is None:
+        return {"success": False, "error": "evaluate_parent_missing"}
+    if student_id is None:
+        student_id = await register_from_tao_terminal(
+            project_id, parent_job_id, settings=settings
+        )
+    else:
+        with Session(engine) as session:
+            student = session.get(StudentModel, student_id)
+            packaging_failed = bool(
+                student is not None and student.checkpoint_packaging_status == "failed"
+            )
+        if packaging_failed:
+            student_id = await register_from_tao_terminal(
+                project_id, parent_job_id, settings=settings
+            )
+    if student_id is None:
+        return {"success": False, "error": "student_registration_failed"}
+
+    async with _project_lock(project_id):
+        if _has_in_flight_deploy(project_id):
+            return {"success": False, "error": "student_nim_deploy_in_progress"}
+        with Session(engine) as session:
+            student = session.get(StudentModel, student_id)
+            if student is None:
+                return {"success": False, "error": "student_not_found"}
+            if student.checkpoint_packaging_status != "validated":
+                return {
+                    "success": False,
+                    "error": "checkpoint_packaging_failed",
+                    "detail": (student.nim_preflight_details or {}).get(
+                        "quality_failure_reason"
+                    ),
+                }
+            student.serving_status = "pending"
+            student.nim_deployment_mode = "local"
+            student.nim_endpoint_url = None
+            student.nim_preflight_status = None
+            student.nim_preflight_details = None
+            student.nim_preflight_at = None
+            student.nim_container_id = None
+            student.serving_evaluation_run_id = None
+            session.commit()
+
+        from vlm_feedback_loop.services import student_nim_lifecycle
+
+        await student_nim_lifecycle.run_student_deployment_lifecycle(
+            project_id=project_id,
+            student_model_id=student_id,
+            mode="local",
+            nim_endpoint_url=None,
+            nim_container_image=None,
+            nim_release_version=None,
+            gpu_assignment=None,
+            auth_mode="none",
+            settings=settings,
+            workspace_root=settings.WORKSPACE_ROOT,
+        )
+
+    with Session(engine) as session:
+        student = session.get(StudentModel, student_id)
+        if student is None:
+            return {"success": False, "error": "student_not_found_after_evaluation"}
+        success = (
+            student.serving_status == "validated"
+            and student.quality_status in {"validated", "partial"}
+            and student.serving_evaluation_run_id is not None
+        )
+        return {
+            "success": success,
+            "student_model_id": student_id,
+            "evaluation_run_id": student.serving_evaluation_run_id,
+            "quality_status": student.quality_status,
+            "serving_status": student.serving_status,
+            "error": None if success else "student_nim_evaluation_failed",
+            "detail": student.nim_preflight_details,
+        }
+
+
 async def deploy_nim(
     *,
     project_id: str,
@@ -1073,10 +1237,12 @@ async def deploy_nim(
 
 __all__ = [
     "PackagingResult",
+    "check_lora_merge_readiness",
     "deploy_nim",
     "find_student_for_evaluate_job",
     "get_student_model",
     "list_student_models",
     "mark_student_quality_failed",
     "register_from_tao_terminal",
+    "run_automatic_baseline_evaluation",
 ]

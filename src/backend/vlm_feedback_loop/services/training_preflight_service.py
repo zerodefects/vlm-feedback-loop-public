@@ -55,6 +55,7 @@ async def run_training_preflight(
     student_base_model_config_ids: list[str],
     settings: Settings,
     include_auto_labeled: bool = True,
+    enable_lora: bool = True,
 ) -> dict[str, Any]:
     """Run the training preflight checks.
 
@@ -157,28 +158,28 @@ async def run_training_preflight(
     )
     checks.extend(be_checks)
 
-    # 5. Gated-model credential for first-use provisioning.  Already-ready
-    # bases do not need Hugging Face access merely to submit a training job,
-    # but every automatic Cosmos base pull does.  Surface this before the SME
-    # starts the workflow instead of letting the provisioning endpoint be the
-    # first place that reports the missing deployment secret.
+    # 5. Gated-model credential. First-use TAO provisioning needs it remotely;
+    # LoRA training also needs it locally after training so the Blueprint can
+    # load the gated base and merge the adapter before baseline NIM evaluation.
     provisioning_required = any(
         check.get("provisioning_required") is True for check in be_checks
     )
     hf_token_configured = bool((settings.HF_TOKEN or "").strip())
-    if provisioning_required:
+    hf_required = provisioning_required or enable_lora
+    if hf_required:
         checks.append(
             {
                 "check_name": "hf_token_configured",
                 "passed": hf_token_configured,
                 "message": (
                     "Hugging Face token configured for gated Cosmos Student "
-                    "base provisioning."
+                    "base access and LoRA checkpoint merge."
                     if hf_token_configured
                     else (
-                        "HF_TOKEN is required to provision the selected gated "
-                        "Cosmos Student base. Add it to the Blueprint "
-                        "deployment secrets and retry readiness."
+                        "HF_TOKEN is required to access the selected gated "
+                        "Cosmos Student base for provisioning or LoRA merge. "
+                        "Add it to the Blueprint deployment secrets and retry "
+                        "readiness."
                     )
                 ),
                 "model_config_id": None,
@@ -198,14 +199,52 @@ async def run_training_preflight(
                 "check_name": "hf_token_configured",
                 "passed": True,
                 "message": (
-                    "Hugging Face token is not required because the selected "
-                    "Student bases are already provisioned."
+                    "Hugging Face token is not required because LoRA is "
+                    "disabled and the selected Student bases are already "
+                    "provisioned."
                 ),
                 "model_config_id": None,
             }
         )
 
-    # 6. Per-model student_base role. Query in a single short session.
+    # 6. Blueprint-owned LoRA merge runtime. TAO cannot evaluate an adapter
+    # checkpoint directly, so the local merge + Student NIM baseline is a
+    # required part of a LoRA chain rather than an optional deployment step.
+    if enable_lora:
+        from vlm_feedback_loop.services import student_model_service
+
+        (
+            merge_ready,
+            merge_message,
+        ) = await student_model_service.check_lora_merge_readiness(settings)
+        checks.append(
+            {
+                "check_name": "lora_merge_runtime",
+                "passed": merge_ready,
+                "message": merge_message,
+                "model_config_id": None,
+                "remediation": (
+                    None
+                    if merge_ready
+                    else (
+                        "Run scripts/setup-dev.sh on the Blueprint host (or "
+                        "configure MERGE_LORA_PYTHON), restart the backend, "
+                        "then rerun readiness."
+                    )
+                ),
+            }
+        )
+    else:
+        checks.append(
+            {
+                "check_name": "lora_merge_runtime",
+                "passed": True,
+                "message": "LoRA merge runtime is not required for full-weight training.",
+                "model_config_id": None,
+            }
+        )
+
+    # 7. Per-model student_base role. Query in a single short session.
     engine = get_project_engine(project_id, settings.WORKSPACE_ROOT)
     role_results: dict[str, dict[str, Any]] = {}
     resolved_presets: dict[str, dict[str, Any]] = {}
@@ -272,7 +311,7 @@ async def run_training_preflight(
                 }
             )
 
-    # 7. Training data availability. Training exports select Verified
+    # 8. Training data availability. Training exports select Verified
     #    labels under the ACTIVE guidance outside the Test Pool
     #    (dataset_export_service) — an empty selection means a
     #    training suite cannot start, so surface that here instead of

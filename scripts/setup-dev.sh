@@ -313,6 +313,28 @@ if [ "$HAS_GPU" = true ]; then
     vfl_create_nim_cache
     info "NIM cache directory ready at ~/.cache/nim"
 
+    # ── LoRA checkpoint merge runtime ────────────────────────────────────────
+    #
+    # TAO train emits an adapter-only checkpoint when LoRA is enabled. The
+    # Blueprint merges that adapter with the gated base locally before the
+    # full-precision baseline is evaluated through the Student NIM. Keep the
+    # heavyweight ML stack isolated from the backend venv and shared across
+    # workspaces on this Profile C host.
+
+    section "LoRA Merge Runtime"
+
+    MERGE_VENV="$HOME/.local/share/vlm-feedback-loop/merge-lora-venv"
+    UV_CMD="$(command -v uv || true)"
+    if [ -z "$UV_CMD" ]; then
+        UV_CMD="$HOME/.local/bin/uv"
+    fi
+    if [ ! -x "$MERGE_VENV/bin/python" ]; then
+        "$UV_CMD" venv --python python3.12 "$MERGE_VENV"
+    fi
+    "$UV_CMD" pip install --python "$MERGE_VENV/bin/python" \
+        -r scripts/merge_lora_requirements.txt
+    info "LoRA merge runtime ready at $MERGE_VENV"
+
     # ── NGC entitlement preflight (no image pulls) ─────────────────────
     #
     # Image pulls are handled by the Blueprint application at runtime
@@ -403,6 +425,7 @@ if [ "$HAS_GPU" = true ]; then
     echo "  Docker      : $(docker --version 2>&1)"
     echo "  Toolkit     : $(dpkg -l nvidia-container-toolkit 2>/dev/null | grep ^ii | awk '{print $3}' || echo 'not found')"
     echo "  NIM cache   : ~/.cache/nim"
+    echo "  LoRA merge  : ~/.local/share/vlm-feedback-loop/merge-lora-venv"
     echo "  NGC entitled: $([ -n "${NGC_API_KEY:-}" ] && echo 'checked' || echo 'key not set')"
 else
     echo ""

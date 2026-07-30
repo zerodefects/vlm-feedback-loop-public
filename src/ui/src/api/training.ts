@@ -35,6 +35,7 @@ export function runTrainingPreflight(
   projectId: string,
   studentBaseModelConfigIds: string[],
   includeAutoLabeled = true,
+  enableLora = true,
 ): Promise<TrainingPreflightResponse> {
   return apiFetch<TrainingPreflightResponse>(
     `/projects/${projectId}/training_preflight`,
@@ -43,6 +44,7 @@ export function runTrainingPreflight(
       body: JSON.stringify({
         student_base_model_config_ids: studentBaseModelConfigIds,
         include_auto_labeled: includeAutoLabeled,
+        enable_lora: enableLora,
       }),
     },
   );

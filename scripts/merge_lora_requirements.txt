@@ -7,13 +7,15 @@
 # take on the weight-heavy ML dependencies. The backend looks for the
 # interpreter in this order (services/student_model_service.py):
 #   1. the MERGE_LORA_PYTHON setting
-#   2. {WORKSPACE_ROOT}/merge-lora-venv/bin/python (the provisioning
-#      target below)
-#   3. its own interpreter (works only if you install these deps there)
+#   2. {WORKSPACE_ROOT}/merge-lora-venv/bin/python (legacy per-workspace path)
+#   3. ~/.local/share/vlm-feedback-loop/merge-lora-venv/bin/python
+#      (shared Profile C path provisioned by scripts/setup-dev.sh)
+#   4. its own interpreter (works only if you install these deps there)
 #
-# Provision the dedicated venv:
-#   uv venv "$WORKSPACE_ROOT/merge-lora-venv"
-#   uv pip install --python "$WORKSPACE_ROOT/merge-lora-venv/bin/python" \
+# Provision the shared dedicated venv:
+#   uv venv "$HOME/.local/share/vlm-feedback-loop/merge-lora-venv"
+#   uv pip install --python \
+#     "$HOME/.local/share/vlm-feedback-loop/merge-lora-venv/bin/python" \
 #     -r scripts/merge_lora_requirements.txt
 
 transformers>=4.41

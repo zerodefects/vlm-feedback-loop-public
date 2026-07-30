@@ -1271,6 +1271,8 @@ async def launch_training_suite(
         project_id=project_id,
         student_base_model_config_ids=list(student_base_model_config_ids),
         settings=settings,
+        include_auto_labeled=include_auto_labeled,
+        enable_lora=enable_lora,
     )
     failed_checks = [check for check in readiness["checks"] if not check["passed"]]
     if failed_checks:

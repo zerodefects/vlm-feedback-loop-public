@@ -21,6 +21,18 @@ _SVC = "vlm_feedback_loop.services.training_preflight_service"
 PID = "proj-preflight-test"
 
 
+@pytest.fixture(autouse=True)
+def _merge_runtime_ready(monkeypatch):
+    """Keep non-runtime checks independent of packages on the test host."""
+    from vlm_feedback_loop.services import student_model_service
+
+    monkeypatch.setattr(
+        student_model_service,
+        "check_lora_merge_readiness",
+        AsyncMock(return_value=(True, "LoRA merge runtime ready.")),
+    )
+
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
@@ -257,6 +269,7 @@ class TestPreflightRouter:
     def test_all_pass_returns_passed(self, test_app_client):
         pid = _seed_project_with_catalog(test_app_client)
         sb_id = _student_base_model_id(test_app_client, pid)
+        _set_hf_token(test_app_client, "hf_test")
         with (
             _patch_probe_success(),
             _patch_workspace_check_pass(),
@@ -276,6 +289,7 @@ class TestPreflightRouter:
         assert "tao_workspace_reachable" in check_names
         assert "tao_base_experiment_ready" in check_names
         assert "hf_token_configured" in check_names
+        assert "lora_merge_runtime" in check_names
         assert "student_base_role" in check_names
         assert "verified_train_examples" in check_names
         for c in body["checks"]:
@@ -510,6 +524,7 @@ class TestProfileDDifferentiation:
             "tao_workspace_reachable",
             "tao_base_experiment_ready",
             "hf_token_configured",
+            "lora_merge_runtime",
             "student_base_role",
             "verified_train_examples",
         }
@@ -847,16 +862,14 @@ class TestPreflightWorkspaceAndBaseExperimentChecks:
 
         assert resp.status_code == 200
         body = resp.json()
-        hf = next(
-            c for c in body["checks"] if c["check_name"] == "hf_token_configured"
-        )
+        hf = next(c for c in body["checks"] if c["check_name"] == "hf_token_configured")
         assert hf["passed"] is False
         assert "HF_TOKEN is required" in hf["message"]
         assert "~/.vlm_feedback_loop/.env" in hf["remediation"]
         assert body["status"] == "failed"
 
-    def test_ready_base_does_not_require_hf_token(self, test_app_client):
-        """Training an already-provisioned base does not require a new pull."""
+    def test_ready_lora_base_still_requires_hf_token(self, test_app_client):
+        """Local adapter merge must load the gated base even when TAO has it."""
         pid = _seed_project_with_catalog(test_app_client)
         sb_id = _student_base_model_id(test_app_client, pid)
         _set_hf_token(test_app_client, None)
@@ -874,12 +887,33 @@ class TestPreflightWorkspaceAndBaseExperimentChecks:
 
         assert resp.status_code == 200
         body = resp.json()
-        hf = next(
-            c for c in body["checks"] if c["check_name"] == "hf_token_configured"
-        )
+        hf = next(c for c in body["checks"] if c["check_name"] == "hf_token_configured")
+        assert hf["passed"] is False
+        assert "HF_TOKEN is required" in hf["message"]
+        assert body["status"] == "failed"
+
+    def test_ready_full_weight_base_does_not_require_hf_token(self, test_app_client):
+        pid = _seed_project_with_catalog(test_app_client)
+        sb_id = _student_base_model_id(test_app_client, pid)
+        _set_hf_token(test_app_client, None)
+        with (
+            _patch_probe_success(),
+            _patch_workspace_check_pass(),
+            _patch_base_experiment_pass_for([sb_id]),
+            _patch_train_examples_pass(),
+        ):
+            resp = test_app_client.post(
+                f"/v1/projects/{pid}/training_preflight",
+                json={
+                    "student_base_model_config_ids": [sb_id],
+                    "enable_lora": False,
+                },
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        hf = next(c for c in body["checks"] if c["check_name"] == "hf_token_configured")
         assert hf["passed"] is True
         assert "not required" in hf["message"]
-        assert body["status"] == "passed"
 
     def test_every_missing_selected_base_is_marked_for_provisioning(
         self, test_app_client
@@ -956,6 +990,7 @@ class TestVerifiedTrainExamplesCheck:
     def test_passes_with_verified_non_pool_label(self, test_app_client):
         pid = _seed_project_with_catalog(test_app_client)
         sb_id = _student_base_model_id(test_app_client, pid)
+        _set_hf_token(test_app_client, "hf_test")
         gid = _seed_active_guidance(test_app_client, pid)
         _insert_verified_label(test_app_client, pid, gid, pool_assignment=None)
         resp = self._post(test_app_client, pid, sb_id)

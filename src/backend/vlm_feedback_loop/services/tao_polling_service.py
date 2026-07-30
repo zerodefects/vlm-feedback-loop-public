@@ -1591,6 +1591,7 @@ async def _advance_after_terminal(
         return
 
     next_job_id: str | None = None
+    local_baseline_eval_id: str | None = None
     cross_chain_next_id: str | None = None
 
     with Session(engine) as session:
@@ -1599,11 +1600,11 @@ async def _advance_after_terminal(
             return
 
         # Iteratively skip TAO ``evaluate`` jobs that are doomed on the
-        # cosmos-rl side: (a) trained base on the operator-configured
-        # blocklist, or (b) the chain trained adapter-only
-        # (``enable_lora=true``) — cosmos-rl evaluate hands the adapter
-        # directory straight to vLLM engine init, which cannot load
-        # PEFT-prefixed weights into the bare base class. Each
+        # cosmos-rl side because the trained base is on the operator-configured
+        # blocklist. A LoRA baseline is different: TAO cannot load its
+        # adapter-only checkpoint, so the Blueprint merges it and evaluates
+        # the resulting full checkpoint through the local Student NIM.
+        # Each policy-skipped job
         # skipped job lands ``status="canceled"`` with the auto-skip
         # chain_halted_reason marker (the roll-up treats that prefix as
         # success-equivalent); the next loop iteration then looks
@@ -1620,15 +1621,28 @@ async def _advance_after_terminal(
             )
             if next_job is None:
                 break
+            if _is_lora_baseline_evaluate(session, next_job):
+                next_job.status = "running"
+                next_job.started_at = next_job.started_at or utc_now()
+                next_job.training_backend = "student_nim_local"
+                next_job.chain_halted_reason = None
+                next_job.progress = {
+                    "metrics_latest": {
+                        "stage": "Merging LoRA checkpoint and validating Student NIM"
+                    }
+                }
+                job_config = dict(next_job.job_config or {})
+                job_config["evaluation_source"] = "student_nim_local"
+                job_config["requires_merged_checkpoint"] = True
+                next_job.job_config = job_config
+                local_baseline_eval_id = next_job.tao_job_id
+                break
             base_blocklisted = (
                 bool(skip_set)
                 and next_job.action == "evaluate"
                 and _trained_base_is_blocklisted(session, next_job, skip_set)
             )
-            adapter_only = (
-                next_job.action == "evaluate" and _chain_trained_adapter_only(next_job)
-            )
-            if not (base_blocklisted or adapter_only):
+            if not base_blocklisted:
                 next_job_id = next_job.tao_job_id
                 break
             # Skip path: mark the evaluate as canceled with a clear
@@ -1640,35 +1654,24 @@ async def _advance_after_terminal(
             # job with a null completed_at skews duration reporting and the
             # job-monitor timeline.
             next_job.completed_at = utc_now()
-            if adapter_only:
-                next_job.chain_halted_reason = (
-                    f"{AUTO_SKIP_REASON_PREFIX} action=evaluate auto-skipped; "
-                    "trained checkpoint is adapter-only (enable_lora=true) "
-                    "and cosmos-rl evaluate cannot load LoRA adapters (vLLM "
-                    "rejects PEFT-prefixed weights on the bare base class; "
-                    "live-verified 2026-07-15) — Student stays at "
-                    "quality_status=pending for the cold-start NIM-eval "
-                    "fallback."
-                )
-            else:
-                next_job.chain_halted_reason = (
-                    f"{AUTO_SKIP_REASON_PREFIX} action=evaluate auto-skipped; "
-                    f"base {_resolve_trained_base_name(session, next_job)!r} "
-                    f"is in TAO_AUTOEVAL_SKIP_BASES — Student stays at "
-                    f"quality_status=pending for the cold-start NIM-eval fallback."
-                )
+            next_job.chain_halted_reason = (
+                f"{AUTO_SKIP_REASON_PREFIX} action=evaluate auto-skipped; "
+                f"base {_resolve_trained_base_name(session, next_job)!r} "
+                f"is in TAO_AUTOEVAL_SKIP_BASES — Student stays at "
+                f"quality_status=pending for the cold-start NIM-eval fallback."
+            )
             logger.info(
-                "skipping TAO evaluate %s (chain_sequence=%d, base=%s, "
-                "adapter_only=%s) — Student will route through the "
+                "skipping TAO evaluate %s (chain_sequence=%d, base=%s) — "
+                "Student will route through the "
                 "NIM-eval-as-quality-fallback.",
                 next_job.tao_job_id,
                 next_job.chain_sequence,
                 _resolve_trained_base_name(session, next_job),
-                adapter_only,
             )
 
         if (
             next_job_id is None
+            and local_baseline_eval_id is None
             and suite is not None
             and not _chain_has_active_work(
                 session, project_id=project_id, chain_id=chain_id
@@ -1683,7 +1686,15 @@ async def _advance_after_terminal(
         _roll_up_suite_status(session, project_id=project_id, chain_id=chain_id)
         session.commit()
 
-    if next_job_id is not None:
+    if local_baseline_eval_id is not None:
+        await _run_local_baseline_evaluation(
+            project_id,
+            local_baseline_eval_id,
+            chain_id=chain_id,
+            engine=engine,
+            settings=settings,
+        )
+    elif next_job_id is not None:
         await tao_job_service.submit_chain_job(
             project_id, next_job_id, settings=settings
         )
@@ -1747,6 +1758,120 @@ def _chain_trained_adapter_only(job: TAOJob) -> bool:
     """
     lora_cfg: dict[str, Any] = (job.job_config or {}).get("lora_config") or {}
     return lora_cfg.get("enable_lora") is True
+
+
+def _is_lora_baseline_evaluate(session: Session, job: TAOJob) -> bool:
+    """Return True for the post-train evaluate in a LoRA chain.
+
+    Quantized evaluate rows parent on ``quantize`` and remain TAO-native:
+    TAO quantize already materializes a merged quantized checkpoint. Only the
+    baseline row that parents directly on ``train`` needs Blueprint-owned
+    merge + NIM evaluation.
+    """
+    if job.action != "evaluate" or not job.parent_tao_job_id:
+        return False
+    parent = (
+        session.query(TAOJob)
+        .filter_by(
+            project_id=job.project_id,
+            tao_job_id=job.parent_tao_job_id,
+        )
+        .first()
+    )
+    return bool(
+        parent is not None
+        and parent.action == "train"
+        and _chain_trained_adapter_only(parent)
+    )
+
+
+async def _run_local_baseline_evaluation(
+    project_id: str,
+    tao_job_id: str,
+    *,
+    chain_id: str,
+    engine: Engine,
+    settings: Settings,
+) -> None:
+    """Complete a synthetic baseline evaluate row via merged Student NIM."""
+    from vlm_feedback_loop.services import student_model_service
+
+    result = await student_model_service.run_automatic_baseline_evaluation(
+        project_id=project_id,
+        evaluate_tao_job_id=tao_job_id,
+        settings=settings,
+    )
+    with Session(engine) as session:
+        job = (
+            session.query(TAOJob)
+            .filter_by(project_id=project_id, tao_job_id=tao_job_id)
+            .first()
+        )
+        if job is None:
+            return
+        sequence = job.chain_sequence
+        outputs = dict(job.outputs or {})
+        outputs.update(
+            {
+                "evaluation_source": "student_nim_local",
+                "student_model_id": result.get("student_model_id"),
+                "evaluation_run_id": result.get("evaluation_run_id"),
+                "quality_status": result.get("quality_status"),
+                "serving_status": result.get("serving_status"),
+            }
+        )
+        job.outputs = outputs
+        job.completed_at = utc_now()
+        job.outputs_fetch_status = "completed"
+        if result.get("success"):
+            job.status = "succeeded"
+            job.tao_status_raw = "BlueprintLocalNIMEvaluationSucceeded"
+            job.progress = {
+                "metrics_latest": {"stage": "Merged Student NIM evaluation complete"}
+            }
+            job.error_ref = None
+        else:
+            job.status = "failed"
+            job.tao_status_raw = "BlueprintLocalNIMEvaluationFailed"
+            job.error_ref = str(result.get("error") or "local_baseline_eval_failed")
+            if result.get("detail") is not None:
+                outputs["error_detail"] = result["detail"]
+        session.commit()
+
+    if result.get("success"):
+        try:
+            await sse_manager.emit(
+                project_id,
+                "tao_job_completed",
+                {
+                    "run_id": tao_job_id,
+                    "tao_job_id": tao_job_id,
+                    "run_type": "tao_job",
+                    "status": "succeeded",
+                    "evaluation_source": "student_nim_local",
+                },
+            )
+        except Exception:  # pragma: no cover
+            logger.exception("SSE emit failed")
+        await _advance_after_terminal(
+            project_id,
+            chain_id=chain_id,
+            chain_sequence=sequence,
+            engine=engine,
+            settings=settings,
+        )
+        return
+
+    await handle_terminal_failure(
+        project_id,
+        tao_job_id,
+        chain_id=chain_id,
+        chain_sequence=sequence,
+        action="evaluate",
+        terminal_status="failed",
+        engine=engine,
+        settings=settings,
+    )
 
 
 async def handle_terminal_failure(
@@ -2001,6 +2126,15 @@ async def tick(settings: Settings) -> None:
                 project_id,
             )
 
+        revived = _migrate_legacy_lora_baseline_skips(project_id, engine=engine)
+        if revived:
+            logger.info(
+                "tao_polling: revived %d legacy LoRA baseline auto-skip(s) "
+                "for merged Student NIM evaluation (project=%s)",
+                revived,
+                project_id,
+            )
+
         # Chain advance/halt recovery: resume chains frozen by a crash
         # between a terminal commit and its continuation (N+1 submit, or
         # dependent halt + suite roll-up). Runs after the outputs-fetch
@@ -2230,6 +2364,50 @@ async def _recover_stuck_outputs_fetch_in_project(
             settings=settings,
             origin="recovery",
         )
+
+
+def _migrate_legacy_lora_baseline_skips(
+    project_id: str,
+    *,
+    engine: Engine,
+) -> int:
+    """Requeue baseline rows canceled by the former adapter-only policy.
+
+    Releases before 2026-07-30 deliberately auto-skipped these rows because
+    TAO evaluate cannot load LoRA adapters. The Blueprint now owns merge +
+    local NIM evaluation, so the persisted auto-skip fingerprint is safe and
+    precise to revive once. Ordinary user cancellations and base blocklist
+    skips are untouched.
+    """
+    revived = 0
+    with Session(engine) as session:
+        rows = (
+            session.query(TAOJob)
+            .filter(
+                TAOJob.project_id == project_id,
+                TAOJob.action == "evaluate",
+                TAOJob.status == "canceled",
+            )
+            .all()
+        )
+        for row in rows:
+            reason = row.chain_halted_reason or ""
+            if not (
+                reason.startswith(AUTO_SKIP_REASON_PREFIX)
+                and "trained checkpoint is adapter-only" in reason
+                and _is_lora_baseline_evaluate(session, row)
+            ):
+                continue
+            row.status = "not_started"
+            row.completed_at = None
+            row.chain_halted_reason = None
+            row.error_ref = None
+            row.tao_status_raw = None
+            row.progress = None
+            revived += 1
+        if revived:
+            session.commit()
+    return revived
 
 
 # Statuses meaning a chain member is actively owned by the live event

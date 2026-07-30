@@ -40,5 +40,6 @@ async def run_training_preflight_endpoint(
         student_base_model_config_ids=body.student_base_model_config_ids,
         settings=settings,
         include_auto_labeled=body.include_auto_labeled,
+        enable_lora=body.enable_lora,
     )
     return TrainingPreflightResponse.model_validate(result)

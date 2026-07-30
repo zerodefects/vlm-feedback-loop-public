@@ -51,13 +51,14 @@ from vlm_feedback_loop.model_catalog_constants import (
     COSMOS_REASON2_2B,
     COSMOS_REASON2_8B,
 )
-from vlm_feedback_loop.services import tao_job_service
+from vlm_feedback_loop.services import student_model_service, tao_job_service
 from vlm_feedback_loop.services.project_service import (
     set_project_engine,
 )
 from vlm_feedback_loop.services.tao_polling_service import (
     AUTO_SKIP_REASON_PREFIX,
     _advance_after_terminal,
+    _migrate_legacy_lora_baseline_skips,
     _resolve_trained_base_name,
     _trained_base_is_blocklisted,
 )
@@ -438,27 +439,13 @@ class TestBaseBlocklistSkipPath:
         submit_mock.assert_called_once_with(PID, eval_id, settings=settings)
 
 
-class TestAdapterOnlyEvaluateSkip:
-    """LoRA chains skip the post-train evaluate regardless of the base
-    blocklist: cosmos-rl evaluate hands the adapter-only checkpoint to
-    vLLM engine init, which cannot load PEFT-prefixed weights into the
-    bare base class ("There is no module or parameter named
-    'base_model'" — live-verified on FTMS 6.26.3, 2026-07-15).
-    Unlike quantize (which carries in-container merge flags), evaluate
-    exposes no enable_lora merge path, so the skip is unconditional;
-    LoRA Student quality routes through the NIM-eval fallback serving
-    the merged checkpoint.
-    """
+class TestAdapterOnlyBaselineEvaluation:
+    """LoRA baselines are merged and evaluated by the local Student NIM."""
 
     @pytest.mark.asyncio
-    async def test_lora_evaluate_skipped_even_when_base_not_blocklisted(
+    async def test_lora_evaluate_runs_via_local_student_nim(
         self, tmp_path, monkeypatch
     ):
-        """A 2B LoRA chain's evaluate is auto-canceled with the adapter-only
-        reason even though the 2B base is not in TAO_AUTOEVAL_SKIP_BASES —
-        the full-FT 2B evaluate works and stays submitted (guarded by
-        ``test_2b_evaluate_NOT_skipped_under_default_settings``); the
-        adapter-only checkpoint is what dooms this one."""
         engine, workspace, _pdir = _seed_project(tmp_path)
         _train_id, eval_id, _ = _seed_chain(
             engine,
@@ -470,6 +457,20 @@ class TestAdapterOnlyEvaluateSkip:
         settings = _make_settings(workspace)
         submit_mock = AsyncMock()
         monkeypatch.setattr(tao_job_service, "submit_chain_job", submit_mock)
+        local_eval = AsyncMock(
+            return_value={
+                "success": True,
+                "student_model_id": "student-1",
+                "evaluation_run_id": "run-1",
+                "quality_status": "validated",
+                "serving_status": "validated",
+            }
+        )
+        monkeypatch.setattr(
+            student_model_service,
+            "run_automatic_baseline_evaluation",
+            local_eval,
+        )
 
         await _advance_after_terminal(
             PID,
@@ -481,19 +482,18 @@ class TestAdapterOnlyEvaluateSkip:
 
         with Session(engine) as s:
             eval_row = s.query(TAOJob).filter_by(tao_job_id=eval_id).one()
-            assert eval_row.status == "canceled"
-            reason = eval_row.chain_halted_reason or ""
-            # roll-up success-equivalence key
-            assert reason.startswith(AUTO_SKIP_REASON_PREFIX)
-            assert "adapter-only" in reason
+            assert eval_row.status == "succeeded"
+            assert eval_row.training_backend == "student_nim_local"
+            assert eval_row.outputs["evaluation_source"] == "student_nim_local"
+            assert eval_row.outputs["evaluation_run_id"] == "run-1"
             assert eval_row.completed_at is not None
+        local_eval.assert_awaited_once()
         submit_mock.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_lora_skip_survives_empty_blocklist(self, tmp_path, monkeypatch):
-        """Clearing TAO_AUTOEVAL_SKIP_BASES disables the base blocklist
-        but NOT the adapter-only skip — the LoRA crash is structural
-        (no evaluate-side merge path exists to re-enable)."""
+    async def test_lora_local_evaluation_survives_empty_blocklist(
+        self, tmp_path, monkeypatch
+    ):
         engine, workspace, _pdir = _seed_project(tmp_path)
         _train_id, eval_id, _ = _seed_chain(
             engine,
@@ -505,6 +505,19 @@ class TestAdapterOnlyEvaluateSkip:
         settings = _make_settings(workspace, skip_bases=[])
         submit_mock = AsyncMock()
         monkeypatch.setattr(tao_job_service, "submit_chain_job", submit_mock)
+        monkeypatch.setattr(
+            student_model_service,
+            "run_automatic_baseline_evaluation",
+            AsyncMock(
+                return_value={
+                    "success": True,
+                    "student_model_id": "student-1",
+                    "evaluation_run_id": "run-1",
+                    "quality_status": "validated",
+                    "serving_status": "validated",
+                }
+            ),
+        )
 
         await _advance_after_terminal(
             PID,
@@ -516,18 +529,13 @@ class TestAdapterOnlyEvaluateSkip:
 
         with Session(engine) as s:
             eval_row = s.query(TAOJob).filter_by(tao_job_id=eval_id).one()
-            assert eval_row.status == "canceled"
-            assert "adapter-only" in (eval_row.chain_halted_reason or "")
+            assert eval_row.status == "succeeded"
         submit_mock.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_lora_skip_finalizes_suite_completed_not_failed(
+    async def test_lora_local_evaluation_finalizes_suite_completed(
         self, tmp_path, monkeypatch
     ):
-        """The adapter-only skip reuses the auto-skip reason prefix so the
-        suite roll-up counts the canceled evaluate as success-equivalent:
-        train(succeeded) + evaluate(adapter-only-skipped) finalizes the
-        suite "completed", not "failed"."""
         engine, workspace, _pdir = _seed_project(tmp_path)
         _train_id, _eval_id, _ = _seed_chain(
             engine,
@@ -538,6 +546,19 @@ class TestAdapterOnlyEvaluateSkip:
         )
         settings = _make_settings(workspace)
         monkeypatch.setattr(tao_job_service, "submit_chain_job", AsyncMock())
+        monkeypatch.setattr(
+            student_model_service,
+            "run_automatic_baseline_evaluation",
+            AsyncMock(
+                return_value={
+                    "success": True,
+                    "student_model_id": "student-1",
+                    "evaluation_run_id": "run-1",
+                    "quality_status": "validated",
+                    "serving_status": "validated",
+                }
+            ),
+        )
 
         await _advance_after_terminal(
             PID,
@@ -551,3 +572,30 @@ class TestAdapterOnlyEvaluateSkip:
             suite = s.query(TrainingSuite).filter_by(project_id=PID).one()
             assert suite.status == "completed"
             assert suite.completed_at is not None
+
+    def test_legacy_adapter_only_skip_is_revived_once(self, tmp_path):
+        engine, _workspace, _pdir = _seed_project(tmp_path)
+        _train_id, eval_id, _ = _seed_chain(
+            engine,
+            chain_id=CHAIN,
+            train_status="succeeded",
+            base_mc_id=MC_2B,
+            lora=True,
+        )
+        with Session(engine) as session:
+            row = session.query(TAOJob).filter_by(tao_job_id=eval_id).one()
+            row.status = "canceled"
+            row.completed_at = "2026-07-15T00:00:00Z"
+            row.chain_halted_reason = (
+                f"{AUTO_SKIP_REASON_PREFIX} action=evaluate auto-skipped; "
+                "trained checkpoint is adapter-only (enable_lora=true)"
+            )
+            session.commit()
+
+        assert _migrate_legacy_lora_baseline_skips(PID, engine=engine) == 1
+        assert _migrate_legacy_lora_baseline_skips(PID, engine=engine) == 0
+        with Session(engine) as session:
+            row = session.query(TAOJob).filter_by(tao_job_id=eval_id).one()
+            assert row.status == "not_started"
+            assert row.completed_at is None
+            assert row.chain_halted_reason is None

@@ -180,8 +180,12 @@ Fine-tune Student models (Cosmos-RL / TAO) from Verified data. A **training suit
 | `GET` | `/v1/projects/{project_id}/tao_jobs/{tao_job_id}` | Get a job; `?refresh=true` polls the external TAO service |
 | `POST` | `/v1/projects/{project_id}/tao_jobs/{tao_job_id}:cancel` | Cancel a job and halt downstream chain siblings; `?force_local=true` cancels the local row when TAO is unreachable |
 
-`training_preflight` accepts `student_base_model_config_ids[]` and
-`include_auto_labeled`. In addition to structured checks, `data_summary`
+`training_preflight` accepts `student_base_model_config_ids[]`,
+`include_auto_labeled`, and `enable_lora` (default `true`). LoRA readiness also
+checks the Blueprint's local merge runtime and `HF_TOKEN`, because the
+full-precision baseline is merged and evaluated through the local Student NIM
+instead of TAO's adapter-incompatible evaluate action. In addition to
+structured checks, `data_summary`
 returns `verified_training_count`, `test_pool_count`,
 `auto_labeled_eligible_count`, `auto_labeled_included_count`,
 `excluded_test_pool_count`, `excluded_auto_labeled_count`, and

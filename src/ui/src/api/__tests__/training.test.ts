@@ -74,6 +74,7 @@ describe("runTrainingPreflight", () => {
     expect(JSON.parse(init?.body as string)).toEqual({
       student_base_model_config_ids: ["mc-2b"],
       include_auto_labeled: false,
+      enable_lora: true,
     });
   });
 });

@@ -255,6 +255,13 @@ TAO FTMS instance.
 
 > **TAO access in containerized mode:** TAO job submission, monitoring, and dataset upload are remote HTTP and work from the container. The post-training packaging step for **adapter-only (full-precision) checkpoints** — `scripts/merge_lora.py` plus its provisioned merge venv — is **local-source-only**: the backend image ships neither the script nor a merge interpreter. Quantized variants are unaffected (TAO merges them remotely), and serving a trained Student behind a local NIM already requires local-source mode.
 
+For local-source Profile C installations, `scripts/setup-dev.sh` provisions
+the isolated merge runtime at
+`~/.local/share/vlm-feedback-loop/merge-lora-venv`. LoRA Student Training
+readiness fails closed if that runtime or `HF_TOKEN` is absent: the token is
+needed on the Blueprint host to load the gated base for adapter merge even
+when TAO already has its own provisioned copy.
+
 ## Troubleshooting
 
 | Symptom | Fix |

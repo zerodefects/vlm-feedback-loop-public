@@ -1542,7 +1542,15 @@ See §9.7.8 for full details.
 
 Quantization is an explicit post-training stage. Uses TAO Cosmos-RL `quantize` action exclusively. Full Student lifecycle:
 
-`fine_tune → evaluate_baseline → quantize(optional) → evaluate_quantized → package_for_nim → deploy`
+`fine_tune → merge_and_evaluate_baseline_via_student_nim → quantize(optional) → evaluate_quantized_via_tao → package_for_nim → deploy`
+
+For a LoRA chain, TAO evaluate cannot consume the adapter-only post-train
+checkpoint. The Blueprint merges the adapter locally, serves the merged
+full-precision checkpoint through the temporary Student NIM, evaluates the
+frozen Test Pool, and records that Run on the baseline job. Quantized
+evaluation remains TAO-native because TAO quantize already performs the merge.
+The training readiness gate therefore requires both `HF_TOKEN` and the local
+merge runtime whenever LoRA is enabled.
 
 **Default quantization:** FP8_DYNAMIC only for Validate training setup,
 producing baseline + FP8. W4A16, W8A8, and W8A16 are explicit additional

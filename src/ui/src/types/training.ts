@@ -53,6 +53,7 @@ export type TrainingPreflightCheckName =
   | "tao_workspace_reachable"
   | "tao_base_experiment_ready"
   | "hf_token_configured"
+  | "lora_merge_runtime"
   | "student_base_role"
   | "verified_train_examples";
 

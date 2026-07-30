@@ -183,6 +183,21 @@ describe("JobCard state bodies", () => {
     expect(outputs.textContent).toContain("/art/metrics.json");
   });
 
+  it("identifies a Blueprint-merged local Student NIM baseline evaluation", async () => {
+    renderCard("succeeded", {
+      completed_at: "2026-07-30T19:20:00Z",
+      outputs: {
+        evaluation_source: "student_nim_local",
+        evaluation_run_id: "run-local-baseline",
+      },
+    });
+    const outputs = await screen.findByTestId("training-job-outputs");
+    expect(outputs.textContent).toContain("Evaluation source");
+    expect(outputs.textContent).toContain("Merged checkpoint · local Student NIM");
+    expect(outputs.textContent).toContain("Evaluation run");
+    expect(outputs.textContent).toContain("run-local-baseline");
+  });
+
   it("failed card renders a friendly reason for bare-token error_refs, never raw snake_case", async () => {
     renderCard("failed", { error_ref: "submission_interrupted" });
     await screen.findByText(/Submission interrupted/);

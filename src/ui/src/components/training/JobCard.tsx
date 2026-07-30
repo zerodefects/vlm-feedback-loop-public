@@ -94,6 +94,20 @@ function renderArtifacts(outputs: TAOJob["outputs"]) {
       value: String(outputs.metrics_ref),
     });
   }
+  if (outputs.evaluation_source === "student_nim_local") {
+    rows.push({
+      key: "evaluation_source",
+      label: "Evaluation source",
+      value: "Merged checkpoint · local Student NIM",
+    });
+  }
+  if (outputs.evaluation_run_id) {
+    rows.push({
+      key: "evaluation_run_id",
+      label: "Evaluation run",
+      value: String(outputs.evaluation_run_id),
+    });
+  }
   return rows;
 }
 

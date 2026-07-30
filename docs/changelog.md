@@ -4,6 +4,19 @@ Notable user-facing changes to the Interactive VLM Feedback Loop are recorded
 here. The public release begins with v1.0; private development history and
 pre-release database revisions are intentionally excluded.
 
+## 2026-07-30 — LoRA baseline merge and evaluation
+
+- LoRA training chains now merge the adapter with its gated base on the
+  Blueprint host and automatically evaluate the resulting full-precision
+  checkpoint through the local Student NIM. The Training monitor records this
+  as the real baseline evaluation instead of canceling TAO's unsupported
+  adapter-only evaluate action.
+- Quantized evaluation remains TAO-native because TAO quantization already
+  emits a merged quantized checkpoint.
+- Student Training readiness now requires `HF_TOKEN` and a working isolated
+  LoRA merge runtime when LoRA is enabled. `scripts/setup-dev.sh` provisions
+  the shared runtime automatically.
+
 ## 2026-07-29 — Public FTUE and release hardening
 
 - Made Docker Compose with hosted NVIDIA endpoints the primary SME quick

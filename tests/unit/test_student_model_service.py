@@ -204,7 +204,7 @@ class TestResolveMergePython:
         )
         assert _resolve_merge_python(settings) == "/opt/ml/bin/python"
 
-    def test_provisioned_venv_used_when_present(self, tmp_path):
+    def test_provisioned_venv_used_when_present(self, tmp_path, monkeypatch):
         import sys as _sys
         from types import SimpleNamespace
 
@@ -212,6 +212,10 @@ class TestResolveMergePython:
             _resolve_merge_python,
         )
 
+        monkeypatch.setattr(
+            "vlm_feedback_loop.services.student_model_service.Path.home",
+            lambda: tmp_path / "fake-home",
+        )
         settings = SimpleNamespace(MERGE_LORA_PYTHON=None, WORKSPACE_ROOT=str(tmp_path))
         # No venv → backend interpreter (needs manual dep install).
         assert _resolve_merge_python(settings) == _sys.executable
@@ -219,6 +223,25 @@ class TestResolveMergePython:
         venv_python.parent.mkdir(parents=True)
         venv_python.touch()
         assert _resolve_merge_python(settings) == str(venv_python)
+
+    @pytest.mark.asyncio
+    async def test_merge_readiness_fails_for_missing_configured_interpreter(
+        self, tmp_path
+    ):
+        from types import SimpleNamespace
+
+        from vlm_feedback_loop.services.student_model_service import (
+            check_lora_merge_readiness,
+        )
+
+        missing = tmp_path / "missing-python"
+        settings = SimpleNamespace(
+            MERGE_LORA_PYTHON=str(missing),
+            WORKSPACE_ROOT=str(tmp_path),
+        )
+        ready, message = await check_lora_merge_readiness(settings)
+        assert ready is False
+        assert str(missing) in message
 
 
 class TestPackaging:

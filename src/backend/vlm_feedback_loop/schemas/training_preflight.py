@@ -25,6 +25,7 @@ class TrainingPreflightRequest(BaseModel):
 
     student_base_model_config_ids: list[str] = Field(..., min_length=1)
     include_auto_labeled: bool = True
+    enable_lora: bool = True
 
 
 class TrainingPreflightCheck(BaseModel):
@@ -38,6 +39,7 @@ class TrainingPreflightCheck(BaseModel):
         "tao_workspace_reachable",
         "tao_base_experiment_ready",
         "hf_token_configured",
+        "lora_merge_runtime",
         "student_base_role",
         "verified_train_examples",
     ]

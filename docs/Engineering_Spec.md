@@ -3273,6 +3273,10 @@ The training-suite launch path MUST verify:
 - Each selected model has the `student_base` role.
 - The training export has at least one eligible Verified example.
 - For each selected `student_base_model_config_id`, determine either (a) the base is ready (`tao_base_experiment_id` non-null and pull status `pull_complete`) or (b) automatic first-use provisioning is required.
+- When `enable_lora=true`, the Blueprint host has `HF_TOKEN` and a usable
+  isolated merge interpreter containing torch, transformers, peft, accelerate,
+  and safetensors. This is required even when the TAO copy of the base is
+  already provisioned because baseline packaging loads the gated base locally.
 
 These checks are rendered from the same `training_preflight` service on the
 Scale-Up Hub and Student Training screen; they are not reimplemented in
@@ -3297,7 +3301,25 @@ Self-service registers Hugging Face-format checkpoints (`config.json` + `*.safet
 
 Quantization is an explicit post-training stage, not an implicit attribute of the Student. Quantization uses the TAO Cosmos-RL `quantize` action exclusively. The full Student lifecycle is:
 
-`fine_tune → evaluate_baseline → quantize(optional) → evaluate_quantized → package_for_nim → deploy`
+`fine_tune → merge_and_evaluate_baseline_via_student_nim → quantize(optional) → evaluate_quantized_via_tao → package_for_nim → deploy`
+
+**LoRA baseline evaluation amendment (2026-07-30).** TAO FTMS 6.26.3's v2
+`evaluate` action does not expose `enable_lora` or `base_model_path`; submitting
+the adapter-only training output directly causes vLLM to reject PEFT-prefixed
+weights. For the post-`train` baseline row of a LoRA chain, the Blueprint MUST
+therefore: fetch the adapter, merge it with the persisted
+`resolved_training_fields.policy.model_name_or_path`, validate the merged
+Hugging Face checkpoint, deploy it temporarily through the normal local
+Student NIM lifecycle, evaluate the frozen Test Pool, and persist that Run ID
+on both the StudentModel and the existing baseline `TAOJob` row. That row uses
+`training_backend="student_nim_local"` and
+`outputs.evaluation_source="student_nim_local"`; it reaches `succeeded` only
+when serving validates and quality is `validated` or `partial`. A failure is a
+real evaluate failure and follows normal chain-isolation semantics.
+
+This redirect applies only when the evaluate row parents directly on `train`.
+An evaluate row parented on `quantize` remains TAO-native because quantize
+already merged the LoRA adapter while producing the quantized checkpoint.
 
 **Default quantization:** `FP8_DYNAMIC` alone is pre-selected for **Validate
 training setup**, producing a full-precision baseline and FP8 variant.
@@ -4576,7 +4598,8 @@ Request:
 ```json
 {
   "student_base_model_config_ids": ["string"],
-  "include_auto_labeled": true
+  "include_auto_labeled": true,
+  "enable_lora": true
 }
 ```
 
