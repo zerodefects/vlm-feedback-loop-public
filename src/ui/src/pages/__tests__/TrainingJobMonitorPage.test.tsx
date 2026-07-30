@@ -523,7 +523,10 @@ describe("TrainingJobMonitorPage", () => {
     await waitFor(() =>
       expect(mockGenerateActionRequest).toHaveBeenCalledWith(
         "pid-1",
-        expect.objectContaining({ request_type: "tao_issue" }),
+        expect.objectContaining({
+          request_type: "tao_issue",
+          context: { tao_job_id: "f-1" },
+        }),
       ),
     );
   });

@@ -1895,9 +1895,33 @@ class TestQuantizePayloadSpec:
         specs = request["specs"]
         assert specs["max_sequence_length"] == 16384
         assert specs["quantization_scheme"] == "FP8_DYNAMIC"
+        assert specs["num_calibration_samples"] == 128
         # Train-specific blocks stay out of the quantize spec (the
         # cosmos-rl-quantize CLI rejects their flag names).
         assert "train" not in specs and "policy" not in specs
+
+    def test_quantize_spec_accepts_operator_calibration_cap(self):
+        """Large-image projects can lower the bounded calibration set
+        without changing any TAO-side code."""
+        from vlm_feedback_loop.services.training_suite_service import (
+            _build_quantize_payload,
+        )
+
+        _, request = _build_quantize_payload(
+            quantization_method="FP8_DYNAMIC",
+            training_archive_path="seaweedfs://bucket/exports/e1/e1.tar.gz",
+            training_annotation_path="seaweedfs://bucket/exports/e1/a.json",
+            parent_tao_job_id="parent-ext-id",
+            tao_release_version="6.26.3",
+            cosmos_rl_container_tag="6.26.3-cosmos-rl",
+            training_preset="quick",
+            workspace_id="ws-1",
+            base_experiment_id="be-1",
+            job_name="vlm-fb-quantize-test",
+            calibration_samples=64,
+        )
+
+        assert request["specs"]["num_calibration_samples"] == 64
 
     def test_lora_chain_quantize_spec_carries_merge_flags(self):
         """A quantize on an adapter-only parent must tell the container to

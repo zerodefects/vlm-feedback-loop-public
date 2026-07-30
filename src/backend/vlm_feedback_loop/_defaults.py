@@ -162,6 +162,11 @@ DEFAULTS: dict[str, Any] = {
     # a generous 24-hour stale-job ceiling on every suite job. This remains
     # an operator-overridable dead-job backstop, not a runtime estimate.
     "TAO_JOB_TIMEOUT_MINUTES": 1440,
+    # Cosmos-RL's default of 512 can exceed PyArrow's 2 GiB ListArray
+    # offset ceiling when VLM calibration samples contain high-resolution
+    # images. 128 retains a representative calibration set while keeping
+    # the materialized nested arrays comfortably below that hard limit.
+    "TAO_QUANTIZATION_CALIBRATION_SAMPLES": 128,
     # Partial quality_status threshold. A NIM eval that
     # finishes ``incomplete`` but produces parseable output on at least this
     # fraction of examples promotes the paired StudentModel to

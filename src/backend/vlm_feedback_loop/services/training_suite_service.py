@@ -603,6 +603,7 @@ def _build_quantize_payload(
     base_experiment_id: str,
     job_name: str,
     timeout_minutes: int | None = None,
+    calibration_samples: int = 128,
     enable_lora: bool = False,
     base_model_path: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -696,6 +697,12 @@ def _build_quantize_payload(
     specs: dict[str, Any] = {
         "quantization_scheme": quantization_method,
         "max_sequence_length": 16384,
+        # Cosmos-RL defaults to 512 and materializes every preprocessed
+        # VLM sample into one Arrow ListArray. High-resolution images can
+        # push that array beyond PyArrow's signed 32-bit (2 GiB) offset
+        # ceiling after the final sample, even though all samples mapped
+        # successfully. Cap the calibration set before materialization.
+        "num_calibration_samples": calibration_samples,
     }
     # Adapter-only parents need the in-container LoRA merge.
     # Emitted explicitly rather than relying on FTMS's inherited
@@ -757,6 +764,7 @@ def _create_chain_rows_in_session(
     base_experiment_id: str,
     enable_lora: bool = True,
     timeout_minutes: int | None = None,
+    quantization_calibration_samples: int = 128,
 ) -> tuple[str, list[TAOJob]]:
     """Pre-create one model's full TAO chain with status=not_started.
 
@@ -868,6 +876,7 @@ def _create_chain_rows_in_session(
                 chain_sequence=seq,
             ),
             timeout_minutes=timeout_minutes,
+            calibration_samples=quantization_calibration_samples,
             enable_lora=enable_lora,
             base_model_path=_hf_path_for_model(mc) if enable_lora else None,
         )
@@ -1696,6 +1705,9 @@ async def create_training_suite(
                     base_experiment_id=base_experiment_id,
                     enable_lora=enable_lora,
                     timeout_minutes=settings.TAO_JOB_TIMEOUT_MINUTES,
+                    quantization_calibration_samples=(
+                        settings.TAO_QUANTIZATION_CALIBRATION_SAMPLES
+                    ),
                 )
                 chain_ids_ordered.append(chain_id)
                 if first_chain_train_job is None:

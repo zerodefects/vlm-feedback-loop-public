@@ -169,6 +169,16 @@ class Settings(BaseModel):
             "This is a dead-job reaper, not an expected training duration."
         ),
     )
+    TAO_QUANTIZATION_CALIBRATION_SAMPLES: int = Field(
+        default=DEFAULTS["TAO_QUANTIZATION_CALIBRATION_SAMPLES"],
+        ge=1,
+        le=512,
+        description=(
+            "Maximum calibration examples materialized by Cosmos-RL quantize. "
+            "The 128 default avoids PyArrow's 2 GiB nested-array offset limit "
+            "on high-resolution VLM images."
+        ),
+    )
     STUDENT_QUALITY_PARTIAL_PARSEABLE_THRESHOLD: float = DEFAULTS[
         "STUDENT_QUALITY_PARTIAL_PARSEABLE_THRESHOLD"
     ]

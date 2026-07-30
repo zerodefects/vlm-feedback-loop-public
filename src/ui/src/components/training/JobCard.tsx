@@ -269,6 +269,7 @@ export function JobCard({
           <ActionRequestPanel
             projectId={projectId}
             requestType="tao_issue"
+            context={{ tao_job_id: suiteJob.tao_job_id }}
             onClose={() => setShowReportIssue(false)}
           />
         </div>

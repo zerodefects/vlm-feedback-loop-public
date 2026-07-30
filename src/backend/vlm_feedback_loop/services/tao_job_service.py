@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC
@@ -192,6 +193,7 @@ _COMPILE_HINT = "compile is not supported"
 _FILE_NOT_FOUND_HINT = "filenotfounderror"
 _HF_LOCAL_PATH_REJECT_HINT = "repo id must be in the form"
 _TAO_400_HINTS = ("missing required field", "validation error", "invalid enum member")
+_ARROW_OFFSET_OVERFLOW_HINT = "offset overflow while concatenating arrays"
 
 
 def classify_tao_failure(raw_error: str | None) -> tuple[str, str | None]:
@@ -206,6 +208,15 @@ def classify_tao_failure(raw_error: str | None) -> tuple[str, str | None]:
         return ("", None)
     lowered = raw_error.lower()
 
+    if _ARROW_OFFSET_OVERFLOW_HINT in lowered:
+        return (
+            "Cosmos-RL exceeded PyArrow's 2 GiB ListArray offset ceiling "
+            "while materializing high-resolution VLM calibration samples. "
+            "The Blueprint quantize spec must bound "
+            "num_calibration_samples (128 by default); retry the quantize "
+            "job with the bounded spec.",
+            "quantization_arrow_offset_overflow",
+        )
     if any(h in lowered for h in _GATED_HF_HINTS):
         return (
             "Cosmos-RL container hit HuggingFace gated-repo (HTTP 401). "
@@ -263,6 +274,33 @@ def classify_tao_failure(raw_error: str | None) -> tuple[str, str | None]:
         )
 
     return (raw_error, None)
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_ACTION_FAILURE_RE = re.compile(
+    r"(?:Quantization|Training|Evaluation) failed:\s*(.+)",
+    flags=re.IGNORECASE,
+)
+
+
+def extract_actionable_failure_from_logs(log_text: str | None) -> str | None:
+    """Extract the worker exception that FTMS's final status line hides.
+
+    FTMS often reports only ``"quantize action failed for cosmos-rl"`` in
+    ``job_details.detailed_status`` even though ``:logs`` contains the
+    concrete exception immediately before it. Return a sanitized,
+    classified one-line error suitable for ``TAOJob.error_ref``.
+    """
+    if not log_text:
+        return None
+    clean = _ANSI_ESCAPE_RE.sub("", log_text)
+    matches = _ACTION_FAILURE_RE.findall(clean)
+    if not matches:
+        return None
+    raw = matches[0].strip()
+    # TAO's colored logger appends its source location after the message.
+    raw = re.sub(r"\s+\(logging\.py:\d+\)\s*$", "", raw)
+    return format_failure_error_ref(raw)
 
 
 def format_failure_error_ref(raw_msg: str) -> str | None:

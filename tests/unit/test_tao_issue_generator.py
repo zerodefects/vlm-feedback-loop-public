@@ -145,6 +145,41 @@ class TestRenderedContent:
         # Standard diagnostic suggestions
         assert "R580+" in text  # driver compatibility hint
 
+    def test_generic_status_is_replaced_from_captured_worker_logs(
+        self, tmp_path, monkeypatch
+    ):
+        engine, workspace = _setup_project_db(tmp_path)
+        settings = make_tao_settings(workspace)
+        with Session(engine) as s:
+            _seed_project(s, workspace / "projects" / PID)
+            _seed_tao_job(
+                s,
+                action="quantize",
+                error_ref="quantize action failed for cosmos-rl",
+            )
+            job = s.query(TAOJob).filter_by(tao_job_id=TID).one()
+            job.outputs = {
+                "tao_logs_text": (
+                    "Quantization failed: offset overflow while concatenating "
+                    "arrays, consider casting to large_list first.\n"
+                    "quantize action failed for cosmos-rl"
+                )
+            }
+            s.commit()
+        monkeypatch.setattr(
+            "vlm_feedback_loop.services.tao_issue_generator.get_settings",
+            lambda: settings,
+        )
+
+        result = generate_action_request(
+            "tao_issue", "Test Project", PID, {"tao_job_id": TID}
+        )
+        text = result["rendered_text"]
+        assert f"Job ID: {TID}" in text
+        assert "Action: quantize" in text
+        assert "offset overflow while concatenating arrays" in text
+        assert "num_calibration_samples" in text
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Framework redact on secrets

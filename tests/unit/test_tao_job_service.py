@@ -48,8 +48,10 @@ from vlm_feedback_loop.services.tao_job_service import (
     apply_dataset_binding,
     can_transition,
     cancel_tao_job,
+    classify_tao_failure,
     compute_request_checksum,
     create_tao_job,
+    extract_actionable_failure_from_logs,
     get_tao_job,
     list_tao_jobs,
     map_tao_raw_status,
@@ -306,6 +308,26 @@ class TestStateMachine:
     def test_map_tao_raw_status_none_preserves_current(self):
         assert map_tao_raw_status(None, current="running") == "running"
         assert map_tao_raw_status(None, current="paused") == "paused"
+
+    def test_extracts_quantize_exception_hidden_by_generic_ftms_status(self):
+        logs = (
+            "\x1b[31;20mERROR - Quantization failed: offset overflow while "
+            "concatenating arrays, consider casting input to large_list first. "
+            "(logging.py:191)\x1b[0m\n"
+            "INFO - quantize action failed for cosmos-rl\n"
+        )
+        result = extract_actionable_failure_from_logs(logs)
+        assert result is not None
+        assert "offset overflow while concatenating arrays" in result
+        assert "2 GiB" in result
+        assert "num_calibration_samples" in result
+
+    def test_classifies_arrow_offset_overflow(self):
+        friendly, category = classify_tao_failure(
+            "pyarrow.lib.ArrowInvalid: offset overflow while concatenating arrays"
+        )
+        assert category == "quantization_arrow_offset_overflow"
+        assert "128" in friendly
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -4,6 +4,20 @@ Notable user-facing changes to the Interactive VLM Feedback Loop are recorded
 here. The public release begins with v1.0; private development history and
 pre-release database revisions are intentionally excluded.
 
+## 2026-07-30 — High-resolution quantization recovery
+
+- Cosmos-RL quantization now caps calibration at 128 examples by default,
+  preventing high-resolution VLM datasets from exceeding PyArrow's 2 GiB
+  nested-array offset ceiling while preserving a representative calibration
+  set. Operators can tune the cap with
+  `TAO_QUANTIZATION_CALIBRATION_SAMPLES`.
+- Failed-job cards now pass the exact TAO job identity into Report TAO Issue,
+  so reports contain the local/external IDs, action, model, configuration, and
+  logs endpoint.
+- When FTMS returns only a generic action-failed status, the Blueprint now
+  extracts and classifies the actionable worker exception from captured TAO
+  logs for both the monitor and issue report.
+
 ## 2026-07-30 — LoRA baseline merge and evaluation
 
 - LoRA training chains now merge the adapter with its gated base on the

@@ -64,6 +64,7 @@ backend settings in this table are passed through to the container:
 | `NVIDIA_API_KEY` / `NGC_API_KEY` | unset | NIM credentials passed through to the backend |
 | `TAO_API_KEY` / `TAO_API_BASE_URL` / `TAO_ORG_NAME` | unset | TAO FTMS credentials for Student training |
 | `TAO_JOB_TIMEOUT_MINUTES` | `1440` | Per-job TAO stale-heartbeat ceiling. This is a dead-job reaper, not a runtime estimate; Student Training preflight blocks an unpatched FTMS v2 API that cannot accept it |
+| `TAO_QUANTIZATION_CALIBRATION_SAMPLES` | `128` | Calibration examples materialized by Cosmos-RL quantize. The bounded default avoids PyArrow's 2 GiB nested-array offset overflow on high-resolution VLM datasets |
 | `TAO_WORKSPACE_S3_ACCESS_KEY` / `TAO_WORKSPACE_S3_SECRET_KEY` | unset | TAO workspace S3 credentials for training-dataset uploads (§9.7.8.2) |
 | `HF_TOKEN` | unset | HuggingFace token for gated Cosmos base pulls. **Start Training** uses it to provision a selected missing base in both local-source and containerized modes, and injects it into remote TAO jobs. The local LoRA-merge fallback remains local-source-only. |
 | `ALLOW_UI_SECRET_PERSIST` | `false` | Whether the UI's "Save to .env" path may persist pasted API keys. Off by default in containers: the write target (`/home/appuser/.vlm_feedback_loop/.env`) sits in the container's ephemeral layer — no volume covers it — so a "saved" key would silently vanish on the next `docker compose up --build`/recreate. Keys pasted in the UI still apply for the process lifetime; persistent keys belong in the shell environment or the repo-root `.env` compose reads. Set `true` only if you mount a persistent `/home/appuser/.vlm_feedback_loop` |
@@ -96,6 +97,9 @@ For local-source mode, override `TAO_JOB_TIMEOUT_MINUTES` in
 or repository-root `.env`. The shipped 1440-minute value prevents
 cosmos-rl's quiet training loop from being mistaken for a stale job at FTMS's
 60-minute fallback. Increase it for legitimate runs longer than 24 hours.
+`TAO_QUANTIZATION_CALIBRATION_SAMPLES` is configured through
+the same paths; raise it only after confirming the calibration dataset's
+preprocessed nested arrays remain below PyArrow's 2 GiB offset ceiling.
 
 ### Data persistence
 

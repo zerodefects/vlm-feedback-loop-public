@@ -1995,6 +1995,16 @@ async def handle_terminal_failure(
                 outputs = dict(failed_job.outputs or {})
                 outputs["tao_logs_text"] = log_text
                 failed_job.outputs = outputs
+                actionable_error = (
+                    tao_job_service.extract_actionable_failure_from_logs(log_text)
+                )
+                generic_error = (
+                    not failed_job.error_ref
+                    or failed_job.error_ref.strip().lower()
+                    == f"{action} action failed for cosmos-rl"
+                )
+                if actionable_error and generic_error:
+                    failed_job.error_ref = actionable_error
 
         # Evaluate failure → flip paired StudentModel
         # quality_status="failed" (two-part readiness).
