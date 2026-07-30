@@ -956,6 +956,19 @@ async def poll_tao_job(
 def _job_to_dict(job: TAOJob) -> dict[str, Any]:
     """Convert a TAOJob ORM row to the response dict shape."""
     dataset_export_ids: list[str] = [str(x) for x in job.dataset_export_ids]
+    error_ref = job.error_ref
+    logs_text = (job.outputs or {}).get("tao_logs_text")
+    actionable_error = extract_actionable_failure_from_logs(
+        logs_text if isinstance(logs_text, str) else None
+    )
+    if actionable_error and (
+        not error_ref
+        or error_ref.strip().lower() == f"{job.action} action failed for cosmos-rl"
+    ):
+        # Backward-compatible read repair: jobs that failed before actionable
+        # log extraction shipped retain their immutable DB audit row while the
+        # API/UI expose the concrete captured worker exception.
+        error_ref = actionable_error
 
     return {
         "tao_job_id": job.tao_job_id,
@@ -977,7 +990,7 @@ def _job_to_dict(job: TAOJob) -> dict[str, Any]:
         "chain_sequence": job.chain_sequence,
         "chain_halted_reason": job.chain_halted_reason,
         "preflight_result": job.preflight_result,
-        "error_ref": job.error_ref,
+        "error_ref": error_ref,
         "poll_error_ref": job.poll_error_ref,
         "created_at": job.created_at,
         "started_at": job.started_at,

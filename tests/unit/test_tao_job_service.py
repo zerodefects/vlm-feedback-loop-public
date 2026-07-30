@@ -329,6 +329,33 @@ class TestStateMachine:
         assert category == "quantization_arrow_offset_overflow"
         assert "128" in friendly
 
+    def test_job_response_repairs_historical_generic_failure_from_logs(self):
+        job = TAOJob(
+            tao_job_id="job-old",
+            project_id=PID,
+            student_base_model_config_id=MCID,
+            dataset_export_ids=[EXPORT_A],
+            action="quantize",
+            status="failed",
+            training_backend="cosmos_rl_tao_vlm",
+            job_config={},
+            tao_create_job_request={},
+            error_ref="quantize action failed for cosmos-rl",
+            outputs={
+                "tao_logs_text": (
+                    "Quantization failed: offset overflow while concatenating "
+                    "arrays, consider casting to large_list first."
+                )
+            },
+            created_at=utc_now(),
+        )
+
+        response = tao_job_service._job_to_dict(job)
+        assert "offset overflow while concatenating arrays" in response["error_ref"]
+        assert "num_calibration_samples" in response["error_ref"]
+        # The read repair does not rewrite the immutable historical row.
+        assert job.error_ref == "quantize action failed for cosmos-rl"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HF_TOKEN passthrough via docker_env_vars
