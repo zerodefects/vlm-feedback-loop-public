@@ -717,6 +717,7 @@ def _derive_progress_from_job_details(
     job_entry: dict[str, Any],
     *,
     network_arch: str | None = None,
+    action: str | None = None,
 ) -> dict[str, Any] | None:
     """Map FTMS 6.26.3 JobResult fields onto the §7 progress shape.
 
@@ -736,10 +737,22 @@ def _derive_progress_from_job_details(
     that genuinely reports the metric) and every other backend's values
     pass through verbatim.
     """
+    # JobResult is shared by every FTMS action.  In particular, quantize
+    # currently fills ``max_epoch`` and ``time_per_epoch`` with its generic
+    # work-unit telemetry (for example 100 and 0:00:01).  Those values are
+    # not training epochs and presenting them as such is actively
+    # misleading.  Epoch-specific fields are therefore valid only for
+    # train jobs; action-neutral ETA and iteration telemetry remain useful
+    # for the other actions.
+    is_epoch_action = action in (None, "train")
     epoch_raw: Any = job_entry.get("epoch")
     max_epoch_raw: Any = job_entry.get("max_epoch")
-    epoch_current = epoch_raw if isinstance(epoch_raw, int) else None
-    epoch_total = max_epoch_raw if isinstance(max_epoch_raw, int) else None
+    epoch_current = (
+        epoch_raw if is_epoch_action and isinstance(epoch_raw, int) else None
+    )
+    epoch_total = (
+        max_epoch_raw if is_epoch_action and isinstance(max_epoch_raw, int) else None
+    )
     eta_seconds = _parse_eta_seconds(job_entry.get("eta"))
 
     metrics_latest: dict[str, Any] = {}
@@ -753,12 +766,20 @@ def _derive_progress_from_job_details(
     cur_iter_raw: Any = job_entry.get("cur_iter")
     if isinstance(cur_iter_raw, int):
         metrics_latest["cur_iter"] = cur_iter_raw
-    for time_key in ("time_per_epoch", "time_per_iter"):
+    time_keys = (
+        ("time_per_epoch", "time_per_iter") if is_epoch_action else ("time_per_iter",)
+    )
+    for time_key in time_keys:
         time_raw: Any = job_entry.get(time_key)
         if isinstance(time_raw, str) and time_raw.strip():
             metrics_latest[time_key] = time_raw
 
-    if epoch_current is None and epoch_total is None and not metrics_latest:
+    if (
+        epoch_current is None
+        and epoch_total is None
+        and eta_seconds is None
+        and not metrics_latest
+    ):
         return None
     return {
         "epoch_current": epoch_current,
@@ -835,11 +856,13 @@ async def poll_tao_job(
     job_entry = _job_details_entry(body, tao_external_job_id)
     if progress is None and job_entry is not None:
         network_arch_raw: Any = body.get("network_arch")
+        action_raw: Any = body.get("action")
         progress = _derive_progress_from_job_details(
             job_entry,
             network_arch=(
                 network_arch_raw if isinstance(network_arch_raw, str) else None
             ),
+            action=action_raw if isinstance(action_raw, str) else None,
         )
 
     # Extract any container-side status message (cosmos-rl crash detail,

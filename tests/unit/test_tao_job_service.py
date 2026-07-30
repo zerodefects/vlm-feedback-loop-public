@@ -628,6 +628,34 @@ class TestProgressDerivation:
             "metrics_history_ref": None,
         }
 
+    def test_quantize_drops_generic_epoch_telemetry_but_keeps_eta(self):
+        """FTMS reuses JobResult for quantization and populates its epoch
+        slots with generic work-unit values.  They must not be presented as
+        training epoch metrics."""
+        from vlm_feedback_loop.services.tao_job_service import (
+            _derive_progress_from_job_details,
+        )
+
+        progress = _derive_progress_from_job_details(
+            {
+                "epoch": None,
+                "max_epoch": 100,
+                "eta": "0:16:40",
+                "time_per_epoch": "0:00:01",
+                "time_per_iter": None,
+                "key_metric": 0.0,
+            },
+            network_arch="cosmos-rl",
+            action="quantize",
+        )
+        assert progress == {
+            "epoch_current": None,
+            "epoch_total": None,
+            "eta_seconds": 1000.0,
+            "metrics_latest": None,
+            "metrics_history_ref": None,
+        }
+
     @pytest.mark.parametrize(
         ("raw", "expected"),
         [
