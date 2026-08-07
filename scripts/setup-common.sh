@@ -108,18 +108,16 @@ vfl_ensure_docker_group() {
     fi
 }
 
-# Install the NVIDIA Container Toolkit from NVIDIA's apt repository. Callers
-# check for an existing install and only invoke this when it is absent.
+# Install the NVIDIA Container Toolkit from an already configured apt source.
+# Callers check for an existing install and only invoke this when it is absent.
 vfl_install_nvidia_container_toolkit() {
     info "Installing NVIDIA Container Toolkit..."
-    sudo rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
-        | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
-        | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
-        | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
     sudo apt-get update -qq
-    sudo apt-get install -y -qq nvidia-container-toolkit > /dev/null
+    if ! sudo apt-get install -y -qq nvidia-container-toolkit > /dev/null; then
+        error "NVIDIA Container Toolkit is unavailable from configured apt sources."
+        error "Follow https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html and rerun this setup."
+        return 1
+    fi
 }
 
 # Configure the Docker runtime for NVIDIA GPU passthrough and restart Docker.

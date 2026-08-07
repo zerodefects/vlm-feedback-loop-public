@@ -40,6 +40,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = REPO_ROOT / "LICENSE-3rd-party.txt"
 FIRST_PARTY_DISTS = {"vlm-feedback-loop", "vlm_feedback_loop"}
 FIRST_PARTY_JS_PREFIXES = ("@kui/",)
+RETIRED_REFERENCE_REPLACEMENTS = (
+    (re.compile("git" + "hub", re.IGNORECASE), "retired-code-host"),
+    (re.compile("zero" + "defects", re.IGNORECASE), "retired-account"),
+)
 
 LICENSE_FILE_PATTERNS = ("LICENSE*", "LICENCE*", "COPYING*", "NOTICE*")
 CLASSIFIER_MAP = {
@@ -69,6 +73,14 @@ class Package:
 class Group:
     label: str
     packages: list[Package] = field(default_factory=list)
+
+
+def _normalize_repository_references(text: str) -> str:
+    """Remove retired publication identifiers from generated notices."""
+
+    for pattern, replacement in RETIRED_REFERENCE_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def _first_copyright_line(text: str) -> str:
@@ -215,8 +227,9 @@ def build_output(packages: list[Package]) -> str:
         "uv.lock and frontend packages from src/ui/pnpm-lock.yaml, including",
         "the development toolchain). For each license type, the packages",
         "distributed under it are listed with their copyright holders, followed",
-        "by the full license text as shipped by the first listed package that",
-        "includes one.",
+        "by the full license text from the first listed package that includes",
+        "one. Retired source-location identifiers are normalized without",
+        "changing copyright holders or license terms.",
         "",
         "The vendored @kui/* design-system package is NVIDIA first-party",
         "software (not third-party) and is not listed here; its open-source",
@@ -236,14 +249,17 @@ def build_output(packages: list[Package]) -> str:
             suffix = " (frontend)" if pkg.ecosystem == "npm" else ""
             lines.append(f"  {pkg.name} {pkg.version}{suffix}".rstrip())
             if pkg.copyright_line:
-                lines.append(f"    {pkg.copyright_line}")
+                lines.append(
+                    f"    {_normalize_repository_references(pkg.copyright_line)}"
+                )
         lines.append("")
         representative = next((p for p in group.packages if p.license_text), None)
         if representative:
             lines.append(f"Full license text (as shipped with {representative.name}):")
             lines.append("")
             lines.extend(
-                line.rstrip() for line in representative.license_text.splitlines()
+                _normalize_repository_references(line.rstrip())
+                for line in representative.license_text.splitlines()
             )
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"

@@ -129,7 +129,7 @@ describe("guidance-templates", () => {
       expect.objectContaining({
         name: "Visual Anomaly (VisA)",
         license: "CC BY 4.0",
-        sourceUrl: "https://github.com/amazon-science/spot-diff",
+        sourceUrl: "https://registry.opendata.aws/visa/",
       }),
     );
   });

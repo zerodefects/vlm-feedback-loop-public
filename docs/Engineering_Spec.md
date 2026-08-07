@@ -1444,8 +1444,8 @@ Template definitions:
 - **Rock, paper, scissors:** Description: *"Classify the hand gesture in each image as rock, paper, or scissors."* Core: `category: enum` [rock, paper, scissors]. Rules define the visible gesture for each value, identify the primary foreground hand as the subject, and direct the SME to Skip occluded or ambiguous gestures. Dataset context: bundled 15-image walkthrough, CC BY 2.0.
 - **Multi-label classification:** Description: *"Select all labels that apply to each image."* Core: `labels: enum_set` [`replace_me_a`, `replace_me_b`]. Rules instruct the SME to replace both values, select every visibly supported label, use an empty set when none apply, and avoid near-synonym labels.
 - **Presence and count:** Description: *"Determine whether the target object is visible in each image and count the visible instances."* Core: `target_present: boolean`, `target_count: integer` (min: 0). Rules require the SME to name the real target, keep the boolean/count pair consistent, define how partial instances are counted, and Skip images that cannot be counted reliably.
-- **Packaging information audit:** Description: *"Read each food-packaging photo, identify the dominant language of the visible text, and determine whether a nutrition-information panel is visible."* Core: `language_on_packaging: enum` [fr, en, es, de, it, nl, other], `contains_nutrition_table: boolean`. Rules define dominant language from legible words, the visible structure required for a nutrition panel, and when unreadable text requires Skip. Dataset context: Open Food Facts images, open product-packaging photos with extracted text, CC BY-SA images, source `https://openfoodfacts.github.io/openfoodfacts-server/api/aws-images-dataset/`; no images are bundled.
-- **Industrial anomaly inspection:** Description: *"Inspect each product image from the VisA dataset, identify the object category, and determine whether a visible manufacturing anomaly is present."* Core: `object_category: enum` [candle, capsules, cashew, chewinggum, fryum, macaroni1, macaroni2, pcb1, pcb2, pcb3, pcb4, pipe_fryum], `has_anomaly: enum` [no, yes]. Rules distinguish visible surface/structural flaws from pose, lighting, and ordinary appearance differences and direct the SME to Skip insufficient evidence. The template deliberately omits free-text defect description and the source annotation's 39-value defect taxonomy: prior Blueprint runs found that taxonomy synonym-fragmented and poorly suited to reliable exact-match evaluation, while optional rationale notes already cover explanatory evidence. Dataset context: Visual Anomaly (VisA), 10,821 images across 12 object categories, CC BY 4.0, source `https://github.com/amazon-science/spot-diff`; no images are bundled.
+- **Packaging information audit:** Description: *"Read each food-packaging photo, identify the dominant language of the visible text, and determine whether a nutrition-information panel is visible."* Core: `language_on_packaging: enum` [fr, en, es, de, it, nl, other], `contains_nutrition_table: boolean`. Rules define dominant language from legible words, the visible structure required for a nutrition panel, and when unreadable text requires Skip. Dataset context: Open Food Facts images, open product-packaging photos with extracted text, CC BY-SA images, source `https://world.openfoodfacts.org/data`; no images are bundled.
+- **Industrial anomaly inspection:** Description: *"Inspect each product image from the VisA dataset, identify the object category, and determine whether a visible manufacturing anomaly is present."* Core: `object_category: enum` [candle, capsules, cashew, chewinggum, fryum, macaroni1, macaroni2, pcb1, pcb2, pcb3, pcb4, pipe_fryum], `has_anomaly: enum` [no, yes]. Rules distinguish visible surface/structural flaws from pose, lighting, and ordinary appearance differences and direct the SME to Skip insufficient evidence. The template deliberately omits free-text defect description and the source annotation's 39-value defect taxonomy: prior Blueprint runs found that taxonomy synonym-fragmented and poorly suited to reliable exact-match evaluation, while optional rationale notes already cover explanatory evidence. Dataset context: Visual Anomaly (VisA), 10,821 images across 12 object categories, CC BY 4.0, source `https://registry.opendata.aws/visa/`; no images are bundled.
 
 All templates leave rationale notes disabled. The SME may opt in with the Guidance toggle after selecting any template.
 
@@ -7893,25 +7893,21 @@ closes only when live-validated evidence lands.
   `deploy_local_nim`, `stop_local_nim`, and `run_preflight_checks` for
   `role="student"`; Teacher and embedding deployments are not affected.
 
-**CI / pre-commit pipeline (Phase 13 Step 13.1):**
-- Verify: `.github/workflows/ci.yml` exists at the repo root, triggers on
-  `push` and `pull_request` to `main` plus `workflow_dispatch`, and declares
-  the eight release jobs: `backend-lint`, `backend-tests`,
-  `backend-typecheck`, `frontend-lint`, `frontend-tests`, `frontend-build`,
-  `dependency-audit`, and `compose-smoke`.
-- Verify: all jobs run on `ubuntu-latest` without job-level
-  `continue-on-error: true`. The seven non-Compose jobs use a 10-minute
-  timeout; `compose-smoke` uses 20 minutes to accommodate cold image builds.
-- Verify: `backend-tests` runs the unit suite with the configured coverage gate
-  on Python 3.11, 3.12, and 3.13. `backend-lint` runs `ruff check`,
-  `ruff format --check`, and the `AGENTS.md` / `CLAUDE.md` twin check.
-  `backend-typecheck` runs strict pyright on `src/backend/`.
-- Verify: `frontend-lint` runs ESLint, Prettier, and `pnpm typecheck` inside
-  `src/ui`; `frontend-tests` runs `pnpm test`; and `frontend-build` runs
-  `pnpm build` and produces the production JS/CSS bundles and `index.html`.
-- Verify: `dependency-audit` checks the complete frozen backend lock with
-  `pip-audit --no-deps --disable-pip` (uv, not pip, remains the resolver)
-  and production frontend dependencies with `pnpm audit --prod --audit-level
+**Local release pipeline during repository transition (Phase 13 Step 13.1):**
+- Verify: no hosted CI configuration or remote pre-commit dependency is
+  shipped during the repository transition. Contributors run and report the
+  repository's explicit local validation commands before requesting review.
+- Verify: `scripts/ci-local.sh` runs the six deterministic core stages:
+  backend lint, unit tests with the configured coverage gate, strict pyright,
+  frontend lint/typecheck, frontend tests, and the frontend production build.
+  It also checks that `AGENTS.md` and `CLAUDE.md` remain byte-identical.
+- Verify: release validation additionally runs the serial integration suite,
+  `uv run pytest tests/integration/ -q -n 0`; the suite rejects xdist because
+  it starts live services on fixed ports and may require credentials or
+  Docker.
+- Verify: maintainers check the complete frozen backend lock with
+  `pip-audit --no-deps --disable-pip` (uv, not pip, remains the resolver) and
+  production frontend dependencies with `pnpm audit --prod --audit-level
   high`. The only package-native audit exception is
   `GHSA-qwww-vcr4-c8h2`: the affected unstable React Server Components APIs
   are absent from this client-only Vite SPA, and the upstream patched major
@@ -7920,60 +7916,27 @@ closes only when live-validated evidence lands.
   The default `aiperf` operational group overrides AIPerf 0.10.0's stale
   aiohttp/Pillow caps to the audited aiohttp 3.14.3+ and Pillow 12.3+
   releases; the real raw-payload integration test MUST pass with that locked
-  environment.
-  `compose-smoke` builds the Compose images, starts the stack, requires a
-  healthy edge at `http://localhost:3000/health`, prints diagnostics on
-  failure, and always tears the stack down.
-- Verify: integration tests remain outside the default CI workflow because
-  they start live services on fixed ports and may require credentials or
-  Docker. The operator validation command is `uv run pytest
-  tests/integration/ -q -n 0`; the suite rejects xdist execution.
-- Verify: `.pre-commit-config.yaml` declares the seven hooks in execution
-  order: `trailing-whitespace`, `end-of-file-fixer`, `check-yaml`, `ruff`,
-  `ruff-format`, `gitleaks`, and `agents-claude-twins`. Formatting exclusions
-  are hook-specific so gitleaks still scans every shipping text file. The
-  pre-commit ruff revision tracks the resolved project minor.
-- Verify: `scripts/ci-local.sh` reproduces the six deterministic core jobs
-  (backend lint/tests/typecheck and frontend lint/tests/build). Network-bound
-  dependency audits and the Docker Compose smoke remain explicit release
-  commands rather than hidden local-script side effects.
+  environment. The Compose smoke builds both images, starts the stack,
+  requires a healthy edge at `http://localhost:3000/health`, prints
+  diagnostics on failure, and always tears the stack down.
 
-**Secret scanning + organization-only SonarQube delegate (Phase 13 Step 13.1):**
-- Verify: the private source profile keeps `.github/workflows/sonarqube.yml`
-  with a manual trigger and uses
-  `NVIDIA-AI-Blueprints/sonarqube-workflows/.github/workflows/sonarqube-reusable-template.yml@main`
-  — the same ref pinned by Retail-Agentic-Commerce and
-  Retail-Catalog-Enrichment. The `with:` block populates
-  `organization`, `team`, `product`, `scmRepoName`, `projectTags`,
-  and `language: python`. `secrets: inherit` is set so the org
-  SonarQube token flows through.
-- Verify: the curated independent public export omits both GitHub Actions
-  workflow files. CI remains authoritative in the source repository during
-  the GitLab cutover; the independent mirror is temporarily distribution-only.
-  The SonarQube delegate must not ship there in any case: GitHub resolves its
-  private reusable-workflow reference before evaluating a job-level
-  repository-owner condition. When source CI moves to NVRetail GitLab, replace
-  the GitHub-only delegate with the approved internal GitLab integration.
-- Verify: the `gitleaks` pre-commit hook is configured with
-  `repo: https://github.com/gitleaks/gitleaks` and a pinned
-  `rev:` tag (not `main`, not unpinned). The repo includes a
-  `.gitleaks.toml` at the repo root that `extend.useDefault = true`
-  AND adds an `id = "nvidia-api-key"` rule with regex matching
+**Secret scanning and static analysis (Phase 13 Step 13.1):**
+- Verify: `.gitleaks.toml` remains at the repository root with
+  `extend.useDefault = true` and an `id = "nvidia-api-key"` rule matching
   `nvapi-` followed by 40–80 token characters (covers
   `NVIDIA_API_KEY` and `NGC_API_KEY` formats — the documented
   minimal-setup credentials).
-- Verify: the `nvidia-api-key` rule fires on a planted credential.
-  Stage a file containing `NVIDIA_API_KEY = "nvapi-<60 token chars>"`
-  and run `pre-commit run gitleaks` — the hook MUST exit non-zero
-  with `RuleID: nvidia-api-key` reported. Short-form test fixtures
+- Verify: the `nvidia-api-key` rule fires on a planted credential. Scan a
+  fixture containing `NVIDIA_API_KEY = "nvapi-<60 token chars>"` with
+  `gitleaks detect --source . --config .gitleaks.toml`; the command MUST exit
+  non-zero with `RuleID: nvidia-api-key` reported. Short-form test fixtures
   matching `nvapi-(test|fake|stub|placeholder|example|dummy)…` MUST
   NOT trigger the rule (the `[allowlist]` block in `.gitleaks.toml`
   exempts them).
-- Verify: the source CI CVE backstop is the locked-set-only `pip-audit` plus
-  `pnpm audit` job. The public export temporarily ships no hosted CI workflow;
-  its maintainers can run the same frozen audit commands locally. SAST remains
-  delegated to the approved NVIDIA organization integration when that source
-  publication profile is enabled; the repo does not add a parallel `bandit`,
+- Verify: the CVE backstop is the locked-set-only `pip-audit` plus `pnpm audit`
+  commands above. `sonar-project.properties` is retained for the future
+  approved NVRetail GitLab integration, but this transition snapshot has no
+  hosted static-analysis job. The repo does not add a parallel `bandit`,
   `eslint-plugin-security`, or custom suppression-ledger program.
 
 **Backend type checking (Phase 13 Step 13.2 — COMPLETE):**
@@ -7989,10 +7952,8 @@ closes only when live-validated evidence lands.
   warnings. Every suppression includes its bracketed diagnostic code and a
   defensible local reason; the checklist does not pin a historical suppression
   count that would become false as code evolves.
-- Verify: `.github/workflows/ci.yml` declares a `backend-typecheck` job
-  that runs `uv run pyright src/backend/` as a required gate (no
-  `continue-on-error: true`), with `timeout-minutes: 10`, in parallel with the
-  other CI jobs.
+- Verify: `scripts/ci-local.sh` runs `uv run pyright src/backend/` as a required
+  stage and stops on failure.
 
 ---
 

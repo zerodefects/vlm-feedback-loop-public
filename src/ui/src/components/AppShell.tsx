@@ -71,11 +71,11 @@ export function AppShell({ children }: AppShellProps) {
           <div className="ml-auto flex items-center gap-3">
             <div id="header-right-slot" className="flex items-center gap-3" />
             <a
-              href="https://github.com/zerodefects/vlm-feedback-loop-public#documentation"
+              href="https://gitlab-master.nvidia.com/NVRetail/vlm-feedback-loop"
               target="_blank"
               rel="noopener noreferrer"
               className="nav-link"
-              title="View the public Blueprint documentation"
+              title="View the Blueprint documentation"
             >
               <Text kind="label/regular/sm" style={{ color: "inherit" }}>
                 Docs

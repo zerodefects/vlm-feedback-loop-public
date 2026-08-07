@@ -12,11 +12,9 @@ By default the command:
 
 * requires a clean source checkout;
 * verifies every tracked top-level path is classified;
-* removes private evidence, private agent configuration, and source-managed
-  GitHub Actions workflows from the public snapshot;
+* removes private evidence and private agent configuration;
 * strips source-host authority, dataset, and companion-checkout assumptions
   from the public agent-instruction twins;
-* rewrites the source GitLab clone URL to the anonymous public mirror;
 * excludes the optional AutoRun operator feature and its dedicated tests;
 * runs public-readiness checks before changing the destination; and
 * refuses to write into a non-empty destination.
@@ -57,11 +55,8 @@ from pathlib import Path, PurePosixPath
 from typing import Final
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
-SCRIPT_RELATIVE_PATH: Final = PurePosixPath("scripts/export_public_snapshot.py")
-PUBLIC_REPOSITORY_URL: Final = "https://github.com/zerodefects/vlm-feedback-loop-public"
-SOURCE_REPOSITORY_URL: Final = (
-    "https://gitlab-master.nvidia.com/NVRetail/vlm-feedback-loop"
-)
+READINESS_SCANNER_PATH: Final = PurePosixPath("scripts/export_public_snapshot.py")
+RETIRED_REPOSITORY_TERMS: Final = ("git" + "hub", "zero" + "defects")
 
 # The public export is allowlisted at the top level. A new root path must be
 # classified here deliberately instead of silently leaking into the snapshot.
@@ -69,10 +64,8 @@ PUBLIC_TOP_LEVEL: Final = frozenset(
     {
         ".dockerignore",
         ".env.example",
-        ".github",
         ".gitleaks.toml",
         ".gitignore",
-        ".pre-commit-config.yaml",
         "AGENTS.md",
         "CHANGELOG.md",
         "CLAUDE.md",
@@ -98,8 +91,6 @@ PRIVATE_TOP_LEVEL: Final = frozenset({".claude", ".codex"})
 EXCLUDED_PATHS: Final = (
     PurePosixPath(".claude"),
     PurePosixPath(".codex"),
-    PurePosixPath(".github/workflows/ci.yml"),
-    PurePosixPath(".github/workflows/sonarqube.yml"),
     PurePosixPath("docs/live-release-acceptance.md"),
     PurePosixPath("docs/internal"),
     PurePosixPath("docs/fixtures/pinned"),
@@ -320,30 +311,13 @@ def remove_source_only_documentation(snapshot_root: Path) -> None:
         target.write_text(pattern.sub("\n", text), encoding="utf-8")
 
 
-def rewrite_repository_urls(snapshot_root: Path) -> None:
-    """Point the exported README at the anonymously cloneable public mirror."""
-
-    readme = snapshot_root / "README.md"
-    if not readme.is_file():
-        return
-    text = readme.read_text(encoding="utf-8")
-    readme.write_text(
-        text.replace(SOURCE_REPOSITORY_URL, f"{PUBLIC_REPOSITORY_URL}.git"),
-        encoding="utf-8",
-    )
-
-
-def _is_excluded_from_readiness_scan(relative: PurePosixPath) -> bool:
-    return relative == SCRIPT_RELATIVE_PATH
-
-
 def _read_text_files(snapshot_root: Path) -> list[tuple[PurePosixPath, str]]:
     files: list[tuple[PurePosixPath, str]] = []
     for path in sorted(snapshot_root.rglob("*")):
         if not path.is_file() or path.is_symlink():
             continue
         relative = PurePosixPath(path.relative_to(snapshot_root).as_posix())
-        if _is_excluded_from_readiness_scan(relative):
+        if relative == READINESS_SCANNER_PATH:
             continue
         try:
             text = path.read_text(encoding="utf-8")
@@ -380,6 +354,19 @@ def find_readiness_issues(snapshot_root: Path) -> list[ReadinessIssue]:
     """Return public-cut blockers found in an extracted candidate snapshot."""
 
     issues: list[ReadinessIssue] = []
+    for path in sorted(snapshot_root.rglob("*")):
+        relative = path.relative_to(snapshot_root).as_posix()
+        lowered = relative.lower()
+        if any(term in lowered for term in RETIRED_REPOSITORY_TERMS):
+            issues.append(
+                ReadinessIssue(
+                    code="retired-repository-reference",
+                    path=relative,
+                    line=0,
+                    message="remove the retired host or account reference",
+                )
+            )
+
     for excluded in EXCLUDED_PATHS:
         path = snapshot_root.joinpath(*excluded.parts)
         if path.exists() or path.is_symlink():
@@ -394,13 +381,12 @@ def find_readiness_issues(snapshot_root: Path) -> list[ReadinessIssue]:
 
     general_rules = (
         (
-            "private-repository-url",
+            "retired-repository-reference",
             re.compile(
-                r"github\.com/zerodefects/vlm-feedback-loop"
-                r"(?:\.git)?(?:[/?#\s]|$)"
-                r"|gitlab-master\.nvidia\.com"
+                "|".join(re.escape(term) for term in RETIRED_REPOSITORY_TERMS),
+                re.IGNORECASE,
             ),
-            "replace the private repository URL with the final public URL",
+            "remove the retired host or account reference",
         ),
         (
             "private-evidence-reference",
@@ -452,12 +438,6 @@ def find_readiness_issues(snapshot_root: Path) -> list[ReadinessIssue]:
                 r"|'''docs/TAO_FTMS_INSTALL_GUIDE_v8\\\.md'''"
             ),
             "remove broad public-prose allowlists from the public scanner config",
-        ),
-        (
-            PurePosixPath(".pre-commit-config.yaml"),
-            "global-precommit-exclusion",
-            re.compile(r"(?m)^exclude:\s*\|"),
-            "make formatting exclusions hook-specific so gitleaks scans all text",
         ),
     )
     for relative, code, pattern, message in focused_rules:
@@ -679,7 +659,6 @@ def build_snapshot(
         exclude_autorun=exclude_autorun,
     )
     remove_source_only_documentation(snapshot_root)
-    rewrite_repository_urls(snapshot_root)
     return snapshot_root
 
 

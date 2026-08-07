@@ -47,9 +47,9 @@ Do NOT read the big documents front-to-back at session start. Work from this fil
 
 ## Repository
 
-- Public release mirror:
-  `https://github.com/zerodefects/vlm-feedback-loop-public.git`, default branch
-  `main`. Maintainers may use a separate private source remote locally.
+- Canonical repository:
+  `https://gitlab-master.nvidia.com/NVRetail/vlm-feedback-loop.git`, default
+  branch `main`.
 
 ## Repository layout
 

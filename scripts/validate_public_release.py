@@ -24,9 +24,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote
 
-PUBLIC_REPOSITORY_URL = "https://github.com/zerodefects/vlm-feedback-loop-public"
+CANONICAL_REPOSITORY_URL = "https://gitlab-master.nvidia.com/NVRetail/vlm-feedback-loop"
 PRIVATE_EVIDENCE_PATH = Path("docs") / "internal"
-PRIVATE_SOURCE_HOST = "gitlab-master." + "nvidia.com"
+RETIRED_REPOSITORY_TERMS = ("git" + "hub", "zero" + "defects")
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*]\(([^)\n]+)\)")
 IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 SCRIPT_SUFFIXES = frozenset(
@@ -248,14 +248,14 @@ def find_public_migration_issues(root: Path) -> list[ValidationIssue]:
 
 
 def find_readme_issues(root: Path) -> list[ValidationIssue]:
-    """Pin the documented first-run contract and public acquisition URL."""
+    """Pin the documented first-run contract and canonical acquisition URL."""
 
     readme = root / "README.md"
     if not readme.is_file():
         return []
     text = readme.read_text(encoding="utf-8")
     expectations = (
-        (PUBLIC_REPOSITORY_URL, "public clone URL is missing"),
+        (CANONICAL_REPOSITORY_URL, "canonical clone URL is missing"),
         ("docker compose up --build", "primary Compose launch command is missing"),
         ("docker compose down", "Compose stop command is missing"),
         ("127.0.0.1", "loopback-only launch boundary is missing"),
@@ -268,10 +268,31 @@ def find_readme_issues(root: Path) -> list[ValidationIssue]:
         for expected, message in expectations
         if expected not in text
     ]
-    if PRIVATE_SOURCE_HOST in text:
-        issues.append(
-            ValidationIssue("README.md", "private source-repository host is present")
-        )
+    return issues
+
+
+def find_retired_repository_reference_issues(root: Path) -> list[ValidationIssue]:
+    """Reject retired host and account terms in paths or readable text."""
+
+    issues: list[ValidationIssue] = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if any(part in GENERATED_MARKDOWN_PARTS for part in Path(relative).parts):
+            continue
+        if any(term in relative.lower() for term in RETIRED_REPOSITORY_TERMS):
+            issues.append(
+                ValidationIssue(relative, "retired repository reference in path")
+            )
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if any(term in text.lower() for term in RETIRED_REPOSITORY_TERMS):
+            issues.append(
+                ValidationIssue(relative, "retired repository reference in text")
+            )
     return issues
 
 
@@ -439,6 +460,7 @@ def validate(root: Path) -> list[ValidationIssue]:
         return [ValidationIssue(str(root), "release directory does not exist")]
     return [
         *find_structure_issues(root),
+        *find_retired_repository_reference_issues(root),
         *find_readme_issues(root),
         *find_version_issues(root),
         *find_source_readability_issues(root),

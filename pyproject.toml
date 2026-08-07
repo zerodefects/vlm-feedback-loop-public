@@ -46,7 +46,7 @@ vlm-feedback-loop = "vlm_feedback_loop.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/backend/vlm_feedback_loop"]
 
-# The GitHub Blueprint is the complete teaching source. The Python sdist is a
+# The repository is the complete teaching source. The Python sdist is a
 # backend package artifact, so keep it focused and never sweep private release
 # evidence or the frontend dependency tree into a package upload.
 [tool.hatch.build.targets.sdist]

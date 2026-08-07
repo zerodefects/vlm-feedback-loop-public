@@ -2021,15 +2021,14 @@ Notable subsections:
 
 - **Action Requests (§10.3)** — 11 verify items including the four §10.3.3 customer-facing handoff keys (`nim_model_profile_recommended`, `gpu_requirements`, `tensor_parallelism`, `nim_env_vars_recommended`) and the canonical `docker_run_args` provenance via `local_nim_service.build_student_docker_run_*`.
 - **Full-stack validation (Phase 12.4)** — C20 (handoff `docker run` re-execution proof for both 2B and 8B; optional RPS evidence uses baseline representatives and gates on one raw/fenced-JSON schema-parseable prediction per class while recording accuracy separately), C21 (2B vs 8B handoff content differentiation, accepting two intentionally unset custom-checkpoint profiles while requiring distinct images/GPU floors/served-model environments), final integration checkpoint, Cosmos-RL format validator, `LOCAL_NIM_MOCK_ENDPOINT_URL` test seam. Mock-validated in `tests/unit/test_full_stack_validation_mock.py`; live-validated via a rental-window operator runbook (retained in the project's internal engineering archive).
-- **Release automation and static analysis** — verify the eight CI jobs
-  (backend lint/tests/typecheck, frontend lint/tests/build, locked dependency
-  audit, and Compose smoke), seven pre-commit hooks, serial operator-run
-  integration suite, strict pyright configuration at the Python 3.11 floor,
-  and the source-only NVIDIA-org SonarQube delegate. During the GitLab cutover,
-  the curated independent public export omits both GitHub Actions workflows;
-  source CI remains authoritative and the public mirror is distribution-only.
-  The current commands and invariants are listed in the full Spec; historical
-  job and suppression counts are not part of the contract.
+- **Release validation and static analysis** — during the GitLab cutover, no
+  hosted CI or remote pre-commit configuration ships. Verify the six-stage
+  local validation script, locked dependency audits, Compose smoke, serial
+  integration suite, repository-wide retired-reference check, and strict
+  pyright configuration at the Python 3.11 floor. SonarQube properties remain
+  ready for a future approved NVRetail integration. The current commands and
+  invariants are listed in the full Spec; historical job and suppression
+  counts are not part of the contract.
 
 ---
 

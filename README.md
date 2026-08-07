@@ -282,7 +282,7 @@ required.
 2. Clone and launch the Blueprint:
 
    ```bash
-   git clone https://github.com/zerodefects/vlm-feedback-loop-public.git
+   git clone https://gitlab-master.nvidia.com/NVRetail/vlm-feedback-loop
    cd vlm-feedback-loop
    export NVIDIA_API_KEY=nvapi-...
    docker compose up --build
@@ -330,7 +330,7 @@ restart, bind-mount, and reset procedures.
 Use source mode for development and for system-managed local NIMs:
 
 ```bash
-git clone https://github.com/zerodefects/vlm-feedback-loop-public.git
+git clone https://gitlab-master.nvidia.com/NVRetail/vlm-feedback-loop
 cd vlm-feedback-loop
 
 uv sync
@@ -504,10 +504,10 @@ vlm-feedback-loop/
 ## Contributing and security
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
-fork, sign-off, pull request, and validation requirements.
+fork, sign-off, merge request, and validation requirements.
 
 Report security issues through the process in [SECURITY.md](SECURITY.md), not
-through a public GitHub issue.
+through the public issue tracker.
 
 ## License
 

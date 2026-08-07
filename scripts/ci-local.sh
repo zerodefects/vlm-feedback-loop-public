@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Reproduce .github/workflows/ci.yml locally. First failing stage
-# exits with a non-zero status. Use this before pushing a change
-# you expect to land green in CI — burning a CI run takes minutes;
+# Run the deterministic release checks locally. The first failing stage
+# exits with a non-zero status. Use this before pushing a change;
 # this takes seconds for lint and a few minutes for the full chain.
 #
 # Paired with the workflow file: the seven stages cover its six core jobs and

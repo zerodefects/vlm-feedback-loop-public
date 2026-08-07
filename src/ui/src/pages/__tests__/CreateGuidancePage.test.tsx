@@ -333,7 +333,7 @@ describe("CreateGuidancePage — Page Structure", () => {
     );
     expect(screen.getByRole("link", { name: /View dataset source/i })).toHaveAttribute(
       "href",
-      "https://openfoodfacts.github.io/openfoodfacts-server/api/aws-images-dataset/",
+      "https://world.openfoodfacts.org/data",
     );
   });
 
@@ -456,7 +456,7 @@ describe("CreateGuidancePage — Page Structure", () => {
     );
     expect(screen.getByRole("link", { name: /View dataset source/i })).toHaveAttribute(
       "href",
-      "https://github.com/amazon-science/spot-diff",
+      "https://registry.opendata.aws/visa/",
     );
     expect(screen.queryByTestId("field-row-rationale_note")).not.toBeInTheDocument();
     expect(

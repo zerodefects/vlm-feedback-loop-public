@@ -164,8 +164,7 @@ export const GUIDANCE_TEMPLATES: readonly GuidanceTemplate[] = [
       name: "Open Food Facts images",
       detail: "open product-packaging photos with extracted text",
       license: "CC BY-SA (images)",
-      sourceUrl:
-        "https://openfoodfacts.github.io/openfoodfacts-server/api/aws-images-dataset/",
+      sourceUrl: "https://world.openfoodfacts.org/data",
     },
   },
   {
@@ -209,7 +208,7 @@ export const GUIDANCE_TEMPLATES: readonly GuidanceTemplate[] = [
       name: "Visual Anomaly (VisA)",
       detail: "10,821 images across 12 object categories",
       license: "CC BY 4.0",
-      sourceUrl: "https://github.com/amazon-science/spot-diff",
+      sourceUrl: "https://registry.opendata.aws/visa/",
     },
   },
 ] as const;

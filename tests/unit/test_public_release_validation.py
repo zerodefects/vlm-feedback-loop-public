@@ -172,7 +172,7 @@ def test_local_link_check_ignores_installed_dependency_markdown(
     assert validator.find_local_link_issues(tmp_path) == []
 
 
-def test_readme_smoke_contract_pins_anonymous_compose_walkthrough(
+def test_readme_smoke_contract_pins_canonical_compose_walkthrough(
     tmp_path: Path,
 ) -> None:
     """The README check catches drift in acquisition and first-run commands."""
@@ -182,7 +182,7 @@ def test_readme_smoke_contract_pins_anonymous_compose_walkthrough(
         "README.md",
         "\n".join(
             (
-                validator.PUBLIC_REPOSITORY_URL,
+                validator.CANONICAL_REPOSITORY_URL,
                 "docker compose up --build",
                 "docker compose down",
                 "Open 127.0.0.1",
@@ -196,8 +196,35 @@ def test_readme_smoke_contract_pins_anonymous_compose_walkthrough(
 
     _write(tmp_path, "README.md", "docker compose up --build\n")
     messages = {issue.message for issue in validator.find_readme_issues(tmp_path)}
-    assert "public clone URL is missing" in messages
+    assert "canonical clone URL is missing" in messages
     assert "Compose stop command is missing" in messages
+
+
+def test_release_rejects_retired_repository_references(tmp_path: Path) -> None:
+    """Retired publication terms cannot survive in a path or readable file."""
+
+    _write(tmp_path, "README.md", "host: " + "git" + "hub\n")
+    _write(tmp_path, "docs/" + "zero" + "defects-notes.md", "clean text\n")
+
+    issues = validator.find_retired_repository_reference_issues(tmp_path)
+
+    assert {issue.message for issue in issues} == {
+        "retired repository reference in path",
+        "retired repository reference in text",
+    }
+
+
+def test_release_reference_check_ignores_generated_environment_files(
+    tmp_path: Path,
+) -> None:
+    """Repository metadata and installed dependencies are outside the release."""
+
+    retired_host = "git" + "hub"
+    _write(tmp_path, ".git/config", retired_host + "\n")
+    _write(tmp_path, ".venv/lib/example.py", retired_host + "\n")
+    _write(tmp_path, "src/ui/node_modules/example/index.js", retired_host + "\n")
+
+    assert validator.find_retired_repository_reference_issues(tmp_path) == []
 
 
 def test_version_check_requires_all_public_declarations_to_agree(

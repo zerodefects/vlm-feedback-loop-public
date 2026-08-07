@@ -1,9 +1,9 @@
 # Changelog
 
-- 2026-08-07: The independent public snapshot temporarily omits GitHub Actions
-  CI while the canonical source moves to NVRetail GitLab. Source CI remains
-  active during cutover, and the exporter now prevents the removed public
-  workflow from returning on the next snapshot refresh.
+- 2026-08-07: Removed host-specific CI and remote pre-commit configuration
+  during the move to NVRetail GitLab. Release checks remain available through
+  the explicit local validation commands, and automated release validation now
+  rejects every textual reference to the retired host and account.
 
 - 2026-08-07: README clone commands now resolve to the canonical repository for
   each distribution (NVRetail GitLab in source and the anonymous mirror in the
@@ -23,13 +23,10 @@
   Propose, Review, Refine, Optimize, and Deploy loop, giving new users the
   Blueprint's workflow before setup details.
 
-- 2026-08-07: The curated independent public export now omits the
-  NVIDIA-organization-only SonarQube delegate. GitHub resolves a private
-  reusable workflow before evaluating its job-level repository-owner guard,
-  which otherwise made every independent-mirror push appear failed with zero
-  jobs. The public CI's locked `pip-audit` and `pnpm audit` backstop remains
-  active; the source-only delegate is manually dispatchable until installed in
-  an NVIDIA-owned repository with push and pull-request triggers enabled.
+- 2026-08-07: The curated independent public export omits the
+  NVIDIA-organization-only SonarQube delegate during repository transition.
+  Locked `pip-audit` and `pnpm audit` commands remain part of the documented
+  local release gate until an approved NVRetail integration is installed.
 
 - 2026-08-07: Fixed Scale Up retaining a stale Unlabeled count when an SME
   leaves Image Ingestion after the first accepted batch while later batches

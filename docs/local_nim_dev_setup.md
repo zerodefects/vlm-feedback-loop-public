@@ -137,11 +137,11 @@ installed automatically by `setup-dev.sh` on GPU machines. The script validates
 the installed `nvidia-ctk` release and leaves an existing older installation for
 the host administrator to upgrade.
 
+Configure NVIDIA's package repository by following the
+[NVIDIA Container Toolkit install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
+then install and configure the runtime:
+
 ```bash
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-  sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
 sudo apt-get update
 sudo apt-get install -y nvidia-container-toolkit
 sudo nvidia-ctk runtime configure --runtime=docker
@@ -244,8 +244,8 @@ All NIM containers mount `-v ~/.cache/nim:/opt/nim/.cache`.
 The fastest path — installs everything including GPU components:
 
 ```bash
-git clone https://github.com/zerodefects/vlm-feedback-loop-public.git
-cd vlm-feedback-loop-public
+git clone https://gitlab-master.nvidia.com/NVRetail/vlm-feedback-loop.git
+cd vlm-feedback-loop
 chmod +x scripts/setup-dev.sh
 ./scripts/setup-dev.sh
 ```

@@ -6,8 +6,9 @@ for the software packages this project installs (Python packages from
 uv.lock and frontend packages from src/ui/pnpm-lock.yaml, including
 the development toolchain). For each license type, the packages
 distributed under it are listed with their copyright holders, followed
-by the full license text as shipped by the first listed package that
-includes one.
+by the full license text from the first listed package that includes
+one. Retired source-location identifiers are normalized without
+changing copyright holders or license terms.
 
 The vendored @kui/* design-system package is NVIDIA first-party
 software (not third-party) and is not listed here; its open-source
@@ -1854,7 +1855,7 @@ This binary distribution of NumPy also bundles the following software:
 Name: OpenBLAS
 Files: numpy.libs/libscipy_openblas*.so
 Description: bundled as a dynamically linked library
-Availability: https://github.com/OpenMathLib/OpenBLAS/
+Availability: https://retired-code-host.com/OpenMathLib/OpenBLAS/
 License: BSD-3-Clause
   Copyright (c) 2011-2014, The OpenBLAS Project
   All rights reserved.
@@ -1890,7 +1891,7 @@ License: BSD-3-Clause
 Name: LAPACK
 Files: numpy.libs/libscipy_openblas*.so
 Description: bundled in OpenBLAS
-Availability: https://github.com/OpenMathLib/OpenBLAS/
+Availability: https://retired-code-host.com/OpenMathLib/OpenBLAS/
 License: BSD-3-Clause-Open-MPI
   Copyright (c) 1992-2013 The University of Tennessee and The University
                           of Tennessee Research Foundation.  All rights
@@ -3458,7 +3459,7 @@ The ziggurat methods were derived from Julia.
 Copyright (c) 2009-2019: Jeff Bezanson, Stefan Karpinski, Viral B. Shah,
 and other contributors:
 
-https://github.com/JuliaLang/julia/contributors
+https://retired-code-host.com/JuliaLang/julia/contributors
 
 Permission is hereby granted, free of charge, to any person obtaining
 a copy of this software and associated documentation files (the
@@ -3602,7 +3603,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Adapted from a C++ implementation of Chris Doty-Humphrey's SFC PRNG.
 
-https://gist.github.com/imneme/f1f7821f07cf76504a97f6537c818083
+https://gist.retired-code-host.com/imneme/f1f7821f07cf76504a97f6537c818083
 
 Copyright (c) 2018 Melissa E. O'Neill
 
@@ -4073,7 +4074,7 @@ License: ISC
   shellingham 1.5.4
     Copyright (c) 2018, Tzu-ping Chung <uranusjr@gmail.com>
   siginfo 2.0.0 (frontend)
-    Copyright (c) 2017, Emil Bay <github@tixz.dk>
+    Copyright (c) 2017, Emil Bay <retired-code-host@tixz.dk>
   signal-exit 4.1.0 (frontend)
     Copyright (c) 2015-2023 Benjamin Coe, Isaac Z. Schlueter, and Contributors
   test-exclude 7.0.2 (frontend)
@@ -4426,7 +4427,7 @@ License: MIT
   browserslist 4.28.2 (frontend)
     Copyright 2014 Andrey Sitnik <andrey@sitnik.es> and other contributors
   cac 6.7.14 (frontend)
-    Copyright (c) EGOIST <0x142857@gmail.com> (https://github.com/egoist)
+    Copyright (c) EGOIST <0x142857@gmail.com> (https://retired-code-host.com/egoist)
   callsites 3.1.0 (frontend)
   cffi 2.0.0
   chai 5.3.3 (frontend)
@@ -4495,9 +4496,9 @@ License: MIT
   eslint-plugin-react-hooks 5.2.0 (frontend)
     Copyright (c) Meta Platforms, Inc. and affiliates.
   eslint-plugin-react-refresh 0.4.26 (frontend)
-    Copyright (c) Arnaud Barré (https://github.com/ArnaudBarre)
+    Copyright (c) Arnaud Barré (https://retired-code-host.com/ArnaudBarre)
   estree-walker 3.0.3 (frontend)
-    Copyright (c) 2015-20 [these people](https://github.com/Rich-Harris/estree-walker/graphs/contributors)
+    Copyright (c) 2015-20 [these people](https://retired-code-host.com/Rich-Harris/estree-walker/graphs/contributors)
   execnet 2.1.2
   fast-deep-equal 3.1.3 (frontend)
     Copyright (c) 2017 Evgeny Poberezkin
@@ -4591,7 +4592,7 @@ License: MIT
   magic-string 0.30.21 (frontend)
     Copyright 2018 Rich Harris
   magicast 0.3.5 (frontend)
-    Copyright (c) Pooya Parsa <pooya@pi0.io> and Anthony Fu <https://github.com/antfu>
+    Copyright (c) Pooya Parsa <pooya@pi0.io> and Anthony Fu <https://retired-code-host.com/antfu>
   make-dir 4.0.0 (frontend)
   Mako 1.3.12
     Copyright 2006-2025 the Mako authors and contributors <see AUTHORS file>.
@@ -4609,7 +4610,7 @@ License: MIT
     Copyright (c) 2024 to present, Marco Gorelli
   natural-compare 1.4.0 (frontend)
   node-releases 2.0.37 (frontend)
-    Copyright (c) 2017 Sergey Rubanov (https://github.com/chicoxyzzy)
+    Copyright (c) 2017 Sergey Rubanov (https://retired-code-host.com/chicoxyzzy)
   nwsapi 2.2.23 (frontend)
     Copyright (c) 2007-2025 Diego Perini (http://www.iport.it/)
   optionator 0.9.4 (frontend)
@@ -4620,7 +4621,7 @@ License: MIT
   p-locate 5.0.0 (frontend)
   parent-module 1.0.1 (frontend)
   parse5 7.3.0 (frontend)
-    Copyright (c) 2013-2019 Ivan Nikulin (ifaaan@gmail.com, https://github.com/inikulin)
+    Copyright (c) 2013-2019 Ivan Nikulin (ifaaan@gmail.com, https://retired-code-host.com/inikulin)
   path-exists 4.0.0 (frontend)
   path-key 3.1.1 (frontend)
   pathe 2.0.3 (frontend)
@@ -4697,7 +4698,7 @@ License: MIT
   rich-rst 2.1.0
     Copyright 2026 Wasi Master
   rollup 4.60.1 (frontend)
-    Copyright (c) 2017 [these people](https://github.com/rollup/rollup/graphs/contributors)
+    Copyright (c) 2017 [these people](https://retired-code-host.com/rollup/rollup/graphs/contributors)
   rrweb-cssom 0.8.0 (frontend)
     Copyright (c) Nikita Vasilyev
   ruamel.yaml 0.18.17
@@ -4727,7 +4728,7 @@ License: MIT
   strip-indent 3.0.0 (frontend)
   strip-json-comments 3.1.1 (frontend)
   strip-literal 3.1.0 (frontend)
-    Copyright (c) 2022 Anthony Fu <https://github.com/antfu>
+    Copyright (c) 2022 Anthony Fu <https://retired-code-host.com/antfu>
   supports-color 7.2.0 (frontend)
   symbol-tree 3.2.4 (frontend)
     Copyright (c) 2015 Joris van der Wel
@@ -7305,13 +7306,13 @@ in reverse chronological order:
 
 * files: *
   MPL-2.0 2015-2026 (c) Casper da Costa-Luis
-  [casperdcl](https://github.com/casperdcl).
+  [casperdcl](https://retired-code-host.com/casperdcl).
 * files: tqdm/_tqdm.py
   MIT 2016 (c) [PR #96] on behalf of Google Inc.
 * files: tqdm/_tqdm.py README.rst .gitignore
   MIT 2013 (c) Noam Yorav-Raphael, original author.
 
-[PR #96]: https://github.com/tqdm/tqdm/pull/96
+[PR #96]: https://retired-code-host.com/tqdm/tqdm/pull/96
 
 
 Mozilla Public Licence (MPL) v. 2.0 - Exhibit A

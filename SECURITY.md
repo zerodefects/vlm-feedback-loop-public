@@ -2,7 +2,7 @@
 
 NVIDIA is dedicated to the security and trust of our software products and services, including all source code repositories managed through our organization.
 
-If you need to report a security issue, please use the appropriate contact points outlined below. **Please do not report security vulnerabilities through GitHub.**
+If you need to report a security issue, please use the appropriate contact points outlined below. **Please do not report security vulnerabilities through the public issue tracker.**
 
 ## Reporting Potential Security Vulnerability in an NVIDIA Product
 

@@ -101,16 +101,18 @@ embedding, and Student serving-validation setup.
 Follow NVIDIA's
 [TAO 6.26.3 Microservices Setup](https://docs.nvidia.com/tao/tao-toolkit/6.26.03/text/tao_toolkit_api/api_setup.html)
 for host prerequisites. The following reproducible skeleton uses NVIDIA's
-public `tao_tutorials` Compose bundle at the exact source revision validated
-for this Blueprint:
+`tao_tutorials` Compose bundle at the exact source revision validated for this
+Blueprint. Obtain the repository from your approved source mirror, then set
+its clone URL below:
 
 ```bash
 export TAO_INSTALL_ROOT=/opt/nvidia/tao-ftms
 export TAO_TUTORIALS_COMMIT=3e2b4eb51549ed9aac70637d8c3ee07bc676773f
+export TAO_TUTORIALS_REPOSITORY_URL=<approved-tao-tutorials-repository-url>
 
 sudo install -d -m 0755 "$TAO_INSTALL_ROOT"
 sudo chown "$(id -u):$(id -g)" "$TAO_INSTALL_ROOT"
-git clone https://github.com/NVIDIA/tao_tutorials.git \
+git clone "$TAO_TUTORIALS_REPOSITORY_URL" \
   "$TAO_INSTALL_ROOT/tao_tutorials"
 git -C "$TAO_INSTALL_ROOT/tao_tutorials" checkout --detach \
   "$TAO_TUTORIALS_COMMIT"
@@ -407,4 +409,5 @@ production-quality model.
 - [TAO 6.26.3 REST API](https://docs.nvidia.com/tao/tao-toolkit/6.26.03/text/tao_toolkit_api/api_rest_api.html)
 - [TAO 6.26.3 release notes](https://docs.nvidia.com/tao/tao-toolkit/latest/text/release_notes.html#tao-6-26-3)
 - [TAO 6.26.3 Cosmos-Reason fine-tuning](https://docs.nvidia.com/tao/tao-toolkit/6.26.03/text/vlm_finetuning/cosmos_rl.html)
-- [Pinned TAO tutorials source](https://github.com/NVIDIA/tao_tutorials/tree/3e2b4eb51549ed9aac70637d8c3ee07bc676773f/setup/tao-docker-compose)
+- Pinned TAO tutorials revision:
+  `3e2b4eb51549ed9aac70637d8c3ee07bc676773f`

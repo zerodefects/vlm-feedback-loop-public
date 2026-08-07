@@ -17,7 +17,6 @@
 #   - uv (Python package manager)
 #   - Node.js 20 LTS (via NodeSource)
 #   - pnpm (via Corepack)
-#   - GitHub CLI (gh)
 #   - sqlite3 CLI
 #   - Image library dev headers (for Pillow: JPEG, PNG, TIFF, WebP, FreeType)
 #
@@ -224,24 +223,6 @@ else
     # Match package.json; newer pnpm majors can require a newer Node release.
     corepack prepare pnpm@10.33.0 --activate 2>/dev/null
     info "Installed: $(pnpm --version)"
-fi
-
-# ── GitHub CLI ────────────────────────────────────────────────────────────────
-
-section "GitHub CLI"
-
-if command -v gh &>/dev/null; then
-    info "GitHub CLI already installed: $(gh --version | head -1)"
-else
-    info "Installing GitHub CLI..."
-    sudo rm -f /usr/share/keyrings/githubcli-archive-keyring.gpg
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg 2>/dev/null
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq gh > /dev/null
-    info "Installed: $(gh --version | head -1)"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -460,10 +441,6 @@ echo ""
 
 # ── Post-install guidance ─────────────────────────────────────────────────────
 
-if ! gh auth status &>/dev/null 2>&1; then
-    warn "GitHub CLI is not authenticated. Run: gh auth login"
-fi
-
 if ! git config --global user.name &>/dev/null; then
     warn "Git user not configured. Run:"
     echo "  git config --global user.name \"Your Name\""
@@ -472,7 +449,7 @@ fi
 
 echo ""
 info "Next steps:"
-echo "  1. Clone the repo:     git clone https://github.com/zerodefects/vlm-feedback-loop-public.git"
+echo "  1. Clone the repo:     git clone https://gitlab-master.nvidia.com/NVRetail/vlm-feedback-loop.git"
 echo "  2. Install backend:    cd vlm-feedback-loop && uv sync"
 echo "  3. Install frontend:   cd src/ui && pnpm install && cd ../.."
 echo "  4. Bootstrap config:   uv run vlm-feedback-loop init"
