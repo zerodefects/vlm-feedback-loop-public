@@ -7947,12 +7947,13 @@ closes only when live-validated evidence lands.
   `organization`, `team`, `product`, `scmRepoName`, `projectTags`,
   and `language: python`. `secrets: inherit` is set so the org
   SonarQube token flows through.
-- Verify: the curated independent public export omits that workflow file.
-  GitHub resolves a private reusable-workflow reference before evaluating a
-  job-level repository-owner condition, so an inaccessible org-private call
-  cannot be made to skip cleanly in a public mirror. When the repository is
-  installed under `NVIDIA-AI-Blueprints`, enable its push and pull-request
-  triggers as part of the organization publication profile.
+- Verify: the curated independent public export omits both GitHub Actions
+  workflow files. CI remains authoritative in the source repository during
+  the GitLab cutover; the independent mirror is temporarily distribution-only.
+  The SonarQube delegate must not ship there in any case: GitHub resolves its
+  private reusable-workflow reference before evaluating a job-level
+  repository-owner condition. When source CI moves to NVRetail GitLab, replace
+  the GitHub-only delegate with the approved internal GitLab integration.
 - Verify: the `gitleaks` pre-commit hook is configured with
   `repo: https://github.com/gitleaks/gitleaks` and a pinned
   `rev:` tag (not `main`, not unpinned). The repo includes a
@@ -7968,10 +7969,11 @@ closes only when live-validated evidence lands.
   matching `nvapi-(test|fake|stub|placeholder|example|dummy)…` MUST
   NOT trigger the rule (the `[allowlist]` block in `.gitleaks.toml`
   exempts them).
-- Verify: the independent-public CVE backstop is the locked-set-only
-  `pip-audit` plus `pnpm audit` CI job. SAST remains delegated to the NVIDIA
-  organization SonarQube workflow when that publication profile is enabled;
-  the repo does not add a parallel `bandit`,
+- Verify: the source CI CVE backstop is the locked-set-only `pip-audit` plus
+  `pnpm audit` job. The public export temporarily ships no hosted CI workflow;
+  its maintainers can run the same frozen audit commands locally. SAST remains
+  delegated to the approved NVIDIA organization integration when that source
+  publication profile is enabled; the repo does not add a parallel `bandit`,
   `eslint-plugin-security`, or custom suppression-ledger program.
 
 **Backend type checking (Phase 13 Step 13.2 — COMPLETE):**

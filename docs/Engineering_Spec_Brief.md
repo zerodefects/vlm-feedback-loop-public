@@ -2025,12 +2025,11 @@ Notable subsections:
   (backend lint/tests/typecheck, frontend lint/tests/build, locked dependency
   audit, and Compose smoke), seven pre-commit hooks, serial operator-run
   integration suite, strict pyright configuration at the Python 3.11 floor,
-  and the source-only NVIDIA-org SonarQube delegate. The curated independent
-  public export omits the private reusable-workflow call because GitHub
-  resolves it before job conditions; the locked dependency-audit job remains
-  the public backstop. The current commands and invariants are listed in the
-  full Spec; historical job and suppression counts are not part of the
-  contract.
+  and the source-only NVIDIA-org SonarQube delegate. During the GitLab cutover,
+  the curated independent public export omits both GitHub Actions workflows;
+  source CI remains authoritative and the public mirror is distribution-only.
+  The current commands and invariants are listed in the full Spec; historical
+  job and suppression counts are not part of the contract.
 
 ---
 

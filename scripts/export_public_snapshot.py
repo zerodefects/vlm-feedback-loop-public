@@ -12,8 +12,8 @@ By default the command:
 
 * requires a clean source checkout;
 * verifies every tracked top-level path is classified;
-* removes private evidence, private agent configuration, and the
-  NVIDIA-organization-only SonarQube delegate;
+* removes private evidence, private agent configuration, and source-managed
+  GitHub Actions workflows from the public snapshot;
 * strips source-host authority, dataset, and companion-checkout assumptions
   from the public agent-instruction twins;
 * rewrites the source GitLab clone URL to the anonymous public mirror;
@@ -98,6 +98,7 @@ PRIVATE_TOP_LEVEL: Final = frozenset({".claude", ".codex"})
 EXCLUDED_PATHS: Final = (
     PurePosixPath(".claude"),
     PurePosixPath(".codex"),
+    PurePosixPath(".github/workflows/ci.yml"),
     PurePosixPath(".github/workflows/sonarqube.yml"),
     PurePosixPath("docs/live-release-acceptance.md"),
     PurePosixPath("docs/internal"),

@@ -1,5 +1,10 @@
 # Changelog
 
+- 2026-08-07: The independent public snapshot temporarily omits GitHub Actions
+  CI while the canonical source moves to NVRetail GitLab. Source CI remains
+  active during cutover, and the exporter now prevents the removed public
+  workflow from returning on the next snapshot refresh.
+
 - 2026-08-07: README clone commands now resolve to the canonical repository for
   each distribution (NVRetail GitLab in source and the anonymous mirror in the
   public export). The data-handling, cost, and limitations section has also
