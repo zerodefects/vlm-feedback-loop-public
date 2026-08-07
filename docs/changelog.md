@@ -1,5 +1,10 @@
 # Changelog
 
+- 2026-08-07: NVIDIA API-key setup now recognizes a hosted `429 Too Many
+  Requests` response as proof that the bearer cleared authentication instead
+  of falsely rejecting a fresh key. Invalid keys still fail on `401`/`403`;
+  ordinary inference continues to report and retry rate limiting separately.
+
 - 2026-08-07: The README now opens with the first-run Projects screen and its
   Propose, Review, Refine, Optimize, and Deploy loop, giving new users the
   Blueprint's workflow before setup details.

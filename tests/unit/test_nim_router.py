@@ -1308,6 +1308,33 @@ class TestKeyCredentialEndpoints:
         assert body["success"] is True
         assert bodies and bodies[0]["messages"] == []
 
+    def test_nvidia_429_after_auth_does_not_reject_valid_key(self, test_app_client):
+        """A quota response proves the bearer cleared authentication.
+
+        The setup flow must accept the key and let ordinary inference surface
+        rate-limit recovery separately; otherwise a fresh valid key is trapped
+        behind the replacement-key screen during a hosted quota event.
+        """
+        from vlm_feedback_loop.services.http_client import HttpResult
+
+        with patch(
+            "vlm_feedback_loop.routers.nim.resilient_request",
+            new=AsyncMock(
+                return_value=HttpResult(
+                    status_code=429,
+                    body={"error": {"message": "Too Many Requests"}},
+                    attempts=2,
+                )
+            ),
+        ):
+            resp = test_app_client.post(
+                "/v1/nim/test_nvidia_credential",
+                json={"credential_transient": "nvapi-valid-but-rate-limited"},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"success": True, "models": None, "error": None}
+
     def test_nvidia_explicit_credential_403_rejected(self, test_app_client):
         """build.nvidia.com returns 403 Forbidden / Authorization failed
         for a bad bearer on chat/completions."""

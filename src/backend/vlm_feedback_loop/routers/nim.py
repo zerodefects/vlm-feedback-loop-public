@@ -378,7 +378,11 @@ async def test_nvidia_credential(
         json_body=payload,
         # 400/422 mean the bearer cleared auth and the request died at
         # validation — exactly the signal this probe is engineered to hit.
-        success_statuses=frozenset({200, 400, 422}),
+        # A 429 is also an authenticated outcome: the hosted quota gate
+        # accepted the bearer before rate-limiting the request. Invalid
+        # bearers still return 401/403. Treating 429 as rejection traps users
+        # in setup even after they paste a fresh, valid key.
+        success_statuses=frozenset({200, 400, 422, 429}),
     )
 
 

@@ -5134,8 +5134,17 @@ the same successful request MUST reuse the endpoint rather than duplicate it.
 **Transient connection test (deployment-scoped):**
 
 - `POST /v1/nim/test_connection`
+- `POST /v1/nim/test_ngc_credential`
+- `POST /v1/nim/test_nvidia_credential`
 
 A deployment-scoped proxy for browser-safe endpoint testing. The frontend cannot call NIM directly due to CORS and secret exposure.
+
+The NVIDIA credential probe uses the hosted chat-completions authentication
+gate because the hosted model list is public. `401` and `403` mean the bearer
+was rejected. `200`, request-validation `400`/`422`, and quota-limited `429`
+all prove that the bearer cleared authentication. A `429` MUST NOT trap the SME
+in key replacement; ordinary inference reports and retries rate limiting
+separately.
 
 Request:
 
