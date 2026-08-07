@@ -7929,14 +7929,21 @@ closes only when live-validated evidence lands.
   dependency audits and the Docker Compose smoke remain explicit release
   commands rather than hidden local-script side effects.
 
-**Secret scanning + SonarQube delegate (Phase 13 Step 13.1):**
-- Verify: `.github/workflows/sonarqube.yml` exists at the repo root
-  and uses `NVIDIA-AI-Blueprints/sonarqube-workflows/.github/workflows/sonarqube-reusable-template.yml@main`
-  verbatim — the same ref pinned by Retail-Agentic-Commerce and
+**Secret scanning + organization-only SonarQube delegate (Phase 13 Step 13.1):**
+- Verify: the private source profile keeps `.github/workflows/sonarqube.yml`
+  with a manual trigger and uses
+  `NVIDIA-AI-Blueprints/sonarqube-workflows/.github/workflows/sonarqube-reusable-template.yml@main`
+  — the same ref pinned by Retail-Agentic-Commerce and
   Retail-Catalog-Enrichment. The `with:` block populates
   `organization`, `team`, `product`, `scmRepoName`, `projectTags`,
   and `language: python`. `secrets: inherit` is set so the org
   SonarQube token flows through.
+- Verify: the curated independent public export omits that workflow file.
+  GitHub resolves a private reusable-workflow reference before evaluating a
+  job-level repository-owner condition, so an inaccessible org-private call
+  cannot be made to skip cleanly in a public mirror. When the repository is
+  installed under `NVIDIA-AI-Blueprints`, enable its push and pull-request
+  triggers as part of the organization publication profile.
 - Verify: the `gitleaks` pre-commit hook is configured with
   `repo: https://github.com/gitleaks/gitleaks` and a pinned
   `rev:` tag (not `main`, not unpinned). The repo includes a
@@ -7952,9 +7959,10 @@ closes only when live-validated evidence lands.
   matching `nvapi-(test|fake|stub|placeholder|example|dummy)…` MUST
   NOT trigger the rule (the `[allowlist]` block in `.gitleaks.toml`
   exempts them).
-- Verify: the public-fork CVE backstop is the locked-set-only `pip-audit` plus
-  `pnpm audit` CI job. SAST remains delegated to the NVIDIA organization
-  SonarQube workflow; the repo does not add a parallel `bandit`,
+- Verify: the independent-public CVE backstop is the locked-set-only
+  `pip-audit` plus `pnpm audit` CI job. SAST remains delegated to the NVIDIA
+  organization SonarQube workflow when that publication profile is enabled;
+  the repo does not add a parallel `bandit`,
   `eslint-plugin-security`, or custom suppression-ledger program.
 
 **Backend type checking (Phase 13 Step 13.2 — COMPLETE):**

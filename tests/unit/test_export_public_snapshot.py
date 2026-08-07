@@ -82,6 +82,12 @@ def test_build_snapshot_uses_committed_files_and_removes_private_paths(
             "docs/live-release-acceptance.md": "private run ledger\n",
             internal_report: "private evidence\n",
             "docs/fixtures/pinned/study.json": "{}\n",
+            ".github/workflows/sonarqube.yml": (
+                "jobs:\n"
+                "  sonarqube:\n"
+                "    uses: NVIDIA-AI-Blueprints/sonarqube-workflows/"
+                ".github/workflows/sonarqube-reusable-template.yml@main\n"
+            ),
             "scripts/prepare_training_clone.py": "acceptance = True\n",
             "scripts/research/experiment.py": "research = True\n",
             "tests/unit/test_prepare_training_clone.py": (
@@ -104,6 +110,7 @@ def test_build_snapshot_uses_committed_files_and_removes_private_paths(
     assert not (snapshot / "docs/live-release-acceptance.md").exists()
     assert not (snapshot / "docs" / "internal").exists()
     assert not (snapshot / "docs/fixtures/pinned").exists()
+    assert not (snapshot / ".github/workflows/sonarqube.yml").exists()
     assert not (snapshot / "scripts/prepare_training_clone.py").exists()
     assert not (snapshot / "scripts/research").exists()
     assert not (snapshot / "tests/unit/test_prepare_training_clone.py").exists()

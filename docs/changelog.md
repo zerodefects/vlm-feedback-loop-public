@@ -1,5 +1,13 @@
 # Changelog
 
+- 2026-08-07: The curated independent public export now omits the
+  NVIDIA-organization-only SonarQube delegate. GitHub resolves a private
+  reusable workflow before evaluating its job-level repository-owner guard,
+  which otherwise made every independent-mirror push appear failed with zero
+  jobs. The public CI's locked `pip-audit` and `pnpm audit` backstop remains
+  active; the source-only delegate is manually dispatchable until installed in
+  an NVIDIA-owned repository with push and pull-request triggers enabled.
+
 - 2026-08-07: Fixed Scale Up retaining a stale Unlabeled count when an SME
   leaves Image Ingestion after the first accepted batch while later batches
   continue in the background. Student Training remains available for setup,

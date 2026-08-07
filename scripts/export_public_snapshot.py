@@ -12,7 +12,8 @@ By default the command:
 
 * requires a clean source checkout;
 * verifies every tracked top-level path is classified;
-* removes private evidence and private agent configuration;
+* removes private evidence, private agent configuration, and the
+  NVIDIA-organization-only SonarQube delegate;
 * strips source-host authority, dataset, and companion-checkout assumptions
   from the public agent-instruction twins;
 * excludes the optional AutoRun operator feature and its dedicated tests;
@@ -93,6 +94,7 @@ PRIVATE_TOP_LEVEL: Final = frozenset({".claude", ".codex"})
 EXCLUDED_PATHS: Final = (
     PurePosixPath(".claude"),
     PurePosixPath(".codex"),
+    PurePosixPath(".github/workflows/sonarqube.yml"),
     PurePosixPath("docs/live-release-acceptance.md"),
     PurePosixPath("docs/internal"),
     PurePosixPath("docs/fixtures/pinned"),
@@ -438,12 +440,6 @@ def find_readiness_issues(snapshot_root: Path) -> list[ReadinessIssue]:
             "global-precommit-exclusion",
             re.compile(r"(?m)^exclude:\s*\|"),
             "make formatting exclusions hook-specific so gitleaks scans all text",
-        ),
-        (
-            PurePosixPath(".github/workflows/sonarqube.yml"),
-            "sonarqube-test-scope-todo",
-            re.compile(r"configure the template to run tests/unit only"),
-            "resolve and validate the official-org SonarQube test invocation",
         ),
     )
     for relative, code, pattern, message in focused_rules:

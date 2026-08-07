@@ -89,8 +89,9 @@ jobs:
 
       # Coverage gate: [tool.coverage.report] fail_under in pyproject.toml
       # fires on this run. The coverage.xml artifact is CI-local — the
-      # SonarQube workflow's org template runs its own pytest+coverage
-      # pass and does not consume this file.
+      # The NVIDIA-org SonarQube template runs its own pytest+coverage pass
+      # when that organization-only publication profile is enabled; it does
+      # not consume this file.
       - name: Run backend unit tests (with coverage gate)
         run: >
           uv run pytest tests/unit/ -q --maxfail=5
@@ -288,8 +289,8 @@ jobs:
 
   dependency-audit:
     # Advisory backstop for public forks/mirrors: the org-level SonarQube
-    # scan (sonarqube.yml) only runs inside the NVIDIA-AI-Blueprints org,
-    # so this job keeps known-CVE checking alive everywhere else too.
+    # delegate is source-only and the curated independent public export omits
+    # it, so this job keeps known-CVE checking alive everywhere else too.
     # Audits the LOCKED dependency sets — no resolution, no installs.
     name: Dependency audit
     runs-on: ubuntu-latest
