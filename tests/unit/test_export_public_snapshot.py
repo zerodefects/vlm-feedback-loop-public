@@ -120,6 +120,38 @@ def test_build_snapshot_uses_committed_files_and_removes_private_paths(
     assert not (snapshot / "local-notes.txt").exists()
 
 
+def test_build_snapshot_rewrites_source_clone_url_for_public_readers(
+    tmp_path: Path,
+) -> None:
+    """The source README uses NVRetail while its export stays anonymous-cloneable."""
+
+    repo = _committed_repo(
+        tmp_path,
+        {
+            "README.md": (
+                f"git clone {exporter.SOURCE_REPOSITORY_URL}\n"
+                f"Source: {exporter.SOURCE_REPOSITORY_URL}\n"
+            )
+        },
+    )
+    working_dir = tmp_path / "work"
+    working_dir.mkdir()
+
+    snapshot = exporter.build_snapshot(
+        repo,
+        exporter.resolve_commit(repo, "HEAD"),
+        working_dir,
+    )
+    readme = (snapshot / "README.md").read_text(encoding="utf-8")
+
+    assert exporter.SOURCE_REPOSITORY_URL not in readme
+    assert readme.count(f"{exporter.PUBLIC_REPOSITORY_URL}.git") == 2
+    assert not any(
+        issue.code == "private-repository-url"
+        for issue in exporter.find_readiness_issues(snapshot)
+    )
+
+
 def test_build_snapshot_excludes_autorun_by_default(tmp_path: Path) -> None:
     """The default public profile removes AutoRun and every dedicated test."""
 

@@ -1,5 +1,10 @@
 # Changelog
 
+- 2026-08-07: README clone commands now resolve to the canonical repository for
+  each distribution (NVRetail GitLab in source and the anonymous mirror in the
+  public export). The data-handling, cost, and limitations section has also
+  been condensed while retaining its operational warnings.
+
 - 2026-08-07: The README's opening project-loop image is now cropped to
   the focused first-run card, renamed `project-loop.png`, and the superseded
   first-run guidance screenshot has been removed.

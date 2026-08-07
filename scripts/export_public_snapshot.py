@@ -16,6 +16,7 @@ By default the command:
   NVIDIA-organization-only SonarQube delegate;
 * strips source-host authority, dataset, and companion-checkout assumptions
   from the public agent-instruction twins;
+* rewrites the source GitLab clone URL to the anonymous public mirror;
 * excludes the optional AutoRun operator feature and its dedicated tests;
 * runs public-readiness checks before changing the destination; and
 * refuses to write into a non-empty destination.
@@ -58,6 +59,9 @@ from typing import Final
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 SCRIPT_RELATIVE_PATH: Final = PurePosixPath("scripts/export_public_snapshot.py")
 PUBLIC_REPOSITORY_URL: Final = "https://github.com/zerodefects/vlm-feedback-loop-public"
+SOURCE_REPOSITORY_URL: Final = (
+    "https://gitlab-master.nvidia.com/NVRetail/vlm-feedback-loop"
+)
 
 # The public export is allowlisted at the top level. A new root path must be
 # classified here deliberately instead of silently leaking into the snapshot.
@@ -313,6 +317,19 @@ def remove_source_only_documentation(snapshot_root: Path) -> None:
             flags=re.DOTALL,
         )
         target.write_text(pattern.sub("\n", text), encoding="utf-8")
+
+
+def rewrite_repository_urls(snapshot_root: Path) -> None:
+    """Point the exported README at the anonymously cloneable public mirror."""
+
+    readme = snapshot_root / "README.md"
+    if not readme.is_file():
+        return
+    text = readme.read_text(encoding="utf-8")
+    readme.write_text(
+        text.replace(SOURCE_REPOSITORY_URL, f"{PUBLIC_REPOSITORY_URL}.git"),
+        encoding="utf-8",
+    )
 
 
 def _is_excluded_from_readiness_scan(relative: PurePosixPath) -> bool:
@@ -661,6 +678,7 @@ def build_snapshot(
         exclude_autorun=exclude_autorun,
     )
     remove_source_only_documentation(snapshot_root)
+    rewrite_repository_urls(snapshot_root)
     return snapshot_root
 
 

@@ -249,36 +249,24 @@ placement, reuse, recovery, and replacement contract is in the
 
 ## Data handling, cost, and limitations
 
-Project databases store image filesystem references rather than copies, but
-that does not mean every processing path stays on the same machine:
+Projects store filesystem references to images, not image copies. Data leaves
+the Blueprint host in these workflows:
 
-| Workflow | Data sent outside the Blueprint host |
+| Workflow | Data sent externally |
 | --- | --- |
-| Hosted image embeddings | Each ingested image selected for embedding is encoded and sent to the configured NVIDIA endpoint. |
-| Hosted Teacher inference | The current image, selected ICL images and Verified labels, Guidance-derived prompt, and output schema are sent to the configured NVIDIA endpoint. |
-| TAO Student training | Selected training and held-out images plus annotations are uploaded to the configured TAO workspace object store before remote jobs run. |
+| Hosted embeddings | Images selected for embedding |
+| Hosted Teacher | The current image, selected ICL examples and labels, prompt, and output schema |
+| TAO training | Selected training and test images plus annotations uploaded to the configured workspace |
 
-A persisted `storage_ref` is not a permanent filesystem grant. Every image
-read is re-authorized against the current `IMAGE_ROOT`, must resolve to a
-regular file, and is consumed through the descriptor opened during that check.
-Changing a path or symlink after ingestion therefore cannot redirect serving,
-inference, embedding, pHash, benchmarking, or export reads outside the current
-deployment policy.
+Self-hosted endpoints can also run on another machine. Review each operator's
+access, retention, privacy, and model terms before using sensitive data.
+Hosted APIs and TAO may incur charges; local NIMs consume GPU resources.
 
-Self-hosted endpoint URLs may also refer to another machine, so the operator
-controls that data boundary. Before using sensitive or regulated data, review
-the endpoint and object-store operators' access, retention, privacy, and model
-terms. Hosted API calls can consume quota or incur service charges; local NIMs
-consume GPU resources; TAO workflows can incur compute, storage, and egress
-costs. The Blueprint does not estimate those charges.
-
-This is a single-user reference stack, not a high-availability service. It has
-no built-in authentication or multi-user isolation, runs background work in
-the backend process without an external task queue, and permits one backend
-process per project database. Compose cannot orchestrate system-managed local
-NIMs because its backend intentionally has no Docker socket. The bundled
-15-image sample demonstrates the interaction loop but cannot satisfy the
-default Scale-Up or Student Training data gates.
+Image reads are restricted by the current `IMAGE_ROOT`. This is a single-user,
+trusted-network reference application without built-in authentication or high
+availability; run only one backend process per project database. Compose cannot
+manage local NIM containers, so use local-source mode for that workflow. See
+the [deployment guide](docs/deployment.md) for operational details.
 
 ## Get started
 
@@ -295,7 +283,7 @@ required.
 
    ```bash
    git clone https://github.com/zerodefects/vlm-feedback-loop-public.git
-   cd vlm-feedback-loop-public
+   cd vlm-feedback-loop
    export NVIDIA_API_KEY=nvapi-...
    docker compose up --build
    ```
@@ -343,7 +331,7 @@ Use source mode for development and for system-managed local NIMs:
 
 ```bash
 git clone https://github.com/zerodefects/vlm-feedback-loop-public.git
-cd vlm-feedback-loop-public
+cd vlm-feedback-loop
 
 uv sync
 cd src/ui && pnpm install && cd ../..
