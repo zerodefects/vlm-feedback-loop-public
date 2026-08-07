@@ -17,6 +17,7 @@ export interface BatchLabelRunResponse {
   status: string; // queued | running | paused | canceling | completed | canceled | failed
   status_reason: string | null;
   paused_reason: string | null;
+  circuit_breaker_threshold: number | null;
 
   // Config snapshot
   guidance_id: string | null;
@@ -27,6 +28,7 @@ export interface BatchLabelRunResponse {
   thinking_mode_effective: string | null;
   visual_budget_preset_key: string | null;
   structured_generation_mode_effective: string | null;
+  icl_mode: string | null;
 
   // Progress
   progress: { processed: number; total: number } | null;
@@ -60,13 +62,14 @@ export interface BatchLabelRunCreateResponse {
   thinking_mode_effective: string | null;
   visual_budget_preset_key: string | null;
   structured_generation_mode_effective: string | null;
+  icl_mode: string | null;
   examples_total: number;
   created_at: string;
 }
 
 // ── Schema-Invalid Manifest ───────────────────────────────────────────────
 
-export interface SchemaInvalidExample {
+interface SchemaInvalidExample {
   example_key: string;
   validation_errors_core: string[];
   inference_invocation_id: string;

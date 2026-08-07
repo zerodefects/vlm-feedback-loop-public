@@ -21,7 +21,6 @@ from vlm_feedback_loop.model_catalog_constants import (
     EMBEDDING_MODEL_ID,
     EMBEDDING_NIM_GPU_MIN_GB,
     EMBEDDING_NIM_IMAGE,
-    MISTRAL_LARGE_3,
     NEMOTRON_3_NANO_OMNI_COMPUTE_CAPABILITY_MIN,
     NEMOTRON_3_NANO_OMNI_GPU_MIN_GB,
     NEMOTRON_3_NANO_OMNI_NIM_IMAGE,
@@ -33,9 +32,12 @@ from vlm_feedback_loop.services.environment import (
     _build_missing_prerequisites,
     assess_environment,
     gpu_memory_meets_floor,
+    probe_gpu_inventory,
     run_subprocess,
 )
 from vlm_feedback_loop.services.local_nim_service import ActiveNimResident
+
+_RETIRED_MISTRAL_LARGE_3 = "mistralai/mistral-large-3-675b-instruct-2512"
 
 # ── _assess_local_deployable_models ─────────────────────────────────────────
 
@@ -65,7 +67,7 @@ class TestAssessLocalDeployableModels:
     def test_super_reasoner_needs_more_than_80gb(self):
         # Cosmos 3 Super-Reasoner (88 GB minimum) does NOT fit an 80 GB A100,
         # while the ~56 GB-class models do.
-        gpus = [GpuInfo(name="A100", memory_total_mb=81920)]  # 80 GB
+        gpus = [GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)]  # 80 GB
         fits = {m.model_name: m.fits for m in _assess_local_deployable_models(gpus)}
         assert fits.get(COSMOS3_SUPER_REASONER) is False
         assert fits.get(COSMOS3_NANO_REASONER) is True
@@ -94,17 +96,17 @@ class TestAssessLocalDeployableModels:
 
     def test_only_models_with_local_deploy_metadata(self):
         models = _assess_local_deployable_models(
-            [GpuInfo(name="A100", memory_total_mb=81920)]
+            [GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)]
         )
-        # Only the Cosmos models carry local_deploy_metadata; hosted-only
-        # entries (Mistral Large) are excluded from the result.
+        # Hosted-only entries, including the retired Mistral Large identity,
+        # are excluded from the result.
         names = {m.model_name for m in models}
         assert COSMOS_REASON2_8B in names
         assert COSMOS_REASON2_2B in names
-        assert MISTRAL_LARGE_3 not in names
+        assert _RETIRED_MISTRAL_LARGE_3 not in names
 
     def test_custom_catalog(self):
-        gpus = [GpuInfo(name="A100", memory_total_mb=81920)]
+        gpus = [GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)]
         catalog = [
             {
                 "model_name": "test-model",
@@ -217,6 +219,25 @@ class TestIsContainerized:
 
 class TestRunSubprocessEnvironment:
     @pytest.mark.asyncio
+    async def test_timeout_uses_shared_kill_and_reap_boundary(self, monkeypatch):
+        from vlm_feedback_loop.services import environment
+
+        class FakeProcess:
+            returncode = None
+
+        async def fake_create(*_args, **_kwargs):
+            return FakeProcess()
+
+        communication = AsyncMock(side_effect=TimeoutError)
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_create)
+        monkeypatch.setattr(environment, "communicate_with_timeout", communication)
+
+        result = await environment.run_subprocess("docker", timeout_s=2.5)
+
+        assert result == (-1, "", "Command timed out after 2.5s")
+        communication.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_private_overrides_reach_only_child_environment(self, monkeypatch):
         """Private overrides merge with inheritance without mutating the parent."""
         sentinel = "SENTINEL_CHILD_ONLY_NGC"
@@ -322,6 +343,66 @@ class TestRunSubprocessEnvironment:
         assert stderr == "login rejected [REDACTED]"
 
 
+class TestProbeGpuInventory:
+    @pytest.mark.asyncio
+    async def test_parses_memory_and_compute_capability_from_nvidia_smi(
+        self, monkeypatch
+    ):
+        """The inventory preserves every hardware field used by placement."""
+        probe = AsyncMock(
+            return_value=(
+                0,
+                "NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887, 12.0\n"
+                "NVIDIA A100-SXM4-80GB, 81920, 8.0",
+                "",
+            )
+        )
+        monkeypatch.setattr(
+            "vlm_feedback_loop.services.environment.run_subprocess", probe
+        )
+
+        gpus = await probe_gpu_inventory()
+
+        assert gpus == [
+            GpuInfo(
+                name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                memory_total_mb=97887,
+                compute_capability=12.0,
+            ),
+            GpuInfo(
+                name="NVIDIA A100-SXM4-80GB",
+                memory_total_mb=81920,
+                compute_capability=8.0,
+            ),
+        ]
+        probe.assert_awaited_once_with(
+            "nvidia-smi",
+            "--query-gpu=name,memory.total,compute_cap",
+            "--format=csv,noheader,nounits",
+            timeout_s=10.0,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("returncode", "stdout"),
+        [
+            (1, "driver communication failed"),
+            (0, ""),
+            (0, "malformed inventory line"),
+        ],
+    )
+    async def test_returns_empty_inventory_when_nvidia_smi_is_unusable(
+        self, monkeypatch, returncode, stdout
+    ):
+        """A missing, failed, empty, or malformed probe cannot invent GPUs."""
+        monkeypatch.setattr(
+            "vlm_feedback_loop.services.environment.run_subprocess",
+            AsyncMock(return_value=(returncode, stdout, "probe error")),
+        )
+
+        assert await probe_gpu_inventory() == []
+
+
 # ── assess_environment ──────────────────────────────────────────────────────
 
 
@@ -386,6 +467,17 @@ class TestAssessEnvironment:
         assert result["recommended_embedding_mode"] == "hosted"
 
     @pytest.mark.asyncio
+    async def test_explicitly_disabled_embeddings_recommend_phash(self, mock_env):
+        """An operator who disables embedding NIMs gets the supported pHash
+        path, even if an unrelated hosted credential remains configured."""
+        settings = mock_env(nvidia_api_key="nvapi-test")
+        settings.EMBEDDING_PROVIDER = "none"
+
+        result = await assess_environment(settings)
+
+        assert result["recommended_embedding_mode"] == "none"
+
+    @pytest.mark.asyncio
     async def test_exposes_default_teacher_model_verbatim(self, mock_env):
         """The environment surfaces the effective DEFAULT_TEACHER_MODEL so the
         Confirm Defaults screen preselects it without hardcoding a model name.
@@ -430,7 +522,11 @@ class TestAssessEnvironment:
         monkeypatch.setattr(
             env_mod,
             "probe_gpu_inventory",
-            AsyncMock(return_value=[GpuInfo(name="A100", memory_total_mb=81920)]),
+            AsyncMock(
+                return_value=[
+                    GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)
+                ]
+            ),
         )
 
         settings = mock_env(nvidia_api_key="nvapi-test", ngc_api_key="ngc-test")
@@ -440,7 +536,7 @@ class TestAssessEnvironment:
         assert result["docker_available"] is True
         assert result["nvidia_toolkit_available"] is True
         assert len(result["gpus"]) == 1
-        assert result["gpus"][0]["name"] == "A100"
+        assert result["gpus"][0]["name"] == "NVIDIA A100-SXM4-80GB"
         assert result["recommended_teacher_mode"] == "hosted"
         assert result["recommended_embedding_mode"] == "local"
 
@@ -469,7 +565,11 @@ class TestAssessEnvironment:
         monkeypatch.setattr(
             env_mod,
             "probe_gpu_inventory",
-            AsyncMock(return_value=[GpuInfo(name="A100", memory_total_mb=81920)]),
+            AsyncMock(
+                return_value=[
+                    GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)
+                ]
+            ),
         )
 
         settings = mock_env(ngc_api_key="ngc-test")
@@ -510,7 +610,11 @@ class TestAssessEnvironment:
         monkeypatch.setattr(
             env_mod,
             "probe_gpu_inventory",
-            AsyncMock(return_value=[GpuInfo(name="A100", memory_total_mb=81920)]),
+            AsyncMock(
+                return_value=[
+                    GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)
+                ]
+            ),
         )
 
         result = await assess_environment(mock_env())
@@ -544,7 +648,7 @@ class TestAssessEnvironment:
 
     @pytest.mark.asyncio
     async def test_embedding_only_gpu_uses_local_embedding(self, mock_env, monkeypatch):
-        """A GPU with 12 GB fits neither
+        """A GPU with 24 GB fits neither
         Cosmos variant → recommended_teacher_mode falls back to "hosted"
         (forward-looking — the FTUE Teacher setup screen prompts for an
         API key). Local
@@ -552,7 +656,7 @@ class TestAssessEnvironment:
         peer card.
 
         This is the small-GPU host class: every GPU is below every
-        Teacher floor but at/above the 10 GB embedding floor, so the GPU goes
+        Teacher floor but at the 24 GB embedding floor, so the GPU goes
         to the embedding NIM (hosted Teacher + local embeddings) — no
         planned local Teacher reserves it."""
         import vlm_feedback_loop.services.environment as env_mod
@@ -566,7 +670,7 @@ class TestAssessEnvironment:
         monkeypatch.setattr(
             env_mod,
             "probe_gpu_inventory",
-            AsyncMock(return_value=[GpuInfo(name="RTX 3060", memory_total_mb=12288)]),
+            AsyncMock(return_value=[GpuInfo(name="NVIDIA L4", memory_total_mb=24576)]),
         )
 
         result = await assess_environment(mock_env())
@@ -576,9 +680,37 @@ class TestAssessEnvironment:
         assert result["recommended_local_teacher_model_name"] is None
         assert result["recommended_local_teacher_image"] is None
         assert result["recommended_local_teacher_gpu_memory_minimum_gb"] is None
-        # NIM 2.0.0's 10 GB compatibility floor fits → local.
+        # The supported 24 GB eligibility floor fits → local.
         assert result["embedding_deployment"]["fits"] is True
         assert result["recommended_embedding_mode"] == "local"
+
+    @pytest.mark.asyncio
+    async def test_unvalidated_24gb_gpu_does_not_recommend_embedding_nim(
+        self, mock_env, monkeypatch
+    ):
+        """Memory alone must not present an unvalidated GPU as supported."""
+        import vlm_feedback_loop.services.environment as env_mod
+
+        monkeypatch.setattr(
+            env_mod, "check_docker_available", AsyncMock(return_value=(True, None))
+        )
+        monkeypatch.setattr(
+            env_mod, "check_nvidia_toolkit", AsyncMock(return_value=(True, None))
+        )
+        monkeypatch.setattr(
+            env_mod,
+            "probe_gpu_inventory",
+            AsyncMock(
+                return_value=[
+                    GpuInfo(name="NVIDIA GeForce RTX 4090", memory_total_mb=24576)
+                ]
+            ),
+        )
+
+        result = await assess_environment(mock_env())
+
+        assert result["embedding_deployment"]["fits"] is False
+        assert result["recommended_embedding_mode"] == "hosted"
 
     @pytest.mark.asyncio
     async def test_key_set_with_gpu_still_populates_local_fields(
@@ -601,7 +733,11 @@ class TestAssessEnvironment:
         monkeypatch.setattr(
             env_mod,
             "probe_gpu_inventory",
-            AsyncMock(return_value=[GpuInfo(name="A100", memory_total_mb=81920)]),
+            AsyncMock(
+                return_value=[
+                    GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)
+                ]
+            ),
         )
 
         result = await assess_environment(
@@ -750,6 +886,45 @@ class TestAssessEnvironment:
             == NEMOTRON_3_NANO_OMNI_REASONING
         )
 
+    def test_running_teacher_match_ignores_env_docker_would_reject(self):
+        """The FTUE reuses a resident built from the catalog's effective env."""
+        import vlm_feedback_loop.services.environment as env_mod
+
+        image = "nvcr.io/nim/nvidia/example:1.0"
+        entry = {
+            "model_name": "nvidia/example",
+            "eligible_roles": ["teacher"],
+            "local_deploy_metadata": {
+                "nim_container_image": image,
+                "extra_container_env": {
+                    "NIM_DISABLE_CUDA_GRAPH": "1",
+                    "NGC_API_KEY": "reserved",
+                    "lower_case": "invalid",
+                    "BOOL_VALUE": True,
+                },
+            },
+        }
+        resident = ActiveNimResident(
+            project_id="owner-project",
+            project_name="Example",
+            deployment_id="deployment-1",
+            model_config_id="example-config",
+            role="teacher",
+            model_name="nvidia/example",
+            nim_container_image=image,
+            gpu_assignment="device=0",
+            endpoint_url="http://localhost:8001/v1",
+            host_port=8001,
+            status="running",
+            nim_model_size=None,
+            nim_model_profile=None,
+            extra_container_env=(("NIM_DISABLE_CUDA_GRAPH", "1"),),
+        )
+
+        assert (
+            env_mod._pick_running_teacher_resident_entry([resident], [entry]) is entry
+        )
+
     # ── Placement-aware embedding recommendation ─────────────────────────
 
     def _patch_gpu_host(
@@ -788,8 +963,8 @@ class TestAssessEnvironment:
         self._patch_gpu_host(
             monkeypatch,
             [
-                GpuInfo(name="A100", memory_total_mb=81920),
-                GpuInfo(name="A100", memory_total_mb=81920),
+                GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920),
+                GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920),
             ],
             residents={"0": {"teacher"}},
         )
@@ -808,7 +983,7 @@ class TestAssessEnvironment:
         promise a deploy the one-NIM-per-GPU gate refuses."""
         self._patch_gpu_host(
             monkeypatch,
-            [GpuInfo(name="A100", memory_total_mb=81920)],
+            [GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)],
             residents={"0": {"teacher"}},
         )
 
@@ -822,13 +997,13 @@ class TestAssessEnvironment:
         self, mock_env, monkeypatch
     ):
         """Heterogeneous host: the Teacher holds the 80 GB device and
-        the free device has 8 GB — below the 10 GB embedding floor.
+        the free device has 8 GB — below the 24 GB embedding floor.
         ``fits`` must reflect the GPU the embedding NIM would actually
         get, not host-wide max memory."""
         self._patch_gpu_host(
             monkeypatch,
             [
-                GpuInfo(name="A100", memory_total_mb=81920),
+                GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920),
                 GpuInfo(name="RTX 3070", memory_total_mb=8192),
             ],
             residents={"0": {"teacher"}},
@@ -846,7 +1021,7 @@ class TestAssessEnvironment:
         flip to hosted just because the device is occupied."""
         self._patch_gpu_host(
             monkeypatch,
-            [GpuInfo(name="A100", memory_total_mb=81920)],
+            [GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)],
             residents={"0": {"embedding"}},
         )
 
@@ -865,8 +1040,8 @@ class TestAssessEnvironment:
         self._patch_gpu_host(
             monkeypatch,
             [
-                GpuInfo(name="A100", memory_total_mb=81920),
-                GpuInfo(name="A100", memory_total_mb=81920),
+                GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920),
+                GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920),
             ],
         )
 
@@ -886,7 +1061,7 @@ class TestAssessEnvironment:
             _pick_local_teacher_recommendation,
         )
 
-        gpus = [GpuInfo(name="A100", memory_total_mb=81920)]
+        gpus = [GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)]
 
         # Synthetic catalog with 2B declared first, 8B second.
         flipped_catalog = [
@@ -920,7 +1095,7 @@ class TestAssessEnvironment:
             _pick_local_teacher_recommendation,
         )
 
-        gpus = [GpuInfo(name="A100", memory_total_mb=81920)]
+        gpus = [GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)]
 
         # CR2-8B declared FIRST so a naive stable sort would pick it; the
         # preference rank must override declaration order.
@@ -1003,7 +1178,7 @@ class TestAssessEnvironment:
             _pick_local_teacher_recommendation,
         )
 
-        gpus = [GpuInfo(name="A100", memory_total_mb=81920)]
+        gpus = [GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)]
         embedding_only_catalog = [
             {
                 "model_name": EMBEDDING_MODEL_ID,
@@ -1026,12 +1201,12 @@ class TestAssessEnvironment:
 
     @pytest.mark.asyncio
     async def test_no_secrets_in_response(self, mock_env):
-        settings = mock_env(nvidia_api_key="nvapi-secret-key-123")
+        settings = mock_env(nvidia_api_key="nvapi-fake-key-123")
         result = await assess_environment(settings)
 
         # Flatten all values and check no secrets leak
         flat = str(result)
-        assert "nvapi-secret-key-123" not in flat
+        assert "nvapi-fake-key-123" not in flat
         # Boolean flags only, not values
         assert result["nvidia_api_key_configured"] is True
 
@@ -1055,7 +1230,11 @@ class TestAssessEnvironment:
         monkeypatch.setattr(
             env_mod,
             "probe_gpu_inventory",
-            AsyncMock(return_value=[GpuInfo(name="A100", memory_total_mb=81920)]),
+            AsyncMock(
+                return_value=[
+                    GpuInfo(name="NVIDIA A100-SXM4-80GB", memory_total_mb=81920)
+                ]
+            ),
         )
 
         settings = mock_env()
@@ -1064,7 +1243,7 @@ class TestAssessEnvironment:
         names = {m["model_name"] for m in result["local_deployable_models"]}
         assert COSMOS_REASON2_8B in names
         assert COSMOS_REASON2_2B in names
-        assert MISTRAL_LARGE_3 not in names
+        assert _RETIRED_MISTRAL_LARGE_3 not in names
 
     @pytest.mark.asyncio
     async def test_missing_prerequisites_populated(self, mock_env):

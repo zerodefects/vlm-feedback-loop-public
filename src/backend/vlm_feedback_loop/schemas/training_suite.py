@@ -3,9 +3,10 @@
 
 """Pydantic schemas for training suite endpoints.
 
-"Start Training" must atomically pre-create every TAOJob in every chain.
-``TrainingSuiteCreateRequest`` is the composite counterpart to single-job
-TAO CRUD.
+"Start Training" durably owns its frozen exports before transfer, then
+atomically creates every TAOJob chain after setup succeeds.
+``TrainingSuiteCreateRequest`` is the composite counterpart to single-job TAO
+CRUD.
 """
 
 from __future__ import annotations
@@ -30,9 +31,8 @@ class TrainingSuiteCreateRequest(BaseModel):
     export_field_mode: Literal["all", "aux_and_core", "core_only"] = "all"
     # LoRA-first is the Spec §2 default training mode; ``false`` opts a
     # suite into full-weight fine-tuning (increased memory + no adapter
-    # packaging path). The effective value is persisted per-TAOJob in
-    # ``job_config.lora_config`` and emitted on the cosmos-rl wire as
-    # ``specs.policy.lora`` (§9.7.3.2).
+    # packaging path). The value is retained on the suite and per-TAOJob,
+    # then emitted on the cosmos-rl wire as ``specs.policy.lora`` (§9.7.3.2).
     enable_lora: bool = True
     quantization_schemes: list[Literal["FP8_DYNAMIC", "W8A8", "W8A16", "W4A16"]] = (
         Field(default_factory=lambda: ["FP8_DYNAMIC"])
@@ -68,6 +68,8 @@ class TrainingSuiteJobResponse(BaseModel):
     status: str
     tao_external_job_id: str | None = None
     chain_halted_reason: str | None = None
+    outputs_fetch_status: Literal["pending", "in_progress", "completed", "failed"]
+    outputs_fetch_error_ref: str | None = None
 
 
 class TrainingSuiteChainResponse(BaseModel):
@@ -89,18 +91,24 @@ class TrainingSuiteResponse(BaseModel):
     training_preset: str
     export_field_mode: str
     include_auto_labeled: bool
+    enable_lora: bool
     quantization_schemes: list[str]
 
     training_dataset_export_id: str | None
     evaluation_dataset_export_id: str | None
+    training_example_count: int | None = None
+    evaluation_example_count: int | None = None
+    evaluation_dataset_checksum_sha256: str | None = None
 
     selected_student_base_model_config_ids: list[str]
     chain_ids_ordered: list[str]
     chains: list[TrainingSuiteChainResponse]
+    student_model_ids: list[str] = Field(default_factory=list)
 
     provisioning_run_id: str | None = None
     provisioning_model_names: list[str] = Field(default_factory=list)
     setup_error_ref: str | None = None
+    setup_retryable: bool = False
 
     status: str
     created_at: str

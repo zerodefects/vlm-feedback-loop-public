@@ -1,162 +1,188 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Latency × concurrency matrix for a Student variant card: one row per
- * concurrency level, columns p50 / p90 / p99. Reads the
- * ``metrics.benchmarks`` table the NIM benchmark lifecycle writes onto
- * the Student's serving evaluation run.
- */
+import { useState } from "react";
+import { Button, Text } from "@kui/react";
 
-import type { EvaluationRunResponse } from "@/types/evaluation";
+import type {
+  EvaluationRunResponse,
+  ServingBenchmarkResult,
+  ServingBenchmarkWorkload,
+} from "@/types/evaluation";
 
 export interface ServingMatrixProps {
-  /** The Student's serving evaluation run
-      (``student.serving_evaluation_run_id``). */
   run: EvaluationRunResponse | null;
-  /** Concurrency levels emitted by the backend latency sweep
-      (``settings.STUDENT_LATENCY_TEST_CONCURRENCIES``, default ``[1, 8, 24]``). */
   concurrencies: number[];
 }
 
-interface BenchmarkSlot {
-  concurrency: number;
-  latency_p50_ms: number | null;
-  latency_p90_ms: number | null;
-  latency_p99_ms: number | null;
+function findSlot(
+  benchmarks: ServingBenchmarkResult[],
+  concurrency: number,
+): ServingBenchmarkResult | null {
+  return benchmarks.find((row) => row.concurrency === concurrency) ?? null;
 }
 
-function readBenchmarks(run: EvaluationRunResponse | null): BenchmarkSlot[] {
-  if (!run) return [];
-  // Benchmarks live in the run's metadata under ``metrics.benchmarks`` or
-  // a sibling ``serving_metrics`` field. The run-record metrics shape
-  // carries them under ``metrics.benchmarks`` for NIM-source runs.
-  const metrics = run.metrics as
-    | (Record<string, unknown> & {
-        benchmarks?: Array<{
-          concurrency: number;
-          latency_p50_ms?: number | null;
-          latency_p90_ms?: number | null;
-          latency_p99_ms?: number | null;
-        }>;
-      })
-    | null;
-  const arr = metrics?.benchmarks ?? [];
-  return arr.map((b) => ({
-    concurrency: b.concurrency,
-    latency_p50_ms: b.latency_p50_ms ?? null,
-    latency_p90_ms: b.latency_p90_ms ?? null,
-    latency_p99_ms: b.latency_p99_ms ?? null,
-  }));
+function formatMilliseconds(value: number | null | undefined): string {
+  return value == null || !Number.isFinite(value) ? "—" : `${Math.round(value)} ms`;
 }
 
-function findSlot(benchmarks: BenchmarkSlot[], c: number): BenchmarkSlot | null {
-  return benchmarks.find((b) => b.concurrency === c) ?? null;
+function formatRps(value: number | null | undefined): string {
+  return value == null || !Number.isFinite(value) ? "—" : value.toFixed(2);
 }
 
-function formatLatency(ms: number | null | undefined): string {
-  if (ms == null || Number.isNaN(ms)) return "—";
-  // Render seconds throughout (e.g. ``0.3s``, ``0.5s``, ``1.2s``) —
-  // mixing ``ms`` and ``s`` units in adjacent rows of the same column
-  // would force the SME to mentally normalise. Use two decimal places
-  // below 100 ms (so ``0.15s`` keeps useful precision) and one decimal
-  // place above so larger numbers stay terse.
-  const seconds = ms / 1000;
-  return ms < 100 ? `${seconds.toFixed(2)}s` : `${seconds.toFixed(1)}s`;
+function formatFailure(row: ServingBenchmarkResult | null): string {
+  if (!row) return "—";
+  const rate = row.failure_rate;
+  if (rate != null && Number.isFinite(rate)) return `${(rate * 100).toFixed(1)}%`;
+  if (row.failed_request_count != null && row.attempted_request_count) {
+    return `${((row.failed_request_count / row.attempted_request_count) * 100).toFixed(1)}%`;
+  }
+  return row.status === "passed" ? "0.0%" : "—";
 }
 
-/** One right-aligned latency value cell. */
-function LatencyCell({
-  testId,
-  value,
-}: {
-  testId: string;
-  value: number | null | undefined;
-}) {
+function ValueText({ children }: { children: string }) {
   return (
-    <td data-testid={testId} style={{ padding: "2px 16px", textAlign: "right" }}>
-      {formatLatency(value)}
-    </td>
+    <Text kind="body/regular/sm" style={{ color: "var(--text-secondary)" }}>
+      {children}
+    </Text>
+  );
+}
+
+function Detail({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline justify-between gap-4">
+      <Text kind="label/regular/xs" style={{ color: "var(--text-muted)" }}>
+        {label}
+      </Text>
+      <Text
+        kind="body/regular/xs"
+        style={{ color: "var(--text-secondary)", textAlign: "right" }}
+      >
+        {value}
+      </Text>
+    </div>
+  );
+}
+
+function WorkloadDetails({ workload }: { workload: ServingBenchmarkWorkload | null }) {
+  if (!workload) {
+    return (
+      <Text kind="body/regular/xs" style={{ color: "var(--warning-amber, #f59e0b)" }}>
+        Legacy synthetic benchmark — workload provenance was not recorded.
+      </Text>
+    );
+  }
+  const contract = workload.inference_contract?.output_field_mode;
+  const driver = workload.driver;
+  const driverName =
+    driver?.name?.toLowerCase() === "aiperf" ? "AIPerf" : (driver?.name ?? "AIPerf");
+  return (
+    <div
+      className="glass-card-inner flex flex-col gap-1.5"
+      style={{ padding: 12 }}
+      data-testid="serving-workload-details"
+    >
+      <Detail
+        label="Workload"
+        value={`${workload.selected_count ?? "—"} real Test Pool images${
+          workload.pool_member_count != null ? ` of ${workload.pool_member_count}` : ""
+        }`}
+      />
+      <Detail label="Prompt" value={`Guidance schema · ${contract ?? "unknown"}`} />
+      <Detail label="Output limit" value="Uncapped request (EOS/server policy)" />
+      <Detail label="KV cache reuse" value={workload.kv_cache_reuse ?? "unknown"} />
+      <Detail label="Driver" value={`${driverName} ${driver?.version ?? ""}`.trim()} />
+      <Detail
+        label="Workload hash"
+        value={(workload.workload_hash ?? "—").slice(0, 16)}
+      />
+    </div>
   );
 }
 
 export function ServingMatrix({ run, concurrencies }: ServingMatrixProps) {
-  const benchmarks = readBenchmarks(run);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const benchmarks = run?.metrics?.benchmarks ?? [];
+  const workload = run?.metrics?.benchmark_workload ?? null;
 
   return (
-    <div className="flex flex-col gap-1" data-testid="serving-matrix">
-      {/* The parent (StudentVariantCard) already renders a "Serving:"
-          eyebrow above this matrix; a second "Latency (by concurrency):"
-          eyebrow here would orphan-stack two muted xs labels for no
-          additional information (the table's own "concurrency" column +
-          p50/p90/p99 sub-headers communicate the same thing). */}
-      {/* The table sizes to content (no w-full) so the concurrency label
-          sits adjacent to its latency values instead of stretching the
-          pair across the full card width. */}
-      <table className="text-sm" style={{ borderCollapse: "collapse" }}>
-        <thead>
-          <tr style={{ borderBottom: "1px solid var(--glass-border-subtle)" }}>
-            <th
-              className="section-eyebrow"
-              style={{
-                textAlign: "left",
-                padding: "2px 8px 2px 0",
-                fontWeight: 400,
-                fontSize: 12,
-                color: "var(--text-muted)",
-              }}
-            >
-              concurrency
-            </th>
-            <th
-              colSpan={3}
-              className="section-eyebrow"
-              style={{
-                // Centered across the three value columns so the header
-                // reads as a group label; right alignment would park it
-                // over p99 and leave p50 visually unlabeled.
-                textAlign: "center",
-                padding: "2px 8px",
-                fontWeight: 400,
-                fontSize: 12,
-                color: "var(--text-muted)",
-              }}
-              data-testid="serving-matrix-header"
-            >
-              Latency (p50 / p90 / p99)
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {concurrencies.map((c) => {
-            const slot = findSlot(benchmarks, c);
-            return (
-              <tr key={c} data-testid={`serving-matrix-row-c${c}`}>
-                <td
-                  style={{
-                    padding: "2px 8px 2px 0",
-                    color: "var(--text-secondary)",
-                  }}
+    <div className="flex flex-col gap-2" data-testid="serving-matrix">
+      <div style={{ overflowX: "auto" }}>
+        <table className="text-sm" style={{ borderCollapse: "collapse" }}>
+          <thead>
+            <tr style={{ borderBottom: "1px solid var(--glass-border-subtle)" }}>
+              {["Concurrency", "p50", "p90", "p99", "RPS", "Failures"].map(
+                (heading) => (
+                  <th
+                    key={heading}
+                    style={{
+                      textAlign: heading === "Concurrency" ? "left" : "right",
+                      padding: "3px 10px",
+                      fontWeight: 400,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    <Text
+                      kind="label/regular/xs"
+                      className="section-eyebrow"
+                      style={{ color: "var(--text-muted)" }}
+                    >
+                      {heading}
+                    </Text>
+                  </th>
+                ),
+              )}
+            </tr>
+          </thead>
+          <tbody>
+            {concurrencies.map((concurrency) => {
+              const row = findSlot(benchmarks, concurrency);
+              const values = [
+                formatMilliseconds(row?.latency_p50_ms),
+                formatMilliseconds(row?.latency_p90_ms),
+                formatMilliseconds(row?.latency_p99_ms),
+                formatRps(row?.request_throughput_rps),
+                formatFailure(row),
+              ];
+              return (
+                <tr
+                  key={concurrency}
+                  data-testid={`serving-matrix-row-c${concurrency}`}
                 >
-                  c={c}
-                </td>
-                <LatencyCell
-                  testId={`serving-matrix-cell-c${c}-p50`}
-                  value={slot?.latency_p50_ms}
-                />
-                <LatencyCell
-                  testId={`serving-matrix-cell-c${c}-p90`}
-                  value={slot?.latency_p90_ms}
-                />
-                <LatencyCell
-                  testId={`serving-matrix-cell-c${c}-p99`}
-                  value={slot?.latency_p99_ms}
-                />
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+                  <td style={{ padding: "3px 10px" }}>
+                    <ValueText>{`c=${concurrency}`}</ValueText>
+                  </td>
+                  {values.map((value, index) => (
+                    <td
+                      key={`${concurrency}-${index}`}
+                      data-testid={
+                        index < 3
+                          ? `serving-matrix-cell-c${concurrency}-p${[50, 90, 99][index]}`
+                          : undefined
+                      }
+                      style={{ padding: "3px 10px", textAlign: "right" }}
+                    >
+                      <ValueText>{value}</ValueText>
+                    </td>
+                  ))}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div>
+        <Button
+          kind="tertiary"
+          onClick={() => setDetailsOpen((open) => !open)}
+          aria-expanded={detailsOpen}
+          data-testid="serving-workload-toggle"
+          style={{ borderRadius: 999 }}
+        >
+          {detailsOpen ? "Hide workload details" : "Workload details"}
+        </Button>
+      </div>
+      {detailsOpen && <WorkloadDetails workload={workload} />}
     </div>
   );
 }

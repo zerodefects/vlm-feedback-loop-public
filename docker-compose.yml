@@ -5,32 +5,33 @@
 #
 # Prerequisites (run once on the host):
 #   1. Install Docker + Docker Compose v2
-#   2. Export NVIDIA_API_KEY (hosted NIM) and/or NGC_API_KEY (local NIM) in
-#      the shell — or put them in a repo-root .env file, which compose reads
-#      for the ${VAR:-} interpolations below. (~/.vlm_feedback_loop is NOT
-#      read in containerized mode; the image seeds its own config.yaml.)
+#   2. Export NVIDIA_API_KEY for hosted NIM in the shell — or put it in a
+#      repo-root .env file, which compose reads for the ${VAR:-}
+#      interpolations below. (~/.vlm_feedback_loop is NOT read in
+#      containerized mode; the image seeds its own config.yaml.)
 #
 # Launch:
 #   docker compose up --build
 #
 # Open:  http://localhost:3000
 #
-# Environment overrides (see README "Containerized Blueprint mode"):
+# Environment overrides (see README "Configuration and data"):
 #   EDGE_BIND_HOST         host bind for edge nginx            (default 127.0.0.1)
 #   EDGE_PORT              host port for the edge nginx        (default 3000)
 #   IMAGE_ROOT             host path to ingestible images     (default ./deploy/example-images)
 #   NVIDIA_API_KEY         hosted NIM API key
-#   NGC_API_KEY            NGC key for local NIM image pulls
 #   TAO_*                  TAO FTMS credentials (optional; fine-tuning)
 #   TAO_JOB_TIMEOUT_MINUTES  TAO stale-job ceiling           (default 1440)
+#   TAO_QUANTIZATION_CALIBRATION_SAMPLES  quantization sample cap (default 128)
 #   HF_TOKEN               HuggingFace token (optional; remote TAO base pulls)
 #   ALLOW_UI_SECRET_PERSIST  UI may write keys to in-container .env (default false)
 #   LOG_LEVEL              info | debug                        (default info)
+#   VLM_FEEDBACK_LOOP_BUILD_SHA  source revision for benchmark provenance
 
 services:
   # Edge reverse proxy: /v1/ + /health → backend (SSE-safe), / → ui
   nginx:
-    image: nginx:1.27-alpine
+    image: nginx:1.30.4-alpine
     container_name: vlm-feedback-loop-nginx
     ports:
       - "${EDGE_BIND_HOST:-127.0.0.1}:${EDGE_PORT:-3000}:80"
@@ -60,7 +61,6 @@ services:
       - IMAGE_ROOT=${IMAGE_ROOT:-/data/images}
       # Secrets — pulled from the shell environment or a top-level .env
       - NVIDIA_API_KEY=${NVIDIA_API_KEY:-}
-      - NGC_API_KEY=${NGC_API_KEY:-}
       - TAO_API_KEY=${TAO_API_KEY:-}
       - TAO_API_BASE_URL=${TAO_API_BASE_URL:-}
       - TAO_ORG_NAME=${TAO_ORG_NAME:-}
@@ -68,6 +68,9 @@ services:
       # training, so omitting this would restore FTMS's unsafe 60-minute
       # default. The Student Training preflight verifies server support.
       - TAO_JOB_TIMEOUT_MINUTES=${TAO_JOB_TIMEOUT_MINUTES:-1440}
+      # Bound the calibration subset used by Cosmos-RL quantization. Keep the
+      # Compose default aligned with the typed backend setting.
+      - TAO_QUANTIZATION_CALIBRATION_SAMPLES=${TAO_QUANTIZATION_CALIBRATION_SAMPLES:-128}
       # TAO workspace S3 credentials (§9.7.8.2) — dataset uploads to the
       # FTMS-side bucket. Optional; only needed for fine-tuning.
       - TAO_WORKSPACE_S3_ACCESS_KEY=${TAO_WORKSPACE_S3_ACCESS_KEY:-}
@@ -87,6 +90,10 @@ services:
       # Override to true only with a persistent /home/appuser mount.
       - ALLOW_UI_SECRET_PERSIST=${ALLOW_UI_SECRET_PERSIST:-false}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Packaged/container builds do not include .git. Release automation or
+      # operators running external-endpoint Student benchmarks should set this
+      # to the exact source revision (for example: git rev-parse HEAD).
+      - VLM_FEEDBACK_LOOP_BUILD_SHA=${VLM_FEEDBACK_LOOP_BUILD_SHA:-}
     volumes:
       # Project data workspace: SQLite DBs, exports, artifacts, logs persist
       # here. Uses a Docker named volume by default — inspect with
@@ -106,7 +113,11 @@ services:
     networks:
       - vlm-feedback-loop
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5).read()"
       interval: 30s
       timeout: 10s
       retries: 3

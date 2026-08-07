@@ -18,9 +18,13 @@ vi.mock("@/api/batch", () => ({
   createDatasetExport: vi.fn(),
   getDatasetExport: vi.fn(),
   listDatasetExports: vi.fn(),
+  getSchemaInvalidManifest: vi.fn(),
+  datasetExportArchiveUrl: vi.fn(
+    () => "/v1/projects/pid-1/dataset_exports/de-1/archive",
+  ),
 }));
 
-vi.mock("@/pages/ProjectSetupLayout", () => ({
+vi.mock("@/pages/setup-context", () => ({
   useSetupContext: vi.fn(),
 }));
 
@@ -33,8 +37,10 @@ import {
   createDatasetExport,
   getDatasetExport,
   listDatasetExports,
+  getSchemaInvalidManifest,
+  datasetExportArchiveUrl,
 } from "@/api/batch";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useSetupContext } from "@/pages/setup-context";
 
 const mockGetRun = getBatchLabelRun as ReturnType<typeof vi.fn>;
 const mockResume = resumeBatchLabelRun as ReturnType<typeof vi.fn>;
@@ -42,14 +48,25 @@ const mockCancel = cancelBatchLabelRun as ReturnType<typeof vi.fn>;
 const mockExport = createDatasetExport as ReturnType<typeof vi.fn>;
 const mockGetExport = getDatasetExport as ReturnType<typeof vi.fn>;
 const mockListExports = listDatasetExports as ReturnType<typeof vi.fn>;
+const mockGetManifest = getSchemaInvalidManifest as ReturnType<typeof vi.fn>;
+const mockArchiveUrl = datasetExportArchiveUrl as ReturnType<typeof vi.fn>;
 
 function makeExport(overrides: Record<string, unknown> = {}) {
   return {
     dataset_export_id: "de-1",
+    dataset_intent: "training",
+    export_field_mode: "core_only",
+    label_tier_filter: "auto_labeled_only",
+    guidance_id: "g-1",
+    example_count: 45,
     status: "running",
     status_reason: null,
     progress: null,
     artifact_refs: null,
+    manifest_ref: null,
+    started_at: "2026-04-16T01:00:00Z",
+    completed_at: null,
+    created_at: "2026-04-16T01:00:00Z",
     selection_definition_snapshot: { batch_label_run_id: "run-1" },
     ...overrides,
   };
@@ -63,12 +80,14 @@ function makeRun(overrides: Record<string, unknown> = {}) {
     status: "running",
     status_reason: null,
     paused_reason: null,
+    circuit_breaker_threshold: 10,
     guidance_id: "g-1",
     model_config_id: "mc-1",
     generation_preset_key: "precise",
     thinking_mode_effective: "on",
     visual_budget_preset_key: "balanced",
     structured_generation_mode_effective: "auto",
+    icl_mode: "enabled",
     progress: { processed: 50, total: 100 },
     examples_succeeded: 45,
     examples_schema_invalid: 3,
@@ -107,10 +126,17 @@ beforeEach(() => {
     status: "canceling",
     cancel_requested_at: "2026-04-16T00:10:00Z",
   });
-  mockExport.mockResolvedValue({
-    dataset_export_id: "de-1",
-    example_count: 45,
-    created_at: "2026-04-16T01:00:00Z",
+  mockExport.mockResolvedValue(
+    makeExport({
+      example_count: 45,
+      created_at: "2026-04-16T01:00:00Z",
+    }),
+  );
+  mockGetExport.mockResolvedValue(makeExport());
+  mockGetManifest.mockResolvedValue({
+    batch_label_run_id: "run-1",
+    schema_invalid_examples: [],
+    total_count: 0,
   });
 });
 
@@ -139,6 +165,9 @@ describe("BatchRunStatusPage", () => {
       expect(screen.getByTestId("status-badge")).toHaveTextContent("Running");
       expect(screen.getByText(/50 of 100/)).toBeInTheDocument();
     });
+    expect(screen.getByTestId("config-snapshot")).toHaveTextContent("Thinking On");
+    expect(screen.getByTestId("config-snapshot")).toHaveTextContent("ICL On");
+    expect(screen.getByTestId("config-snapshot")).toHaveTextContent("Structured Auto");
   });
 
   it("shows paused state with circuit breaker banner", async () => {
@@ -154,6 +183,9 @@ describe("BatchRunStatusPage", () => {
       expect(screen.getByTestId("status-badge")).toHaveTextContent("Paused");
       expect(screen.getByTestId("circuit-breaker-banner")).toBeInTheDocument();
       expect(screen.getByText(/Endpoint appears unreachable/)).toBeInTheDocument();
+      expect(screen.getByTestId("circuit-breaker-banner")).toHaveTextContent(
+        "10 consecutive endpoint failures reached the run's safety threshold.",
+      );
     });
   });
 
@@ -185,6 +217,12 @@ describe("BatchRunStatusPage", () => {
       expect(screen.getByTestId("status-badge")).toHaveTextContent("Failed");
       expect(screen.getByTestId("failed-banner")).toBeInTheDocument();
     });
+    expect(screen.getByTestId("failed-banner")).toHaveTextContent(
+      "An unexpected error stopped batch labeling.",
+    );
+    expect(screen.getByTestId("failed-banner")).not.toHaveTextContent(
+      "unhandled_exception",
+    );
   });
 
   it("shows structured gen rejected with restart button", async () => {
@@ -248,6 +286,29 @@ describe("BatchRunStatusPage", () => {
     );
   });
 
+  it("keeps export submission visibly pending and blocks a repeated request", async () => {
+    mockGetRun.mockResolvedValue(
+      makeRun({ status: "completed", completed_at: "2026-04-16T01:00:00Z" }),
+    );
+    let resolveExport!: (value: ReturnType<typeof makeExport>) => void;
+    mockExport.mockReturnValue(
+      new Promise((resolve) => {
+        resolveExport = resolve;
+      }),
+    );
+    renderPage();
+    const exportButton = await screen.findByTestId("export-dataset-btn");
+    fireEvent.click(exportButton);
+
+    await waitFor(() => expect(exportButton).toHaveTextContent("Requesting…"));
+    expect(exportButton).toBeDisabled();
+    expect(screen.getByLabelText("Requesting dataset export")).toBeVisible();
+    expect(mockExport).toHaveBeenCalledTimes(1);
+
+    resolveExport(makeExport());
+    await waitFor(() => expect(screen.getByTestId("export-details")).toBeVisible());
+  });
+
   it("shows honest copy for a schema-evolution-canceled run (no 'retained' claim)", async () => {
     mockGetRun.mockResolvedValue(
       makeRun({
@@ -268,6 +329,21 @@ describe("BatchRunStatusPage", () => {
     expect(banner).not.toHaveTextContent(/schema_evolution_canceled/);
   });
 
+  it("preserves circuit-breaker context after a paused run is canceled", async () => {
+    mockGetRun.mockResolvedValue(
+      makeRun({
+        status: "canceled",
+        paused_reason: "circuit_breaker_threshold_reached",
+        completed_at: "2026-04-16T01:00:00Z",
+      }),
+    );
+    renderPage();
+
+    expect(
+      await screen.findByText(/Canceled by user after circuit breaker pause/),
+    ).toBeInTheDocument();
+  });
+
   it("tracks the background export to completion and reports success", async () => {
     // The create response is only the running record — the archive
     // builds in the background. The page must poll the export record to
@@ -281,6 +357,7 @@ describe("BatchRunStatusPage", () => {
         status: "completed",
         progress: { images_written: 42, images_total: 42 },
         artifact_refs: { archive_path: "/x/de-1.tar.gz", checksum_sha256: "c" },
+        manifest_ref: "/private/workspace/exports/de-1/manifest.json",
       }),
     );
     renderPage();
@@ -293,6 +370,21 @@ describe("BatchRunStatusPage", () => {
     );
     // The export button is gone once the export completed.
     expect(screen.queryByTestId("export-dataset-btn")).toBeNull();
+    const details = screen.getByTestId("export-details");
+    expect(details).toHaveTextContent("Cosmos-RL (annotations.json + images)");
+    expect(details).toHaveTextContent("Core Only");
+    expect(details).toHaveTextContent("Auto Labeled Only");
+    expect(details).toHaveTextContent("45 images");
+    expect(details).toHaveTextContent("Manifest");
+    expect(details).toHaveTextContent("Included");
+    expect(details).not.toHaveTextContent("/private/workspace");
+    const clickSpy = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+    fireEvent.click(screen.getByTestId("download-export-archive-btn"));
+    expect(mockArchiveUrl).toHaveBeenCalledWith("pid-1", "de-1");
+    expect(clickSpy).toHaveBeenCalledOnce();
+    clickSpy.mockRestore();
   });
 
   it("surfaces a failed background export and offers export again", async () => {
@@ -333,7 +425,46 @@ describe("BatchRunStatusPage", () => {
     await waitFor(() =>
       expect(screen.getByTestId("export-status-banner")).toBeInTheDocument(),
     );
+    expect(screen.getByTestId("export-status-banner")).toHaveAttribute(
+      "data-tone",
+      "info",
+    );
+    expect(screen.getByTestId("export-status-banner")).toHaveTextContent(
+      "Dataset export in progress",
+    );
+    expect(screen.getByLabelText("Building dataset export")).toBeVisible();
     expect(mockGetExport).toHaveBeenCalledWith("pid-1", "de-adopted");
+    expect(screen.queryByTestId("export-dataset-btn")).toBeNull();
+  });
+
+  it("restores a completed export download after page reopen", async () => {
+    // The durable completed artifact remains downloadable after navigation.
+    mockGetRun.mockResolvedValue(
+      makeRun({ status: "completed", completed_at: "2026-04-16T01:00:00Z" }),
+    );
+    mockListExports.mockResolvedValue({
+      items: [
+        makeExport({
+          dataset_export_id: "de-completed",
+          status: "completed",
+        }),
+      ],
+      next_cursor: null,
+    });
+    mockGetExport.mockResolvedValue(
+      makeExport({
+        dataset_export_id: "de-completed",
+        status: "completed",
+        artifact_refs: { archive_path: "/x/export.tar.gz", checksum_sha256: "c" },
+      }),
+    );
+
+    renderPage();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("download-export-archive-btn")).toBeInTheDocument(),
+    );
+    expect(mockGetExport).toHaveBeenCalledWith("pid-1", "de-completed");
     expect(screen.queryByTestId("export-dataset-btn")).toBeNull();
   });
 
@@ -454,5 +585,27 @@ describe("BatchRunStatusPage", () => {
     const err = await screen.findByTestId("action-error");
     expect(err).toHaveTextContent("Could not export the dataset: disk full");
     expect(screen.queryByText("Dataset exported successfully.")).toBeNull();
+  });
+
+  it("shows the backend validation detail when an export request is rejected", async () => {
+    const { ApiError } = await import("@/api/client");
+    mockGetRun.mockResolvedValue(
+      makeRun({ status: "completed", completed_at: "2026-04-16T01:00:00Z" }),
+    );
+    mockExport.mockRejectedValue(
+      new ApiError(
+        422,
+        JSON.stringify({
+          detail: "No schema-valid Auto-Labeled outputs are available for export.",
+        }),
+      ),
+    );
+    renderPage();
+    fireEvent.click(await screen.findByTestId("export-dataset-btn"));
+
+    expect(await screen.findByTestId("action-error")).toHaveTextContent(
+      "Could not export the dataset: No schema-valid Auto-Labeled outputs are available for export.",
+    );
+    expect(screen.queryByTestId("export-status-banner")).toBeNull();
   });
 });

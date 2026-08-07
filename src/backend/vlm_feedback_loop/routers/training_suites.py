@@ -3,8 +3,8 @@
 
 """Training suite REST endpoints.
 
-One POST, one atomic suite: dataset exports + pre-created TAO chain jobs +
-TrainingSuite record + first-chain kickoff.
+One POST, one durable suite: frozen dataset exports, workspace staging,
+pre-created TAO chain jobs, and first-chain kickoff.
 """
 
 from __future__ import annotations
@@ -49,9 +49,9 @@ async def create_training_suite(
 ) -> TrainingSuiteResponse:
     """Create a training suite.
 
-    Idempotent: re-POST with the same ``idempotency_key`` returns the
-    existing suite (still 201 — the resource exists after the call either
-    way).
+    Idempotent: re-POST with the same ``idempotency_key`` returns an active or
+    materialized suite. A failed pre-chain transfer resumes the same frozen
+    exports only when the request body is identical (still 201 on success).
     """
     result = await training_suite_service.launch_training_suite(
         project_id,

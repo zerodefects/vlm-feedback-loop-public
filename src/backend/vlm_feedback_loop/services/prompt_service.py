@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
@@ -52,7 +52,62 @@ from vlm_feedback_loop.services.token_budget_service import (
     render_icl_fields,
 )
 
+if TYPE_CHECKING:
+    from vlm_feedback_loop.config import Settings
+
 logger = logging.getLogger("vlm_feedback_loop.prompt_service")
+
+FieldMode = Literal["all", "aux_and_core", "core_only"]
+
+
+def filter_output_schema_for_field_mode(
+    derived_json_schema: dict[str, Any],
+    generation_order: list[str],
+    guidance_fields: list[dict[str, Any]],
+    field_mode: FieldMode,
+) -> tuple[dict[str, Any], list[str]]:
+    """Return the serving schema required by an Inference Contract.
+
+    Training exports can teach a Student to emit every Guidance field, all
+    non-rationale fields, or Core fields only.  The inference prompt and
+    guided-decoding schema must apply the same projection; otherwise a
+    core-only Student is asked for a response shape it never saw in training.
+    """
+    roles = {
+        str(field.get("field_name")): str(field.get("role", "core"))
+        for field in guidance_fields
+        if field.get("field_name")
+    }
+
+    def _included(name: str) -> bool:
+        if field_mode == "all":
+            return True
+        if field_mode == "aux_and_core":
+            return name != "rationale_note"
+        return roles.get(name, "core") == "core"
+
+    projected_order = [name for name in generation_order if _included(name)]
+    raw_properties = derived_json_schema.get("properties")
+    properties = (
+        cast("dict[str, Any]", raw_properties)
+        if isinstance(raw_properties, dict)
+        else {}
+    )
+    projected_properties: dict[str, Any] = {
+        name: properties[name] for name in projected_order if name in properties
+    }
+    raw_required = derived_json_schema.get("required")
+    required = cast("list[Any]", raw_required) if isinstance(raw_required, list) else []
+
+    projected = dict(derived_json_schema)
+    projected["properties"] = projected_properties
+    projected["required"] = [
+        name
+        for name in required
+        if isinstance(name, str) and name in projected_properties
+    ]
+    projected["x-generation-order"] = projected_order
+    return projected, projected_order
 
 
 # ── Prompt template loader ─────────────────────────────────────────────────
@@ -852,12 +907,14 @@ async def invoke_teacher(
     guidance_fields: list[dict[str, Any]],
     generation_order: list[str],
     derived_json_schema: dict[str, Any],
+    output_field_mode: FieldMode = "all",
+    icl_field_mode: FieldMode = "core_only",
     # Model
     model_name: str,
     model_config: ModelConfigInput,
     # Endpoint
     endpoint_base_url: str,
-    auth_headers: dict[str, str],
+    auth_headers: dict[str, str] | None,
     # ICL (pre-queried by caller)
     icl_candidates: list[ICLExample],
     # Settings from config
@@ -890,6 +947,8 @@ async def invoke_teacher(
     max_retries: int = 3,
     # Image preparation
     query_storage_ref: str | None = None,
+    image_transport_max_longest_edge: int | None = None,
+    settings: Settings | None = None,
 ) -> TeacherInvocationResult:
     """Orchestrate a full Teacher invocation (the 6-step request flow).
 
@@ -905,7 +964,15 @@ async def invoke_teacher(
     t_nim_call_ms: int | None = None
     stage_t0 = start_time
 
-    schema_for_output, _ = place_rationale_last(derived_json_schema, generation_order)
+    contract_schema, contract_generation_order = filter_output_schema_for_field_mode(
+        derived_json_schema,
+        generation_order,
+        guidance_fields,
+        output_field_mode,
+    )
+    schema_for_output, _ = place_rationale_last(
+        contract_schema, contract_generation_order
+    )
     structured_gen_attempted = model_config.structured_generation_support == "supported"
     response_format: dict[str, Any] | None = None
     if structured_gen_attempted and schema_for_output:
@@ -938,7 +1005,6 @@ async def invoke_teacher(
     )
     effective_thinking_on = thinking["thinking_mode_effective"] == "on"
 
-    output_field_mode: Literal["all", "aux_and_core", "core_only"] = "all"
     budget = derive_token_budget(
         guidance_fields,
         output_field_mode,
@@ -1002,7 +1068,7 @@ async def invoke_teacher(
         max_icl_tokens,
         guidance_fields,
         generation_order,
-        "core_only",
+        icl_field_mode,
     )
 
     # Image-budget pruning (inline ICL injection): cap retained at
@@ -1050,7 +1116,7 @@ async def invoke_teacher(
             ex.label_json,
             guidance_fields,
             generation_order,
-            "core_only",
+            icl_field_mode,
         )
         icl_rendered.append(rendered)
 
@@ -1132,7 +1198,11 @@ async def invoke_teacher(
         refs_to_prep.append(query_storage_ref)
 
     if refs_to_prep:
-        prep = await prepare_images(refs_to_prep)
+        prep = await prepare_images(
+            refs_to_prep,
+            max_longest_edge=image_transport_max_longest_edge,
+            settings=settings,
+        )
 
         if not prep.success:
             elapsed_ms = int((time.monotonic() - start_time) * 1000)

@@ -7,7 +7,7 @@
  */
 
 import { useState, useRef, useEffect } from "react";
-import { Button } from "@kui/react";
+import { Button, Text } from "@kui/react";
 import { X, Plus } from "lucide-react";
 import { MarkerIcon } from "./MarkerIcon";
 
@@ -64,7 +64,7 @@ export function EnumValueEditor({
             className="glass-pill group"
             data-testid={`value-chip-${fieldClientId}-${i}`}
           >
-            {v}
+            <Text kind="label/regular/xs">{v}</Text>
             <Button
               kind="tertiary"
               onClick={() => onChange(values.filter((_, j) => j !== i))}

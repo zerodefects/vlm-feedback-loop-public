@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from conftest import create_project_via_api
 from vlm_feedback_loop.db.base import generate_uuid4
 from vlm_feedback_loop.db.models.student_model import StudentModel
+from vlm_feedback_loop.db.models.tao_job import TAOJob
 
 
 def _create_project(client) -> str:
@@ -169,6 +170,58 @@ class TestHappyPath:
         assert _stub_lifecycle.get("gpu_assignment") == "device=2"
         assert _stub_lifecycle.get("nim_release_version") == "1.6.0"
 
+    def test_retry_repairs_legacy_local_nim_failure_to_pending_quality(
+        self, test_app_client, _stub_lifecycle
+    ):
+        """A pre-measurement local failure cannot block a clean NIM retry."""
+        pid = _create_project(test_app_client)
+        sid = _insert_student(test_app_client, pid, quality_status="failed")
+        engine = _project_engine(test_app_client, pid)
+        with Session(engine) as session:
+            student = session.get(StudentModel, sid)
+            student.nim_preflight_details = {
+                "quality_failure_reason": "tao_evaluate_failed"
+            }
+            session.add(
+                TAOJob(
+                    tao_job_id="local-eval-1",
+                    project_id=pid,
+                    student_base_model_config_id="mc-base",
+                    dataset_export_ids=["de-1"],
+                    action="evaluate",
+                    status="failed",
+                    tao_status_raw="BlueprintLocalNIMEvaluationFailed",
+                    training_backend="student_nim_local",
+                    training_policy_type=None,
+                    job_config={},
+                    tao_create_job_request={},
+                    tao_external_job_id=None,
+                    progress=None,
+                    outputs={"student_model_id": sid},
+                    parent_tao_job_id="tao-1",
+                    preflight_result=None,
+                    error_ref="student_nim_evaluation_failed",
+                    poll_error_ref=None,
+                    chain_id="chain-1",
+                    chain_sequence=2,
+                    chain_halted_reason=None,
+                    outputs_fetch_status="completed",
+                    outputs_fetch_error_ref=None,
+                )
+            )
+            session.commit()
+
+        response = test_app_client.post(
+            f"/v1/projects/{pid}/student_models/{sid}:deploy_nim",
+            json={},
+        )
+        assert response.status_code == 202, response.text
+
+        with Session(engine) as session:
+            student = session.get(StudentModel, sid)
+            assert student.quality_status == "pending"
+            assert student.serving_status == "pending"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # External mode skips local container, registers the URL
@@ -186,6 +239,7 @@ class TestExternalMode:
             json={
                 "nim_endpoint_url": external,
                 "auth_mode": "bearer",
+                "benchmark_kv_cache_reuse": "disabled",
             },
         )
         assert resp.status_code == 202, resp.text
@@ -197,6 +251,20 @@ class TestExternalMode:
             student = session.get(StudentModel, sid)
             assert student.nim_deployment_mode == "external"
             assert student.nim_endpoint_url == external
+
+    def test_external_url_requires_cache_policy_confirmation(
+        self, test_app_client, _stub_lifecycle
+    ):
+        pid = _create_project(test_app_client)
+        sid = _insert_student(test_app_client, pid)
+        response = test_app_client.post(
+            f"/v1/projects/{pid}/student_models/{sid}:deploy_nim",
+            json={"nim_endpoint_url": "http://student.example:8000/v1"},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == (
+            "benchmark_cache_policy_unconfirmed"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

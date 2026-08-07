@@ -53,6 +53,7 @@ describe("createTrainingSuite", () => {
       student_base_model_config_ids: ["mc-student-1"],
       training_preset: "standard",
       include_auto_labeled: false,
+      enable_lora: true,
       export_field_mode: "all",
       quantization_schemes: [],
       idempotency_key: "idem-1",
@@ -75,6 +76,7 @@ describe("runTrainingPreflight", () => {
       student_base_model_config_ids: ["mc-2b"],
       include_auto_labeled: false,
       enable_lora: true,
+      quantization_schemes: ["FP8_DYNAMIC"],
     });
   });
 });

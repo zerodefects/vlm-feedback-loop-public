@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "pillow==12.3.0",
+#   "playwright==1.62.0",
+# ]
+# ///
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Render docs/images/architecture.mmd to docs/images/architecture.png.
 
-Uses the repo's existing headless-Chromium toolchain (Playwright) with a
-pinned Mermaid release from the jsdelivr CDN — no extra system packages.
+Uses an inline, uv-managed Playwright/Pillow tool environment with a pinned
+Mermaid release from the jsdelivr CDN. The Chromium browser binary must be
+installed once with the command printed by Playwright when it is absent.
 Network access is needed only when regenerating the PNG after editing the
 .mmd source; the rendered PNG is committed.
 
 Usage (from the repo root):
 
-    python3 scripts/render_architecture_diagram.py   # system python3 (Playwright is a dev-box tool, not a project dep)
+    uv run scripts/render_architecture_diagram.py
+    uv run scripts/render_architecture_diagram.py --check
 """
 
 from __future__ import annotations
 
+import argparse
+import io
 import json
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+from PIL import Image, ImageChops
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCE = REPO_ROOT / "docs" / "images" / "architecture.mmd"
@@ -84,8 +95,9 @@ PAGE_HTML = f"""<!DOCTYPE html>
 </html>"""
 
 
-def main() -> None:
-    source = SOURCE.read_text(encoding="utf-8")
+def _render_png(source: str) -> bytes:
+    from playwright.sync_api import sync_playwright
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(
@@ -94,9 +106,51 @@ def main() -> None:
         page.set_content(PAGE_HTML, wait_until="networkidle")
         page.evaluate("source => window.render(source)", source)
         page.wait_for_function("window.renderDone === true")
-        page.locator("#diagram").screenshot(path=str(OUTPUT))
+        png = page.locator("#diagram").screenshot()
         browser.close()
-    from PIL import Image
+    return png
+
+
+def _same_pixels(rendered_png: bytes, committed_path: Path) -> bool:
+    """Compare decoded pixels so PNG encoder metadata cannot create drift."""
+
+    with (
+        Image.open(io.BytesIO(rendered_png)) as rendered,
+        Image.open(committed_path) as committed,
+    ):
+        # Compare RGB. ``Image.getbbox()`` on an RGBA difference can report an
+        # empty box when RGB differs but the alpha-difference channel is zero.
+        rendered_rgb = rendered.convert("RGB")
+        committed_rgb = committed.convert("RGB")
+        return (
+            rendered_rgb.size == committed_rgb.size
+            and ImageChops.difference(rendered_rgb, committed_rgb).getbbox() is None
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="render in memory and fail only when decoded pixels differ",
+    )
+    args = parser.parse_args()
+
+    source = SOURCE.read_text(encoding="utf-8")
+    rendered_png = _render_png(source)
+
+    if args.check:
+        if not OUTPUT.exists():
+            raise SystemExit(f"Missing committed architecture image: {OUTPUT}")
+        if not _same_pixels(rendered_png, OUTPUT):
+            raise SystemExit(
+                "Architecture diagram pixels differ from docs/images/architecture.png"
+            )
+        print("Architecture diagram pixels match docs/images/architecture.png")
+        return
+
+    OUTPUT.write_bytes(rendered_png)
 
     size = Image.open(OUTPUT).size
     print(f"Wrote {OUTPUT.relative_to(REPO_ROOT)} ({size[0]}x{size[1]})")

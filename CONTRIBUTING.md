@@ -12,7 +12,7 @@ Developer workflow for code contributions is as follows:
 1. Developers must first [fork](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/fork-a-repo) this repository.
 2. Git clone the forked repository and push changes to the personal fork.
 3. Once the code changes are staged on the fork and ready for review, a Pull Request (PR) can be requested to merge the changes from a branch of the fork into a selected branch of upstream.
-4. CI (`.github/workflows/ci.yml`) runs backend lint, backend tests, strict pyright type checking, frontend lint, frontend tests, frontend build, a dependency audit (pip-audit + pnpm audit), and a compose smoke (containerized build + health check) on every PR, plus SonarQube analysis (`.github/workflows/sonarqube.yml`); pre-commit hooks include ruff and gitleaks secret scanning. All checks must pass, and the PR is accepted after review by the repository owners.
+4. CI (`.github/workflows/ci.yml`) runs backend lint, backend tests, strict pyright type checking, frontend lint, frontend unit and browser tests, frontend build, serial integration tests, public-export and installed-wheel validation, a dependency audit (pip-audit + pnpm audit), and a Compose functional smoke on every PR, plus SonarQube analysis (`.github/workflows/sonarqube.yml`); pre-commit hooks include ruff and gitleaks secret scanning. All checks must pass, and the PR is accepted after review by the repository owners.
 
 
 ## Signing Your Work

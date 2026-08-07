@@ -10,6 +10,7 @@ from datetime import UTC
 import httpx
 import pytest
 
+from vlm_feedback_loop.services import http_client
 from vlm_feedback_loop.services.http_client import resilient_request
 
 
@@ -24,13 +25,11 @@ def _mock_transport(handler):
 
 
 @pytest.fixture(autouse=True)
-def _reset_throttle():
+def _reset_throttle(monkeypatch):
     """Isolate the module-level adaptive per-host throttle between tests."""
-    from vlm_feedback_loop.services.http_client import reset_adaptive_throttle
-
-    reset_adaptive_throttle()
-    yield
-    reset_adaptive_throttle()
+    monkeypatch.setattr(http_client, "_HOST_MIN_INTERVAL", {})
+    monkeypatch.setattr(http_client, "_HOST_LAST_CALL", {})
+    monkeypatch.setattr(http_client, "_HOST_LOCKS", {})
 
 
 class TestTimeout:

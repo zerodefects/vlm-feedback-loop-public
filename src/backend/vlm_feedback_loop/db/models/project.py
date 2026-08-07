@@ -109,7 +109,7 @@ class Project(ProjectBase):
         Float, nullable=False, default=0.80
     )
     scaleup_min_per_value_f1_threshold: Mapped[float] = mapped_column(
-        Float, nullable=False, default=0.80
+        Float, nullable=False, default=0.60
     )
     scaleup_accept_rate_threshold: Mapped[float] = mapped_column(
         Float, nullable=False, default=0.80

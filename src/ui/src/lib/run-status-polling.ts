@@ -11,6 +11,8 @@
  * own settled-predicate and interval since those genuinely differ.
  */
 
+import { TERMINAL_TAO_STATUSES, type TAOJob } from "@/types/training";
+
 interface RunStatusPollingOptions<TData> {
   /**
    * True once the observed data has reached a settled state (terminal
@@ -41,4 +43,18 @@ export function runStatusRefetchInterval<TData>({
   state: { data: TData | undefined };
 }) => number | false {
   return (query) => (isSettled(query.state.data) ? (settledMs ?? false) : activeMs);
+}
+
+/**
+ * TAO success is only settled for the monitor after the Blueprint finishes
+ * consuming the remote result. Large checkpoint downloads can continue long
+ * after TAO itself reports success, so stopping on ``status`` alone leaves the
+ * screen frozen in a misleading intermediate state.
+ */
+export function isTAOJobPollingSettled(job: TAOJob | undefined): boolean {
+  if (!job || !TERMINAL_TAO_STATUSES.has(job.status)) return false;
+  if (job.status !== "succeeded") return true;
+  return (
+    job.outputs_fetch_status === "completed" || job.outputs_fetch_status === "failed"
+  );
 }

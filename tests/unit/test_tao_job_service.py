@@ -39,6 +39,7 @@ from vlm_feedback_loop.schemas.tao_job import (
     LoRAConfig,
     TAOCreateJobRequest,
     TAOJobCreateRequest,
+    TAOJobResponse,
 )
 from vlm_feedback_loop.services import tao_job_service
 from vlm_feedback_loop.services.tao_job_service import (
@@ -355,6 +356,55 @@ class TestStateMachine:
         assert "num_calibration_samples" in response["error_ref"]
         # The read repair does not rewrite the immutable historical row.
         assert job.error_ref == "quantize action failed for cosmos-rl"
+
+    def test_specific_job_error_takes_precedence_over_captured_logs(self):
+        """A concrete stored failure must not be replaced by stale log text."""
+        job = TAOJob(
+            tao_job_id="job-specific",
+            project_id=PID,
+            student_base_model_config_id=MCID,
+            dataset_export_ids=[EXPORT_A],
+            action="quantize",
+            status="failed",
+            training_backend="cosmos_rl_tao_vlm",
+            job_config={},
+            tao_create_job_request={},
+            error_ref="scheduler rejected the requested GPU shape",
+            outputs={
+                "tao_logs_text": (
+                    "Quantization failed: offset overflow while concatenating arrays"
+                )
+            },
+            created_at=utc_now(),
+        )
+
+        assert (
+            tao_job_service.effective_tao_job_error_ref(job)
+            == "scheduler rejected the requested GPU shape"
+        )
+
+    def test_job_response_exposes_post_success_artifact_processing(self):
+        """A TAO-complete job remains visibly in progress until artifacts finish."""
+        job = TAOJob(
+            tao_job_id="job-finalizing",
+            project_id=PID,
+            student_base_model_config_id=MCID,
+            dataset_export_ids=[EXPORT_A],
+            action="train",
+            status="succeeded",
+            training_backend="cosmos_rl_tao_vlm",
+            job_config={},
+            tao_create_job_request={},
+            outputs_fetch_status="in_progress",
+            outputs_fetch_error_ref=None,
+            created_at=utc_now(),
+        )
+
+        response = TAOJobResponse(**tao_job_service._job_to_dict(job)).model_dump()
+
+        assert response["status"] == "succeeded"
+        assert response["outputs_fetch_status"] == "in_progress"
+        assert response["outputs_fetch_error_ref"] is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════

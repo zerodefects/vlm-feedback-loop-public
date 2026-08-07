@@ -36,6 +36,12 @@ from vlm_feedback_loop.db.models.label import Label
 from vlm_feedback_loop.db.models.operation import OperationRecord
 from vlm_feedback_loop.db.models.project import Project
 from vlm_feedback_loop.db.models.run import RunRecord
+from vlm_feedback_loop.db.models.tao_job import TAOJob
+from vlm_feedback_loop.services.authorized_file import (
+    OpenedRegularFile,
+    open_authorized_image,
+    open_regular_file_beneath,
+)
 from vlm_feedback_loop.services.background import background_manager
 from vlm_feedback_loop.services.hashing import sha256_file
 from vlm_feedback_loop.services.pagination import (
@@ -58,6 +64,18 @@ from vlm_feedback_loop.services.schema_core import (
 from vlm_feedback_loop.services.sse import sse_manager
 
 logger = logging.getLogger("vlm_feedback_loop.dataset_export_service")
+
+
+@dataclass(frozen=True)
+class DatasetExportArchive:
+    """A verified project-contained archive ready for HTTP streaming."""
+
+    opened_file: OpenedRegularFile
+    checksum_sha256: str
+
+    @property
+    def path(self) -> Path:
+        return self.opened_file.canonical_path
 
 
 # ── Create ──────────────────────────────────────────────────────────────────
@@ -99,7 +117,7 @@ def create_dataset_export(
             export_field_mode=export_field_mode,
             batch_label_run_id=batch_label_run_id,
             selection_filters=selection_filters,
-            workspace_root=settings.WORKSPACE_ROOT,
+            settings=settings,
         )
         if isinstance(result, str):
             # Error path — nothing staged, nothing to commit.
@@ -117,7 +135,7 @@ def persist_dataset_export_in_session(
     export_field_mode: str = "all",
     batch_label_run_id: str | None = None,
     selection_filters: dict[str, Any] | None = None,
-    workspace_root: str,
+    settings: Settings,
 ) -> dict[str, Any] | str:
     """Session-scoped synchronous variant of :func:`create_dataset_export`.
 
@@ -142,7 +160,7 @@ def persist_dataset_export_in_session(
     invariant is preserved — export artifacts are only reachable through
     committed DatasetExport rows.
 
-    ``workspace_root`` determines export-archive placement through the
+    ``settings.WORKSPACE_ROOT`` determines export-archive placement through the
     canonical ``{workspace_root}/projects/{project_id}/exports`` layout. The
     stored ``Project.project_dir`` is metadata captured at create-time and can
     be stale after moving a workspace.
@@ -159,12 +177,16 @@ def persist_dataset_export_in_session(
         export_field_mode=export_field_mode,
         batch_label_run_id=batch_label_run_id,
         selection_filters=selection_filters,
-        workspace_root=workspace_root,
+        settings=settings,
     )
     if isinstance(prepared, str):
         return prepared
 
-    artifact_refs, manifest_ref = _build_export_artifacts(prepared)
+    try:
+        artifact_refs, manifest_ref = _build_export_artifacts(prepared, settings)
+    except OSError as exc:
+        _cleanup_export_artifacts(prepared.exports_dir, prepared.export_id)
+        return f"validation: dataset export artifacts could not be built: {exc}"
 
     example_count = len(prepared.annotations)
     record = DatasetExport(
@@ -184,8 +206,14 @@ def persist_dataset_export_in_session(
         example_count=example_count,
     )
     session.add(record)
-    # Flush so the caller sees the row during the same transaction.
-    session.flush()
+    # Flush so the caller sees the row during the same transaction. If the
+    # insert cannot be staged, no database owner can reach the generated
+    # files, so remove them before propagating the transaction failure.
+    try:
+        session.flush()
+    except Exception:
+        _cleanup_export_artifacts(prepared.exports_dir, prepared.export_id)
+        raise
 
     return {
         "dataset_export_id": prepared.export_id,
@@ -236,7 +264,7 @@ def _prepare_dataset_export(
     export_field_mode: str,
     batch_label_run_id: str | None,
     selection_filters: dict[str, Any] | None,
-    workspace_root: str,
+    settings: Settings,
 ) -> _PreparedExport | str:
     """Selection phase: validate, select labels, build the annotations.
 
@@ -314,7 +342,7 @@ def _prepare_dataset_export(
         )
         example_refs = {r[0]: r[1] for r in rows}
 
-    project_dir = str(project_dir_path(workspace_root, project_id))
+    project_dir = str(project_dir_path(settings.WORKSPACE_ROOT, project_id))
 
     # ── Build annotations ──────────────────────────────────────────────
     annotations = _build_annotations(
@@ -338,10 +366,21 @@ def _prepare_dataset_export(
     exportable: list[dict[str, Any]] = []
     for sample in annotations:
         ref = example_refs.get(sample["id"])
-        if ref and Path(ref).exists():
-            exportable.append(sample)
-        else:
+        if not ref:
             skipped_missing_images.append(sample["id"])
+            continue
+        try:
+            with open_authorized_image(ref, settings):
+                pass
+        except FileNotFoundError:
+            skipped_missing_images.append(sample["id"])
+            continue
+        except PermissionError as exc:
+            return (
+                f"validation: image for example {sample['id']} is not accessible "
+                f"under the current IMAGE_ROOT policy: {exc}"
+            )
+        exportable.append(sample)
     if skipped_missing_images:
         logger.warning(
             "Dataset export: skipping %d example(s) whose image file is "
@@ -415,8 +454,20 @@ def _cleanup_export_artifacts(exports_dir: Path, export_id: str) -> None:
             logger.warning("Could not delete export artifact %s", path, exc_info=True)
 
 
+def cleanup_dataset_export_artifacts(
+    project_id: str,
+    dataset_export_id: str,
+    *,
+    settings: Settings,
+) -> None:
+    """Remove artifacts for an export whose database insert was rolled back."""
+    exports_dir = project_dir_path(settings.WORKSPACE_ROOT, project_id) / "exports"
+    _cleanup_export_artifacts(exports_dir, dataset_export_id)
+
+
 def _build_export_artifacts(
     prepared: _PreparedExport,
+    settings: Settings,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> tuple[dict[str, str], str]:
     """Build phase: write sidecar + tar.gz + checksum + manifest to disk.
@@ -443,6 +494,7 @@ def _build_export_artifacts(
         tar_path,
         prepared.annotations,
         prepared.example_refs,
+        settings,
         progress_cb=progress_cb,
     )
 
@@ -519,7 +571,7 @@ async def start_dataset_export(
             export_field_mode=export_field_mode,
             batch_label_run_id=batch_label_run_id,
             selection_filters=selection_filters,
-            workspace_root=settings.WORKSPACE_ROOT,
+            settings=settings,
         )
         if isinstance(prepared, str):
             return prepared
@@ -612,7 +664,10 @@ async def _execute_dataset_export(
 
     try:
         artifact_refs, manifest_ref = await asyncio.to_thread(
-            _build_export_artifacts, prepared, _on_progress
+            _build_export_artifacts,
+            prepared,
+            settings,
+            _on_progress,
         )
     except Exception as exc:
         _cleanup_export_artifacts(prepared.exports_dir, export_id)
@@ -897,6 +952,7 @@ def _build_tar_archive(
     tar_path: Path,
     annotations: list[dict[str, Any]],
     example_refs: dict[str, str],
+    settings: Settings,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> None:
     """Create a .tar.gz archive with annotations.json + images/.
@@ -942,13 +998,19 @@ def _build_tar_archive(
             image_archive_path = sample["images"][0]
             storage_ref = example_refs.get(example_key)
             if not storage_ref:
-                continue
+                raise FileNotFoundError(
+                    f"Dataset export image reference is missing for {example_key}"
+                )
             try:
-                tf.add(storage_ref, arcname=image_archive_path)
+                with open_authorized_image(storage_ref, settings) as opened:
+                    info = tarfile.TarInfo(name=image_archive_path)
+                    info.size = opened.stat_result.st_size
+                    with opened.open_binary() as source:
+                        tf.addfile(info, source)
             except OSError as exc:
                 logger.warning(
-                    "Dataset export: image for %s vanished between the "
-                    "existence check and archiving (%s)",
+                    "Dataset export: image for %s became unavailable or "
+                    "unauthorized before archiving (%s)",
                     example_key,
                     exc,
                 )
@@ -965,23 +1027,57 @@ def _build_tar_archive(
 def resolve_test_pool_dataset_sha(
     session: Session, dataset_export_ids: list[str]
 ) -> str | None:
-    """Archive SHA-256 of the Test Pool export (``dataset_intent="testing"``).
+    """Archive SHA-256 of a Test Pool export.
 
     Reproducibility provenance: the deployment handoff, the Compare screen's
     suite provenance, and the Student-baseline evaluation all report the same
-    checksum, so they must resolve it identically.
+    checksum, so they must resolve it identically. Training suites use
+    ``dataset_intent="evaluation"`` for their held-out export; the public
+    export API also permits the equivalent ``testing`` intent.
     """
     for export_id in dataset_export_ids:
         export = session.get(DatasetExport, export_id)
         if export is None:
             continue
-        if export.dataset_intent == "testing":
+        if export.dataset_intent in {"evaluation", "testing"}:
             refs = export.artifact_refs or {}
             sha = refs.get("checksum_sha256")
             if isinstance(sha, str) and sha:
                 return sha
             return None
     return None
+
+
+def resolve_paired_test_pool_dataset_sha(
+    session: Session,
+    *,
+    artifact_parent_tao_job_id: str,
+    fallback_export_ids: list[str] | None = None,
+) -> str | None:
+    """Resolve the held-out export paired with a Student artifact job.
+
+    ``StudentModel.dataset_export_ids`` intentionally records training data
+    only. The held-out export belongs to the evaluate job whose
+    ``parent_tao_job_id`` is the train job for a baseline Student or the
+    quantize job for a quantized Student. Following that relationship keeps
+    production handoff provenance truthful without overloading the Student's
+    training-data lineage.
+    """
+    evaluate_job = session.scalars(
+        select(TAOJob)
+        .where(
+            TAOJob.parent_tao_job_id == artifact_parent_tao_job_id,
+            TAOJob.action == "evaluate",
+        )
+        .order_by(TAOJob.chain_sequence.asc(), TAOJob.created_at.asc())
+    ).first()
+    if evaluate_job is not None:
+        sha = resolve_test_pool_dataset_sha(
+            session, list(evaluate_job.dataset_export_ids or [])
+        )
+        if sha is not None:
+            return sha
+    return resolve_test_pool_dataset_sha(session, list(fallback_export_ids or []))
 
 
 def get_dataset_export(
@@ -1006,6 +1102,64 @@ def get_dataset_export(
         if record is None:
             return f"not found: Dataset export {dataset_export_id}"
         return _export_to_dict(record)
+
+
+def get_dataset_export_archive(
+    project_id: str,
+    dataset_export_id: str,
+    settings: Settings,
+) -> DatasetExportArchive | str:
+    """Resolve a completed export archive without trusting its stored path.
+
+    The returned descriptor is bound to the authorized inode and owned by the
+    HTTP response, so a later pathname replacement cannot change the bytes.
+    """
+
+    engine = get_project_engine(project_id, settings.WORKSPACE_ROOT)
+    if engine is None:
+        return f"not found: Project {project_id}"
+
+    with Session(engine) as session:
+        record = (
+            session.query(DatasetExport)
+            .filter_by(
+                dataset_export_id=dataset_export_id,
+                project_id=project_id,
+            )
+            .first()
+        )
+        if record is None:
+            return f"not found: Dataset export {dataset_export_id}"
+        if record.status != "completed":
+            return (
+                f"conflict: Dataset export {dataset_export_id} is "
+                f"{record.status}, not completed"
+            )
+        refs = record.artifact_refs or {}
+        archive_ref = refs.get("archive_path")
+        checksum = refs.get("checksum_sha256")
+
+    if not isinstance(archive_ref, str) or not archive_ref:
+        return f"conflict: Dataset export {dataset_export_id} has no archive"
+    if not isinstance(checksum, str) or not checksum:
+        return f"conflict: Dataset export {dataset_export_id} has no checksum"
+
+    archive_path = Path(archive_ref)
+    export_root = project_dir_path(settings.WORKSPACE_ROOT, project_id) / "exports"
+    try:
+        opened = open_regular_file_beneath(archive_path, export_root)
+    except FileNotFoundError:
+        return f"not found: Dataset export archive {dataset_export_id}"
+    except PermissionError:
+        return (
+            "validation: Dataset export archive reference is outside or cannot "
+            "be safely opened beneath the project exports directory"
+        )
+
+    return DatasetExportArchive(
+        opened_file=opened,
+        checksum_sha256=checksum,
+    )
 
 
 def list_dataset_exports(

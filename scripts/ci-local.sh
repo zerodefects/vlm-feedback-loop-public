@@ -7,11 +7,9 @@
 # you expect to land green in CI — burning a CI run takes minutes;
 # this takes seconds for lint and a few minutes for the full chain.
 #
-# Paired with the workflow file: stage commands are bit-for-bit
-# identical to the workflow's `run:` lines for the six core jobs.
-# CI-only jobs not mirrored here: dependency-audit (network-bound
-# advisory lookups) and compose-smoke (Docker build — run
-# `docker compose up --build` yourself when touching packaging).
+# Paired with the workflow file: the seven stages cover its six core jobs and
+# serial integration suite. CI-only jobs not mirrored here are the clean
+# public-artifact check, dependency audit, and Compose smoke.
 
 set -euo pipefail
 
@@ -43,10 +41,11 @@ echo "==> frontend-lint (eslint . && prettier --check . && tsc --noEmit)"
 )
 
 # ── Stage 5: frontend tests ──────────────────────────────────────
-echo "==> frontend-tests (vitest run)"
+echo "==> frontend-tests (vitest + Playwright first-time workflow)"
 (
   cd src/ui
   pnpm test
+  pnpm test:e2e
 )
 
 # ── Stage 6: frontend build ──────────────────────────────────────
@@ -56,5 +55,9 @@ echo "==> frontend-build (tsc -b && vite build)"
   pnpm build
 )
 
+# ── Stage 7: local integration contracts ────────────────────────
+echo "==> integration-tests (serial live-server, proxy, SSE, and mock-NIM contracts)"
+uv run pytest tests/integration/ -q -n 0
+
 echo
-echo "==> all six core CI stages green"
+echo "==> all seven core CI stages green"

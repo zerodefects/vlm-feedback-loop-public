@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -29,7 +30,7 @@ from vlm_feedback_loop.db.engine import open_project_db
 
 
 def _schema_dump(db_path: Path) -> list[tuple]:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         return sorted(
             conn.execute(
                 "SELECT type, name, tbl_name, sql FROM sqlite_master"
@@ -39,7 +40,7 @@ def _schema_dump(db_path: Path) -> list[tuple]:
 
 def _data_dump(db_path: Path) -> dict[str, list[tuple]]:
     """Every row of every table (including alembic_version), sorted."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         tables = [
             r[0]
             for r in conn.execute(

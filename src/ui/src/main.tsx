@@ -19,10 +19,6 @@ const queryClient = new QueryClient({
   },
 });
 
-// Two deliberate omissions for a single-user local tool served from one
-// origin: no route-level code splitting and no error boundary. A fork that
-// needs them would add React.lazy per route and a top-level error boundary
-// around <App />.
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <ThemeProvider theme="dark" density="standard" global target="html">

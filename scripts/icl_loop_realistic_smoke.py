@@ -4,16 +4,16 @@
 """Realistic-load live ICL smoke per hosted Teacher.
 
 Extends ``scripts/icl_loop_smoke.py`` (5-Edit baseline) to a realistic
-load: ≥15 SME Edits per Teacher, image-budget pruning
-forced on Mistral/Qwen (cap=8) and Nemotron (cap=10), large-image
-transport exercised via a synthetic >220 KB PNG, anti-anchoring rationale
-flow exercised live, and evaluation completion.
+load: ≥15 SME Edits per Teacher, image-budget pruning exercised across the
+current hosted Teacher matrix, large-image transport exercised via a synthetic
+>220 KB PNG, anti-anchoring rationale flow exercised live, and evaluation
+completion.
 
-Per Teacher (Mistral default, Qwen, Step-3.7-Flash, Nemotron):
+Per commercially permitted seeded hosted Teacher:
 
   1. Create fresh project; switch teacher; save Guidance.
-  2. Stage 16 RPS images (3 per class spread + a few extras) + 1
-     synthetic >220 KB PNG → ingest 17 examples.
+  2. Stage 18 RPS images (6 per class) + 1 synthetic >220 KB PNG → ingest
+     19 examples.
   3. Drive 15 SME Edits via the API. After each Edit:
      • assert ``len(icl_example_keys_used) == icl_images_attached_count``
        (invariant from inline ICL injection)
@@ -23,16 +23,20 @@ Per Teacher (Mistral default, Qwen, Step-3.7-Flash, Nemotron):
      • on Edit #5, exercise the anti-anchoring rationale flow:
        call ``:regenerate_rationale`` → save with
        ``rationale_source="teacher_regenerated_approved"``.
-  4. Final proposal targets the >220 KB synthetic image. Inspect the
-     persisted OperationRecord and assert
+  4. Final proposal targets the >220 KB synthetic image. Inspect the persisted
+     OperationRecord and assert
      ``image_transport_mode == "base64_inline"`` (hosted endpoints accept
      only inline base64; there is no NVCF asset-upload path on hosted).
   5. Run an evaluation; assert terminal status ``completed``.
 
+The OperationRecord checks read ``project.db`` directly from the
+``project_dir`` returned by project creation. Run this harness against a
+local-source backend on the same host, not Compose or a remote backend.
+
 Usage::
 
     uv run python scripts/icl_loop_realistic_smoke.py
-    uv run python scripts/icl_loop_realistic_smoke.py --teachers mistral
+    uv run python scripts/icl_loop_realistic_smoke.py --teachers step
 """
 
 from __future__ import annotations
@@ -50,6 +54,13 @@ from typing import Any
 import httpx
 from PIL import Image
 
+from vlm_feedback_loop.model_catalog_constants import (
+    MISTRAL_MEDIUM_3_5,
+    NEMOTRON_3_NANO_OMNI_REASONING,
+    NEMOTRON_NANO_12B_VL,
+    STEP_3_7_FLASH,
+)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from icl_loop_smoke import (  # noqa: E402
     BACKEND_URL,
@@ -59,7 +70,6 @@ from icl_loop_smoke import (  # noqa: E402
     wait_backend,
 )
 
-WORKSPACE_ROOT = Path("/tmp/vlm_workspace")
 LARGE_IMG_PATH = Path("/tmp/vlm_smoke_large.png")
 LARGE_IMG_TARGET_BYTES = (
     230_000  # big enough to prove hosted accepts large inline-base64 payloads
@@ -68,11 +78,12 @@ TARGET_EDITS = 15
 
 # label → (model-name, image-cap)
 TEACHER_LOOKUP: dict[str, tuple[str, int]] = {
-    "mistral": ("mistralai/mistral-large-3-675b-instruct-2512", 8),
-    "qwen": ("qwen/qwen3.5-397b-a17b", 8),
-    "step": ("stepfun-ai/step-3.7-flash", 8),
-    "nemotron": ("nvidia/nemotron-nano-12b-v2-vl", 10),
+    "step": (STEP_3_7_FLASH, 8),
+    "mistral_medium": (MISTRAL_MEDIUM_3_5, 10),
+    "nemotron": (NEMOTRON_NANO_12B_VL, 10),
+    "omni": (NEMOTRON_3_NANO_OMNI_REASONING, 8),
 }
+DEFAULT_TEACHERS = ",".join(TEACHER_LOOKUP)
 
 GUIDANCE_BODY: dict[str, Any] = {
     "description": (
@@ -159,6 +170,7 @@ class TeacherReport:
     teacher_model: str
     image_cap: int
     project_id: str | None = None
+    project_dir: Path | None = None
     stages: list[StageResult] = field(default_factory=list)
     discoveries: list[str] = field(default_factory=list)
 
@@ -173,8 +185,9 @@ class TeacherReport:
         return all(s.ok for s in self.stages)
 
 
-def _read_op_record(project_id: str, inv_id: str) -> dict[str, Any] | None:
-    db = WORKSPACE_ROOT / "projects" / project_id / "project.db"
+def _read_op_record(project_dir: Path, inv_id: str) -> dict[str, Any] | None:
+    """Read an OperationRecord from the API-reported local project directory."""
+    db = project_dir / "project.db"
     if not db.exists():
         return None
     conn = sqlite3.connect(str(db))
@@ -215,9 +228,16 @@ async def _smoke_one(
     if r.status_code != 201:
         report.add("create_project", False, f"HTTP {r.status_code}", t0)
         return report
-    pid = r.json()["project_id"]
+    project_payload = r.json()
+    pid = project_payload["project_id"]
     report.project_id = pid
-    report.add("create_project", True, f"project_id={pid}", t0)
+    report.project_dir = Path(project_payload["project_dir"])
+    report.add(
+        "create_project",
+        True,
+        f"project_id={pid} project_dir={report.project_dir}",
+        t0,
+    )
 
     t0 = time.monotonic()
     mc_id = await resolve_teacher_model_config_id(client, pid, teacher_model)
@@ -266,7 +286,7 @@ async def _smoke_one(
         json={"examples": items},
         timeout=60.0,
     )
-    if r.status_code != 200:
+    if r.status_code != 202:
         report.add("ingest_images", False, f"HTTP {r.status_code}", t0)
         return report
     results = r.json().get("results", [])
@@ -451,7 +471,7 @@ async def _smoke_one(
         },
         timeout=60.0,
     )
-    if r.status_code != 200:
+    if r.status_code != 202:
         report.add(
             "large_image_proposal", False, f"ingest large HTTP {r.status_code}", t0
         )
@@ -477,7 +497,8 @@ async def _smoke_one(
             # size cap, or (b) a regression in the inline path.
             if p.get("invocation_status") != "success":
                 inv_id = p.get("inference_invocation_id")
-                rec = _read_op_record(pid, inv_id) if inv_id else None
+                assert report.project_dir is not None
+                rec = _read_op_record(report.project_dir, inv_id) if inv_id else None
                 transport = (rec or {}).get("image_transport_mode")
                 report.discoveries.append(
                     f"large-image (>180KB) proposal failed: "
@@ -493,7 +514,8 @@ async def _smoke_one(
                 )
             else:
                 large_inv = p["inference_invocation_id"]
-                rec = _read_op_record(pid, large_inv)
+                assert report.project_dir is not None
+                rec = _read_op_record(report.project_dir, large_inv)
                 transport = (rec or {}).get("image_transport_mode")
                 report.add(
                     "large_image_proposal",
@@ -549,8 +571,11 @@ async def amain(argv: list[str]) -> int:
     parser.add_argument(
         "--teachers",
         type=str,
-        default="mistral,qwen,step,nemotron",
-        help="Comma list of teacher labels",
+        default=DEFAULT_TEACHERS,
+        help=(
+            f"Comma list of hosted Teacher labels (default: {DEFAULT_TEACHERS}). "
+            "The DB audits require a local-source backend on this host."
+        ),
     )
     args = parser.parse_args(argv)
 

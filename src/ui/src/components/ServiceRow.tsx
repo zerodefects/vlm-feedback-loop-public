@@ -32,7 +32,9 @@ export function ServiceRow({
       ? "NVIDIA hosted NIM"
       : recommendedMode === "local"
         ? "Deploy locally"
-        : "Not available";
+        : serviceName === "Embeddings"
+          ? "pHash diversity (no NIM)"
+          : "Not available";
 
   return (
     <div className="glass-card glass-card--elevated overflow-hidden">

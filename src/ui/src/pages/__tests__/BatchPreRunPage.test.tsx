@@ -29,7 +29,11 @@ vi.mock("@/api/model-configs", () => ({
   fetchModelConfigs: vi.fn(),
 }));
 
-vi.mock("@/pages/ProjectSetupLayout", () => ({
+vi.mock("@/api/nim", () => ({
+  fetchNimEndpoints: vi.fn(),
+}));
+
+vi.mock("@/pages/setup-context", () => ({
   useSetupContext: vi.fn(),
 }));
 
@@ -39,13 +43,15 @@ import { createBatchLabelRun } from "@/api/batch";
 import { fetchScaleUpGate } from "@/api/evaluation";
 import { fetchGuidance, fetchIclCount } from "@/api/guidance";
 import { fetchModelConfigs } from "@/api/model-configs";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { fetchNimEndpoints } from "@/api/nim";
+import { useSetupContext } from "@/pages/setup-context";
 
 const mockCreate = createBatchLabelRun as ReturnType<typeof vi.fn>;
 const mockFetchGate = fetchScaleUpGate as ReturnType<typeof vi.fn>;
 const mockFetchIclCount = fetchIclCount as ReturnType<typeof vi.fn>;
 const mockFetchModelConfigs = fetchModelConfigs as ReturnType<typeof vi.fn>;
 const mockFetchGuidance = fetchGuidance as ReturnType<typeof vi.fn>;
+const mockFetchNimEndpoints = fetchNimEndpoints as ReturnType<typeof vi.fn>;
 const mockSetup = useSetupContext as ReturnType<typeof vi.fn>;
 
 // The page reads example-state counts straight from the setup context's
@@ -101,6 +107,7 @@ beforeEach(() => {
         model_name: "nvidia/cosmos-reason2-8b",
         endpoint_id: "ep-1",
         eligible_roles: ["teacher"],
+        structured_generation_support: "supported",
       },
     ],
     next_cursor: null,
@@ -112,6 +119,16 @@ beforeEach(() => {
     rules: "",
     schema: { fields: [] },
     created_at: "2026-04-16T00:00:00Z",
+  });
+  mockFetchNimEndpoints.mockResolvedValue({
+    items: [
+      {
+        endpoint_id: "ep-1",
+        endpoint_mode: "self_hosted",
+        source_kind: "user_configured",
+        usage_policy: "operator_managed",
+      },
+    ],
   });
   mockCreate.mockResolvedValue({
     run_id: "run-1",
@@ -168,6 +185,23 @@ describe("BatchPreRunPage", () => {
     });
   });
 
+  it("does not claim current Guidance exists when none is active", async () => {
+    mockSetup.mockReturnValue({
+      projectId: "pid-1",
+      project: { ...PROJECT, active_guidance_id: null },
+      environment: {},
+    });
+    renderPage();
+    fireEvent.click(await screen.findByTestId("advanced-toggle"));
+
+    expect(
+      screen.getByText(
+        "Activate Guidance before re-labeling existing Auto-Labeled results.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Re-run with current Guidance/)).toBeNull();
+  });
+
   it("shows input count from project", async () => {
     renderPage();
     await waitFor(() => {
@@ -186,12 +220,41 @@ describe("BatchPreRunPage", () => {
     await waitFor(() => {
       expect(mockCreate).toHaveBeenCalledWith("pid-1", {
         include_auto_labeled: false,
+        structured_generation_mode: "auto",
+        icl_mode: "enabled",
       });
     });
     // Should navigate to status page
     await waitFor(() => {
       expect(screen.getByTestId("status-page")).toBeInTheDocument();
     });
+  });
+
+  it("requires explicit evaluation confirmation for the NVIDIA API Catalog endpoint", async () => {
+    mockFetchNimEndpoints.mockResolvedValueOnce({
+      items: [
+        {
+          endpoint_id: "ep-1",
+          endpoint_mode: "hosted",
+          source_kind: "seeded_hosted",
+          usage_policy: "evaluation_only",
+        },
+      ],
+    });
+    renderPage();
+
+    const launch = screen.getByTestId("launch-batch");
+    await waitFor(() => expect(launch).not.toBeDisabled());
+    expect(screen.getByText(/NVIDIA API Catalog · evaluation only/i)).toBeVisible();
+
+    fireEvent.click(launch);
+    const warning = await screen.findByTestId("evaluation-endpoint-warning");
+    expect(warning).toHaveTextContent(/up to 100 images/i);
+    expect(warning).toHaveTextContent(/additional trial credits.*do not authorize/i);
+    expect(mockCreate).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("confirm-evaluation-batch"));
+    await waitFor(() => expect(mockCreate).toHaveBeenCalledTimes(1));
   });
 
   it("restart-with-prompt-only carries the forced mode into the launch request", async () => {
@@ -212,8 +275,145 @@ describe("BatchPreRunPage", () => {
       expect(mockCreate).toHaveBeenCalledWith("pid-1", {
         include_auto_labeled: false,
         structured_generation_mode: "prompt_only",
+        icl_mode: "enabled",
       });
     });
+  });
+
+  it("lets the SME snapshot the advanced run limit, structured mode, and ICL mode", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByTestId("advanced-toggle"));
+
+    fireEvent.change(screen.getByTestId("batch-run-limit"), {
+      target: { value: "20" },
+    });
+    fireEvent.change(screen.getByTestId("batch-ingested-after"), {
+      target: { value: "2026-08-01T00:00" },
+    });
+    fireEvent.change(screen.getByTestId("batch-ingested-before"), {
+      target: { value: "2026-08-03T23:59" },
+    });
+    fireEvent.change(screen.getByTestId("batch-structured-generation-mode"), {
+      target: { value: "prompt_only" },
+    });
+    fireEvent.change(screen.getByTestId("batch-icl-mode"), {
+      target: { value: "disabled" },
+    });
+
+    const launch = screen.getByTestId("launch-batch");
+    await waitFor(() => expect(launch).not.toBeDisabled());
+    fireEvent.click(launch);
+
+    await waitFor(() => {
+      expect(mockCreate).toHaveBeenCalledWith("pid-1", {
+        include_auto_labeled: false,
+        run_limit: 20,
+        ingested_after: "2026-08-01T00:00:00Z",
+        ingested_before: "2026-08-03T23:59:00Z",
+        structured_generation_mode: "prompt_only",
+        icl_mode: "disabled",
+      });
+    });
+  });
+
+  it("rejects an invalid run limit before submitting", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByTestId("advanced-toggle"));
+    fireEvent.change(screen.getByTestId("batch-run-limit"), {
+      target: { value: "0" },
+    });
+
+    expect(screen.getByTestId("batch-run-limit-helper")).toHaveTextContent(
+      "Enter a whole number of 1 or more.",
+    );
+    expect(screen.getByTestId("launch-batch")).toBeDisabled();
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it("rejects an inverted ingestion range before submitting", async () => {
+    renderPage();
+    fireEvent.click(await screen.findByTestId("advanced-toggle"));
+    fireEvent.change(screen.getByTestId("batch-ingested-after"), {
+      target: { value: "2026-08-04T12:00" },
+    });
+    fireEvent.change(screen.getByTestId("batch-ingested-before"), {
+      target: { value: "2026-08-04T11:00" },
+    });
+
+    expect(screen.getByTestId("batch-ingested-range-helper")).toHaveTextContent(
+      "The end must be the same as or later than the start.",
+    );
+    expect(screen.getByTestId("launch-batch")).toBeDisabled();
+    expect(mockCreate).not.toHaveBeenCalled();
+  });
+
+  it("pins structured generation to prompt-only for an unsupported Teacher", async () => {
+    mockFetchModelConfigs.mockResolvedValueOnce({
+      items: [
+        {
+          model_config_id: "mc-1",
+          model_name: "zero-schema-teacher",
+          endpoint_id: "ep-1",
+          eligible_roles: ["teacher"],
+          structured_generation_support: "unsupported",
+        },
+      ],
+      next_cursor: null,
+    });
+    renderPage();
+    fireEvent.click(await screen.findByTestId("advanced-toggle"));
+
+    const structuredMode = screen.getByTestId("batch-structured-generation-mode");
+    await waitFor(() => expect(structuredMode).toBeDisabled());
+    expect(structuredMode).toHaveValue("prompt_only");
+    expect(
+      screen.getByText(/does not support schema-constrained output/i),
+    ).toBeVisible();
+
+    const launch = screen.getByTestId("launch-batch");
+    await waitFor(() => expect(launch).not.toBeDisabled());
+    fireEvent.click(launch);
+    await waitFor(() =>
+      expect(mockCreate).toHaveBeenCalledWith(
+        "pid-1",
+        expect.objectContaining({ structured_generation_mode: "prompt_only" }),
+      ),
+    );
+  });
+
+  it("shows the backend reason when a gate race rejects launch", async () => {
+    const { ApiError } = await import("@/api/client");
+    mockFetchGate
+      .mockResolvedValueOnce({
+        gate_status: "ready",
+        criteria: [],
+        evaluated_at: "2026-04-16T00:00:00Z",
+      })
+      .mockResolvedValue({
+        gate_status: "not_ready",
+        criteria: [],
+        evaluated_at: "2026-04-16T00:01:00Z",
+      });
+    mockCreate.mockRejectedValueOnce(
+      new ApiError(
+        409,
+        JSON.stringify({
+          detail:
+            "Scale-Up readiness changed before launch. Review the current criteria.",
+        }),
+      ),
+    );
+    renderPage();
+    const launch = screen.getByTestId("launch-batch");
+    await waitFor(() => expect(launch).not.toBeDisabled());
+    fireEvent.click(launch);
+
+    expect(await screen.findByTestId("batch-launch-error")).toHaveTextContent(
+      "Could not start batch run: Scale-Up readiness changed before launch. Review the current criteria.",
+    );
+    expect(screen.getByTestId("review-scaleup-after-launch-error")).toBeVisible();
+    await waitFor(() => expect(screen.getByTestId("launch-batch")).toBeDisabled());
+    expect(mockFetchGate).toHaveBeenCalledTimes(2);
   });
 
   it("shows no-unlabeled warning when count is zero", async () => {
@@ -270,7 +470,7 @@ describe("BatchPreRunPage", () => {
     mockFetchIclCount.mockResolvedValueOnce({ eligible_count: 12 });
     renderPage();
     await waitFor(() => {
-      expect(screen.getByText(/12 edits/)).toBeInTheDocument();
+      expect(screen.getByText("12 edits")).toBeInTheDocument();
     });
     // Matches wireframe's "ICL: 12 edits" formatting.
     expect(screen.getByText(/^ICL$/)).toBeInTheDocument();

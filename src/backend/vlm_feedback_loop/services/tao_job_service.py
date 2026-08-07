@@ -319,6 +319,26 @@ def format_failure_error_ref(raw_msg: str) -> str | None:
     return sanitize_error(raw_msg)
 
 
+def effective_tao_job_error_ref(job: TAOJob) -> str | None:
+    """Return the most actionable error available for a TAO job.
+
+    Historical FTMS failures may retain only a generic final status in
+    ``error_ref`` while their captured logs contain the worker exception.
+    This read repair keeps the persisted audit row unchanged.
+    """
+    error_ref = job.error_ref
+    logs_text = (job.outputs or {}).get("tao_logs_text")
+    actionable_error = extract_actionable_failure_from_logs(
+        logs_text if isinstance(logs_text, str) else None
+    )
+    if actionable_error and (
+        not error_ref
+        or error_ref.strip().lower() == f"{job.action} action failed for cosmos-rl"
+    ):
+        return actionable_error
+    return error_ref
+
+
 @dataclass(frozen=True)
 class PollApplyOutcome:
     """Result of :func:`apply_poll_result` — what the caller needs next.
@@ -956,19 +976,6 @@ async def poll_tao_job(
 def _job_to_dict(job: TAOJob) -> dict[str, Any]:
     """Convert a TAOJob ORM row to the response dict shape."""
     dataset_export_ids: list[str] = [str(x) for x in job.dataset_export_ids]
-    error_ref = job.error_ref
-    logs_text = (job.outputs or {}).get("tao_logs_text")
-    actionable_error = extract_actionable_failure_from_logs(
-        logs_text if isinstance(logs_text, str) else None
-    )
-    if actionable_error and (
-        not error_ref
-        or error_ref.strip().lower() == f"{job.action} action failed for cosmos-rl"
-    ):
-        # Backward-compatible read repair: jobs that failed before actionable
-        # log extraction shipped retain their immutable DB audit row while the
-        # API/UI expose the concrete captured worker exception.
-        error_ref = actionable_error
 
     return {
         "tao_job_id": job.tao_job_id,
@@ -985,12 +992,14 @@ def _job_to_dict(job: TAOJob) -> dict[str, Any]:
         "tao_external_job_id": job.tao_external_job_id,
         "progress": job.progress,
         "outputs": job.outputs,
+        "outputs_fetch_status": job.outputs_fetch_status,
+        "outputs_fetch_error_ref": sanitize_error(job.outputs_fetch_error_ref),
         "parent_tao_job_id": job.parent_tao_job_id,
         "chain_id": job.chain_id,
         "chain_sequence": job.chain_sequence,
         "chain_halted_reason": job.chain_halted_reason,
         "preflight_result": job.preflight_result,
-        "error_ref": error_ref,
+        "error_ref": effective_tao_job_error_ref(job),
         "poll_error_ref": job.poll_error_ref,
         "created_at": job.created_at,
         "started_at": job.started_at,

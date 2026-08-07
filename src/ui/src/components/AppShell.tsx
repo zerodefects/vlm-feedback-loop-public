@@ -54,8 +54,10 @@ export function AppShell({ children }: AppShellProps) {
           </Link>
           {!isHome && (
             <nav className="ml-6 flex items-center gap-1">
-              <Link to="/" className={`nav-link ${isHome ? "nav-link-active" : ""}`}>
-                Projects
+              <Link to="/" className="nav-link">
+                <Text kind="label/regular/sm" style={{ color: "inherit" }}>
+                  Projects
+                </Text>
               </Link>
             </nav>
           )}
@@ -75,7 +77,9 @@ export function AppShell({ children }: AppShellProps) {
               className="nav-link"
               title="View the public Blueprint documentation"
             >
-              Docs
+              <Text kind="label/regular/sm" style={{ color: "inherit" }}>
+                Docs
+              </Text>
               <ExternalLink size={12} aria-hidden="true" />
             </a>
           </div>

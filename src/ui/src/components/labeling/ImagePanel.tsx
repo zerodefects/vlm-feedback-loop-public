@@ -27,15 +27,17 @@ interface ImagePanelProps {
   storageRef?: string | null;
   isLoading: boolean;
   onImageMissing: () => void;
+  onImageLoaded: () => void;
 }
 
 interface ZoomableImageProps {
   src: string;
   alt: string;
   onError: () => void;
+  onLoad: () => void;
 }
 
-function ZoomableImage({ src, alt, onError }: ZoomableImageProps) {
+function ZoomableImage({ src, alt, onError, onLoad }: ZoomableImageProps) {
   const [scale, setScale] = useState(MIN_ZOOM);
   const zoomPercentage = Math.round(scale * 100);
   const isAtMinimum = scale <= MIN_ZOOM;
@@ -151,6 +153,7 @@ function ZoomableImage({ src, alt, onError }: ZoomableImageProps) {
               decoding="async"
               draggable={false}
               onError={onError}
+              onLoad={onLoad}
             />
           </TransformComponent>
         </>
@@ -165,9 +168,11 @@ export function ImagePanel({
   storageRef,
   isLoading,
   onImageMissing,
+  onImageLoaded,
 }: ImagePanelProps) {
   const [imgError, setImgError] = useState(false);
   const [showActionRequest, setShowActionRequest] = useState(false);
+  const [retryNonce, setRetryNonce] = useState(0);
 
   // Reset error state when the example changes
   const [prevKey, setPrevKey] = useState<string | null>(null);
@@ -175,6 +180,7 @@ export function ImagePanel({
     setPrevKey(exampleKey);
     setImgError(false);
     setShowActionRequest(false);
+    setRetryNonce(0);
   }
 
   if (isLoading || !exampleKey) {
@@ -237,13 +243,26 @@ export function ImagePanel({
           </Text>
 
           {!showActionRequest ? (
-            <Button
-              kind="secondary"
-              onClick={() => setShowActionRequest(true)}
-              data-testid="report-missing-files-btn"
-            >
-              Report Missing Files
-            </Button>
+            <div className="flex items-center gap-3">
+              <Button
+                kind="primary"
+                className="nvidia-green-button"
+                onClick={() => {
+                  setImgError(false);
+                  setRetryNonce((value) => value + 1);
+                }}
+                data-testid="retry-image-btn"
+              >
+                Retry image
+              </Button>
+              <Button
+                kind="secondary"
+                onClick={() => setShowActionRequest(true)}
+                data-testid="report-missing-files-btn"
+              >
+                Report Missing Files
+              </Button>
+            </div>
           ) : (
             <div className="w-full">
               <ActionRequestPanel
@@ -277,13 +296,14 @@ export function ImagePanel({
         data-testid="image-panel"
       >
         <ZoomableImage
-          key={exampleKey}
-          src={imageUrl(projectId, exampleKey)}
+          key={`${exampleKey}-${retryNonce}`}
+          src={`${imageUrl(projectId, exampleKey)}${retryNonce > 0 ? `?retry=${retryNonce}` : ""}`}
           alt={`Example ${exampleKey}`}
           onError={() => {
             setImgError(true);
             onImageMissing();
           }}
+          onLoad={onImageLoaded}
         />
       </div>
     </div>

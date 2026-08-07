@@ -72,15 +72,22 @@ vi.mock("@/api/nim", () => ({
   logActionRequestCopy: (...args: unknown[]) => mockLogActionRequestCopy(...args),
 }));
 
+const mockListStudentModels = vi.fn();
+vi.mock("@/api/students", () => ({
+  listStudentModels: (...args: unknown[]) => mockListStudentModels(...args),
+}));
+
 // EvaluationStrip pulls trigger-status + run list via @/api/evaluation. The
 // default mock returns an all-inactive trigger envelope so no banner renders
 // in tests that don't opt in (the real module errors silently in JSDOM).
 const mockFetchTriggerStatus = vi.fn();
+const mockFetchScaleUpGate = vi.fn();
 const mockListEvaluationRuns = vi.fn();
 const mockCreateEvaluationRun = vi.fn();
 const mockCancelEvaluationRun = vi.fn();
 const mockDismissTrigger = vi.fn();
 vi.mock("@/api/evaluation", () => ({
+  fetchScaleUpGate: (...args: unknown[]) => mockFetchScaleUpGate(...args),
   fetchTriggerStatus: (...args: unknown[]) => mockFetchTriggerStatus(...args),
   listEvaluationRuns: (...args: unknown[]) => mockListEvaluationRuns(...args),
   createEvaluationRun: (...args: unknown[]) => mockCreateEvaluationRun(...args),
@@ -346,6 +353,7 @@ function createWrapper(projectOverrides?: Record<string, unknown>) {
                 element={<div data-testid="create-guidance-page" />}
               />
               <Route path="ready" element={<div data-testid="image-ingest-page" />} />
+              <Route path="compare" element={<div data-testid="compare-page" />} />
             </Route>
           </Routes>
         </MemoryRouter>
@@ -361,7 +369,11 @@ function createWrapper(projectOverrides?: Record<string, unknown>) {
 // ---------------------------------------------------------------------------
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  // Reset queued `mockResolvedValueOnce` implementations as well as call
+  // history. Several proposal-state tests intentionally enqueue multiple
+  // review cycles; clearing calls alone lets an unused response leak into the
+  // next test and makes route/auto-advance behavior depend on execution timing.
+  vi.resetAllMocks();
   localStorage.clear();
 
   // Default mocks for shared queries
@@ -375,6 +387,7 @@ beforeEach(() => {
   mockFetchReminderStatus.mockResolvedValue(REMINDER_STATUS_NONE);
   mockDismissReminder.mockResolvedValue({ dismissed_count: 1 });
   mockRestoreOmitted.mockResolvedValue({ restored_count: 0 });
+  mockListStudentModels.mockResolvedValue({ items: [], next_cursor: null });
 
   // Default: fetchNextReviewItem returns REVIEW_NEXT unless overridden
   mockFetchNextReviewItem.mockResolvedValue(REVIEW_NEXT);
@@ -399,6 +412,20 @@ beforeEach(() => {
     },
     icl_growth: { is_active: false, dismissed: false, message: "", context: null },
     updated_at: "2026-04-23T00:00:00Z",
+  });
+  mockFetchScaleUpGate.mockResolvedValue({
+    gate_status: "not_ready",
+    criteria: [
+      {
+        criterion_name: "min_test_pool_size",
+        passed: false,
+        current_value: 7,
+        threshold: 20,
+        message: "Test Pool: 7 (need 20).",
+        details: { pool_target: 20 },
+      },
+    ],
+    evaluated_at: "2026-04-23T00:00:00Z",
   });
   mockListEvaluationRuns.mockResolvedValue({ items: [], next_cursor: null });
   mockCreateEvaluationRun.mockResolvedValue({ run_id: "new-run", status: "queued" });
@@ -482,6 +509,24 @@ describe("LabelingPage", () => {
     // Footer with Add Images
     expect(screen.getByTestId("labeling-footer")).toBeInTheDocument();
     expect(screen.getByTestId("add-images-btn")).toBeInTheDocument();
+    expect(screen.queryByTestId("models-results-indicator")).not.toBeInTheDocument();
+  });
+
+  it("offers Models & Results beside Scale-Up when a Student exists", async () => {
+    mockListStudentModels.mockResolvedValue({
+      items: [{ student_model_id: "student-1" }],
+      next_cursor: null,
+    });
+
+    const { Wrapper } = createWrapper();
+    render(<LabelingPage />, { wrapper: Wrapper });
+
+    const modelsButton = await screen.findByTestId("models-results-indicator");
+    expect(modelsButton).toHaveTextContent("Models & Results");
+    expect(screen.getByTestId("scaleup-indicator")).toBeInTheDocument();
+
+    fireEvent.click(modelsButton);
+    expect(await screen.findByTestId("compare-page")).toBeInTheDocument();
   });
 
   // ── Rationale Visible ─────────────────────────────────────────────────
@@ -606,7 +651,7 @@ describe("LabelingPage", () => {
 
   // ── Missing Image ─────────────────────────────────────────────────────
 
-  it("shows missing-image state with only Skip available", async () => {
+  it("offers image recovery while keeping Skip as the only label action", async () => {
     mockFetchNextReviewItem.mockResolvedValueOnce(REVIEW_NEXT);
     mockCreateProposal.mockResolvedValueOnce(PROPOSAL_SUCCESS);
 
@@ -629,6 +674,7 @@ describe("LabelingPage", () => {
     expect(
       screen.getByText(/Image not found at original location/),
     ).toBeInTheDocument();
+    expect(screen.getByTestId("retry-image-btn")).toBeInTheDocument();
     expect(screen.getByTestId("report-missing-files-btn")).toBeInTheDocument();
 
     // Only Skip is available (no Save or Retry)
@@ -639,6 +685,16 @@ describe("LabelingPage", () => {
 
     // Save and Retry should NOT be in the missing-image action bar
     expect(screen.queryByTestId("labeling-actions")).not.toBeInTheDocument();
+
+    await userEvent.setup().click(screen.getByTestId("retry-image-btn"));
+    const retriedImage = await screen.findByTestId("labeling-image");
+    expect(retriedImage).toHaveAttribute("src", expect.stringContaining("?retry=1"));
+    fireEvent.load(retriedImage);
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("image-panel-missing")).not.toBeInTheDocument();
+      expect(screen.getByTestId("proposal-form")).toBeInTheDocument();
+    });
   });
 
   // ── Auto-Advance: Save ────────────────────────────────────────────────
@@ -654,7 +710,8 @@ describe("LabelingPage", () => {
       pool_assignment: null,
     });
 
-    const { Wrapper } = createWrapper();
+    const { Wrapper, queryClient } = createWrapper();
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const user = userEvent.setup();
     render(<LabelingPage />, { wrapper: Wrapper });
 
@@ -686,6 +743,44 @@ describe("LabelingPage", () => {
         callCountBefore,
       );
     });
+
+    const invalidatedKeys = invalidateSpy.mock.calls
+      .map((call) => call[0]?.queryKey as readonly unknown[] | undefined)
+      .filter((key): key is readonly unknown[] => Array.isArray(key));
+    expect(invalidatedKeys).toEqual(
+      expect.arrayContaining([["evaluations", "test-pid", "gate"]]),
+    );
+  });
+
+  it("shows context selection instead of a false cold-start state between proposals", async () => {
+    mockSaveLabel.mockResolvedValueOnce({
+      example_key: "img_001",
+      label_status: "verified",
+      verified_outcome: "Edit",
+      verified_at: "2026-04-14T12:00:00Z",
+      edited_core_fields: ["damage_type"],
+      edited_aux_fields: [],
+      pool_assignment: null,
+    });
+    mockCreateProposal
+      .mockResolvedValueOnce(PROPOSAL_SUCCESS)
+      .mockImplementationOnce(() => new Promise(() => {}));
+
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+    render(<LabelingPage />, { wrapper: Wrapper });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("proposal-form")).toBeInTheDocument();
+    });
+    await user.click(screen.getByTestId("save-btn"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("icl-chip-pending")).toHaveTextContent(
+        "ICL: selecting context…",
+      );
+    });
+    expect(screen.queryByText("ICL: no edits yet")).not.toBeInTheDocument();
   });
 
   // ── Auto-Advance: Skip ────────────────────────────────────────────────
@@ -1903,6 +1998,10 @@ describe("LabelingPage", () => {
 
       const queueEmpty = screen.getByTestId("queue-empty");
       expect(queueEmpty).toHaveTextContent("All images have been reviewed.");
+      expect(screen.getByTestId("icl-chip-idle")).toHaveTextContent(
+        "ICL: no active proposal",
+      );
+      expect(screen.queryByTestId("icl-chip-pending")).not.toBeInTheDocument();
       // Counts render as a single meta line — the status bar on the same
       // screen already carries the full pill counters.
       expect(queueEmpty).toHaveTextContent(/Verified 42/);

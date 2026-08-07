@@ -9,6 +9,9 @@ rows via the service produces records visible through the router.
 
 from __future__ import annotations
 
+import io
+import tarfile
+
 from conftest import create_project_via_api
 
 
@@ -95,6 +98,7 @@ class TestList:
         for field in [
             "student_model_id",
             "project_id",
+            "training_suite_id",
             "student_base_model_config_id",
             "tao_job_id",
             "guidance_id",
@@ -108,6 +112,8 @@ class TestList:
             "quality_evaluation_run_id",
             "serving_status",
             "serving_evaluation_run_id",
+            "serving_benchmark_current",
+            "serving_benchmark_blocker",
             "nim_preflight_status",
             "nim_preflight_details",
             "nim_preflight_at",
@@ -179,6 +185,8 @@ class TestGet:
         assert body["checkpoint_packaging_status"] == "validated"
         assert body["quality_status"] == "pending"
         assert body["serving_status"] == "not_attempted"
+        assert body["serving_benchmark_current"] is False
+        assert body["serving_benchmark_blocker"] == "serving_status_not_attempted"
 
     def test_get_unknown_id_returns_404(self, test_app_client):
         pid = _create_project(test_app_client)
@@ -195,6 +203,107 @@ class TestGet:
         resp = test_app_client.get(f"/v1/projects/{pid_b}/student_models/{ids_a[0]}")
         assert resp.status_code == 404
         assert resp.json()["detail"] == "Student model not found"
+
+
+class TestDeploymentBundle:
+    def test_streams_attachment_without_buffering_through_json(
+        self, test_app_client, tmp_path, monkeypatch
+    ):
+        """The public route returns a named tar attachment with the checkpoint."""
+        from vlm_feedback_loop.services import deployment_bundle_service as bundles
+
+        pid = _create_project(test_app_client)
+        sid = "student-bundle-test"
+        checkpoint = tmp_path / "checkpoint"
+        checkpoint.mkdir()
+        model = checkpoint / "model.safetensors"
+        model.write_bytes(b"weights")
+        plan = bundles.DeploymentBundlePlan(
+            project_id=pid,
+            student_model_id=sid,
+            archive_filename="vlm-student-student--nim.tar",
+            archive_root="vlm-student-student--nim",
+            checkpoint_root=checkpoint,
+            checkpoint_files=(
+                bundles.DeploymentBundleFile(
+                    source=model,
+                    relative_path=model.relative_to(checkpoint),
+                    size=model.stat().st_size,
+                    mode=0o644,
+                ),
+            ),
+            handoff={
+                "generated_at": "2026-08-03T00:00:00Z",
+                "project_name": "bundle route",
+                "technical_requirements": {
+                    "nim_container_image": "nvcr.io/nim/test:1.0.0",
+                    "nim_release_version": "1.0.0",
+                    "nim_served_model_name": "student-test",
+                    "nim_model_name_path": "/opt/checkpoints/student",
+                    "nim_model_profile_recommended": None,
+                    "nim_env_vars_recommended": {
+                        "NGC_API_KEY": "$NGC_API_KEY",
+                        "NIM_MODEL_NAME": "/opt/checkpoints/student",
+                    },
+                },
+                "current_environment": {
+                    "quality_status": "validated",
+                    "serving_status": "validated",
+                    "checkpoint_packaging_status": "validated",
+                },
+            },
+            verification_request={
+                "model": "student-test",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "__VLM_IMAGE_DATA_URL__"},
+                            }
+                        ],
+                    }
+                ],
+            },
+            verification_prompt_hash="prompt-sha",
+            evaluated_prompt_hash="prompt-sha",
+            guidance_id="guidance-test",
+            guidance_schema_hash="schema-sha",
+        )
+        monkeypatch.setattr(bundles, "prepare_deployment_bundle", lambda **_: plan)
+
+        response = test_app_client.get(
+            f"/v1/projects/{pid}/student_models/{sid}/deployment_bundle"
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"] == "application/x-tar"
+        assert response.headers["content-disposition"] == (
+            'attachment; filename="vlm-student-student--nim.tar"'
+        )
+        assert response.headers["x-content-type-options"] == "nosniff"
+        with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:") as archive:
+            assert (
+                "vlm-student-student--nim/checkpoint/model.safetensors"
+                in archive.getnames()
+            )
+
+    def test_maps_bundle_gate_failure_to_conflict(self, test_app_client, monkeypatch):
+        """The download route preserves production handoff gate failures."""
+        from vlm_feedback_loop.services import deployment_bundle_service as bundles
+
+        pid = _create_project(test_app_client)
+        monkeypatch.setattr(
+            bundles,
+            "prepare_deployment_bundle",
+            lambda **_: "conflict: serving_status_not_validated",
+        )
+        response = test_app_client.get(
+            f"/v1/projects/{pid}/student_models/student/deployment_bundle"
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"] == "conflict: serving_status_not_validated"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -262,3 +371,31 @@ class TestRepackage:
         resp = test_app_client.post(f"/v1/projects/{pid}/student_models/nope:repackage")
         assert resp.status_code == 404
         assert resp.json()["detail"] == "Student model not found"
+
+    def test_quantized_artifact_refresh_failure_is_actionable(
+        self, test_app_client, monkeypatch
+    ):
+        """TAO/S3 refresh failure is a retryable upstream error, not 200."""
+        from unittest.mock import AsyncMock
+
+        from vlm_feedback_loop.services import student_model_service as sms
+
+        pid = _create_project(test_app_client)
+        ids = _insert_students(test_app_client, pid, count=1)
+        monkeypatch.setattr(
+            sms,
+            "repackage_student_model",
+            AsyncMock(
+                return_value={
+                    "error": "artifact_refresh_failed",
+                    "student_model_id": ids[0],
+                }
+            ),
+        )
+
+        resp = test_app_client.post(
+            f"/v1/projects/{pid}/student_models/{ids[0]}:repackage"
+        )
+
+        assert resp.status_code == 502
+        assert "TAO/S3 reachability" in resp.json()["detail"]

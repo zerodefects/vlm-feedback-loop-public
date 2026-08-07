@@ -36,8 +36,14 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import full_stack_validation as fsv  # noqa: E402
 from full_stack_validation import (  # noqa: E402
+    C20Prediction,
     FullStackValidationResult,
+    VariantOutcome,
+    _evaluate_rps_content,
     _extract_host_port,
+    _overall_acceptance_passes,
+    _pick_representatives,
+    _rps_predictions_pass,
     _send_round_trip,
     _validate_docker_run_args,
     phase_d_handoff_reexecution,
@@ -109,7 +115,7 @@ def _synth_handoff(
     nim_model_name_path: str = "/opt/checkpoints/student",
     container_image: str = "nvcr.io/nim/nvidia/cosmos-reason2-2b:1.6.0",
     container_name: str = "vlm-student-test-2b",
-    profile_recommended: str = "vllm-cosmos-2b-bf16",
+    profile_recommended: str | None = "vllm-cosmos-2b-bf16",
     gpu_requirements: str = "1× A100 (≥36 GB)",
     nim_env_overrides: dict | None = None,
 ) -> dict:
@@ -304,6 +310,162 @@ async def test_send_round_trip_accepts_dict_response_with_keys():
         assert "parsed keys" in detail
 
 
+def test_rps_prediction_accepts_fenced_json_and_checks_ground_truth():
+    """A normal fenced Cosmos response passes only for the correct class."""
+    content = '```json\n{"category": "paper"}\n```'
+
+    predicted, ok, matches_ground_truth, detail = _evaluate_rps_content(
+        content, "paper"
+    )
+
+    assert predicted == "paper"
+    assert ok is True
+    assert matches_ground_truth is True
+    assert "matches ground truth" in detail
+
+
+def test_rps_prediction_separates_parseability_from_model_accuracy():
+    """A wrong category is valid deployment evidence and truthful quality evidence."""
+    predicted, ok, matches_ground_truth, detail = _evaluate_rps_content(
+        '{"category": "rock"}', "scissors"
+    )
+
+    assert predicted == "rock"
+    assert ok is True
+    assert matches_ground_truth is False
+    assert "expected='scissors', actual='rock'" in detail
+
+
+def test_rps_gate_requires_one_parseable_prediction_per_class():
+    """The closing gate rejects malformed output without duplicating quality policy."""
+    predictions = [
+        C20Prediction("rock", "/r.png", ok=True, predicted_category="rock"),
+        C20Prediction("paper", "/p.png", ok=True, predicted_category="paper"),
+        C20Prediction(
+            "scissors",
+            "/s.png",
+            ok=True,
+            predicted_category="rock",
+            matches_ground_truth=False,
+        ),
+    ]
+
+    assert _rps_predictions_pass(predictions) is True
+    predictions[-1].ok = False
+    predictions[-1].predicted_category = None
+    predictions[-1].matches_ground_truth = None
+    assert _rps_predictions_pass(predictions) is False
+
+
+def test_closing_gate_fails_when_a_required_rps_prediction_is_unparseable():
+    """An HTTP-healthy NIM cannot pass closing acceptance with malformed output."""
+    result = FullStackValidationResult(execution_mode="live", started_at="t0")
+    result.phase_a_complete = True
+    result.phase_b_target_count = 4
+    result.phase_b_validated_count = 4
+    result.c21_differentiation.differentiated = True
+    result.c20_handoff_rerun.two_b = True
+    result.c20_handoff_rerun.eight_b = True
+    result.final_integration_skipped = True
+    correct = [
+        C20Prediction("rock", "/r.png", ok=True, predicted_category="rock"),
+        C20Prediction("paper", "/p.png", ok=True, predicted_category="paper"),
+        C20Prediction("scissors", "/s.png", ok=True, predicted_category="scissors"),
+    ]
+    result.c20_handoff_rerun.predictions_2b = list(correct)
+    result.c20_handoff_rerun.predictions_8b = list(correct)
+    result.c20_handoff_rerun.predictions_2b[-1] = C20Prediction(
+        "scissors", "/s.png", ok=False
+    )
+
+    assert _overall_acceptance_passes(result, require_rps_predictions=True) is False
+    result.c20_handoff_rerun.predictions_2b = list(correct)
+    assert _overall_acceptance_passes(result, require_rps_predictions=True) is True
+
+
+def test_representative_selection_prefers_baseline_over_api_order():
+    """Quantized Students returned first cannot displace the stable baseline."""
+    discovered = [
+        ("project", {"student_model_id": "2b-fp8"}),
+        ("project", {"student_model_id": "2b-baseline"}),
+        ("project", {"student_model_id": "8b-fp8"}),
+        ("project", {"student_model_id": "8b-baseline"}),
+    ]
+    outcomes = [
+        VariantOutcome("2b-fp8", "2B", "fp8_dynamic", deploy_ok=True),
+        VariantOutcome("2b-baseline", "2B", "none", deploy_ok=True),
+        VariantOutcome("8b-fp8", "8B", "fp8_dynamic", deploy_ok=True),
+        VariantOutcome("8b-baseline", "8B", "none", deploy_ok=True),
+    ]
+
+    assert _pick_representatives(discovered, outcomes) == (
+        ("project", "2b-baseline"),
+        ("project", "8b-baseline"),
+    )
+
+
+# ── Phase C handoff differentiation ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_phase_c_accepts_unset_profiles_for_distinct_checkpoint_nims(
+    tmp_path, monkeypatch
+):
+    """Portable custom checkpoints need no pinned NIM profile.
+
+    The closing validation must recognize distinct 2B/8B images, GPU floors,
+    and served-model environments as a differentiated deployment contract when
+    both handoffs intentionally delegate profile selection to their NIM image.
+    """
+
+    handoffs = {
+        "student-2b": _synth_handoff(
+            served_model="student-2b",
+            container_image="nvcr.io/nim/nvidia/cosmos-reason2-2b:1.6.0",
+            profile_recommended=None,
+            gpu_requirements="1× RTX PRO 6000 (≥36 GB)",
+        ),
+        "student-8b": _synth_handoff(
+            served_model="student-8b",
+            container_image="nvcr.io/nim/nvidia/cosmos-reason2-8b:1.6.0",
+            profile_recommended=None,
+            gpu_requirements="1× RTX PRO 6000 (≥56 GB)",
+        ),
+    }
+
+    async def _stub_handoff(_client, _project_id, student_id):
+        return handoffs[student_id]
+
+    monkeypatch.setattr(fsv, "_generate_handoff", _stub_handoff)
+    result = FullStackValidationResult(
+        execution_mode="live", started_at="2026-08-04T00:00:00Z"
+    )
+    result.variants = [
+        fsv.VariantOutcome("student-2b", "2B", "none", deploy_ok=True),
+        fsv.VariantOutcome("student-8b", "8B", "none", deploy_ok=True),
+    ]
+    discovered = [
+        ("project", {"student_model_id": "student-2b"}),
+        ("project", {"student_model_id": "student-8b"}),
+    ]
+
+    await fsv.phase_c_handoff_differentiation(
+        None,
+        discovered=discovered,
+        result=result,
+        evidence_dir=tmp_path,
+    )
+
+    c21 = result.c21_differentiation
+    assert c21.nim_container_image["differs"] is True
+    assert c21.nim_model_profile_recommended["both_unset"] is True
+    assert c21.nim_model_profile_recommended["compatible"] is True
+    assert c21.gpu_requirements["differs"] is True
+    assert c21.nim_env_vars_recommended["differs"] is True
+    assert c21.tensor_parallelism["both_int_present"] is True
+    assert c21.differentiated is True
+
+
 # ── Phase D end-to-end (mock) ───────────────────────────────────────────────
 
 
@@ -415,7 +577,9 @@ async def test_phase_d_live_keeps_secret_out_of_argv_and_evidence(
     )
 
     assert result.c20_handoff_rerun.two_b is True
-    docker_args, docker_kwargs = captured[0]
+    docker_args, docker_kwargs = next(
+        (args, kwargs) for args, kwargs in captured if args[:2] == ("docker", "run")
+    )
     assert docker_args[:2] == ("docker", "run")
     assert sentinel not in " ".join(docker_args)
     ngc_index = docker_args.index("NGC_API_KEY")
@@ -425,10 +589,140 @@ async def test_phase_d_live_keeps_secret_out_of_argv_and_evidence(
         args for args, _kwargs in captured if args[:2] == ("docker", "stop")
     ]
     assert cleanup_args == [("docker", "stop", "vlm-student-test-2b")]
+    remove_args = [args for args, _kwargs in captured if args[:2] == ("docker", "rm")]
+    assert remove_args == [
+        ("docker", "rm", "vlm-student-test-2b"),
+        ("docker", "rm", "vlm-student-test-2b"),
+    ]
     assert all(sentinel not in " ".join(args) for args, _kwargs in captured)
     evidence = (tmp_path / "handoff_rerun_2b.log").read_text()
     assert sentinel not in evidence
     assert "[REDACTED]" in evidence
+
+
+@pytest.mark.asyncio
+async def test_phase_d_live_refuses_to_remove_running_named_container(
+    tmp_path, monkeypatch
+):
+    """Rerun cleanup removes exited names but never displaces a live NIM."""
+
+    captured: list[tuple[str, ...]] = []
+
+    def fake_run(args, **_kwargs):
+        captured.append(tuple(args))
+        if args[:2] == ["docker", "rm"]:
+            return subprocess.CompletedProcess(
+                args,
+                1,
+                stdout="",
+                stderr="cannot remove a running container",
+            )
+        raise AssertionError(f"unexpected command after live-name conflict: {args}")
+
+    monkeypatch.setattr(fsv.subprocess, "run", fake_run)
+    result = FullStackValidationResult(execution_mode="live", started_at="t0")
+
+    await phase_d_handoff_reexecution(
+        handoffs={"2B": _synth_handoff(served_model="student-2b")},
+        execution_mode="live",
+        result=result,
+        evidence_dir=tmp_path,
+    )
+
+    assert captured == [("docker", "rm", "vlm-student-test-2b")]
+    assert result.c20_handoff_rerun.two_b is False
+    assert "container name is unavailable" in result.c20_handoff_rerun.detail_2b
+
+
+@pytest.mark.asyncio
+async def test_phase_d_live_removes_started_container_when_round_trip_raises(
+    tmp_path, monkeypatch
+):
+    """Unexpected response parsing cannot strand the Student GPU resident."""
+
+    captured: list[tuple[str, ...]] = []
+
+    def fake_run(args, **_kwargs):
+        captured.append(tuple(args))
+        if args[:2] == ["docker", "rm"] and len(captured) == 1:
+            return subprocess.CompletedProcess(
+                args,
+                1,
+                stdout="",
+                stderr="No such container",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="container-id\n", stderr="")
+
+    async def healthy(*_args, **_kwargs):
+        return True
+
+    async def broken_round_trip(*_args, **_kwargs):
+        raise ValueError("malformed NIM response")
+
+    monkeypatch.setattr(fsv.subprocess, "run", fake_run)
+    monkeypatch.setattr(fsv, "_poll_health", healthy)
+    monkeypatch.setattr(fsv, "_send_round_trip", broken_round_trip)
+    result = FullStackValidationResult(execution_mode="live", started_at="t0")
+
+    with pytest.raises(ValueError, match="malformed NIM response"):
+        await phase_d_handoff_reexecution(
+            handoffs={"2B": _synth_handoff(served_model="student-2b")},
+            execution_mode="live",
+            result=result,
+            evidence_dir=tmp_path,
+        )
+
+    assert ("docker", "stop", "vlm-student-test-2b") in captured
+    assert captured[-1] == ("docker", "rm", "vlm-student-test-2b")
+
+
+@pytest.mark.asyncio
+async def test_phase_d_live_fails_when_started_container_cannot_be_removed(
+    tmp_path, monkeypatch
+):
+    """A healthy response is not a pass when the GPU resident is stranded."""
+
+    remove_calls = 0
+
+    def fake_run(args, **_kwargs):
+        nonlocal remove_calls
+        if args[:2] == ["docker", "rm"]:
+            remove_calls += 1
+            if remove_calls == 1:
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    stdout="",
+                    stderr="No such container",
+                )
+            return subprocess.CompletedProcess(
+                args,
+                1,
+                stdout="",
+                stderr="device or resource busy",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="container-id\n", stderr="")
+
+    async def healthy(*_args, **_kwargs):
+        return True
+
+    async def round_trip(*_args, **_kwargs):
+        return True, "ok"
+
+    monkeypatch.setattr(fsv.subprocess, "run", fake_run)
+    monkeypatch.setattr(fsv, "_poll_health", healthy)
+    monkeypatch.setattr(fsv, "_send_round_trip", round_trip)
+    result = FullStackValidationResult(execution_mode="live", started_at="t0")
+
+    await phase_d_handoff_reexecution(
+        handoffs={"2B": _synth_handoff(served_model="student-2b")},
+        execution_mode="live",
+        result=result,
+        evidence_dir=tmp_path,
+    )
+
+    assert result.c20_handoff_rerun.two_b is False
+    assert "cleanup failed: docker rm failed" in result.c20_handoff_rerun.detail_2b
 
 
 @pytest.mark.asyncio
@@ -441,6 +735,13 @@ async def test_phase_d_live_redacts_before_truncating_failure_detail(
     monkeypatch.setenv("NGC_API_KEY", sentinel)
 
     def fake_run(args, **kwargs):
+        if args[:2] == ["docker", "rm"]:
+            return subprocess.CompletedProcess(
+                args,
+                1,
+                stdout="",
+                stderr="No such container",
+            )
         return subprocess.CompletedProcess(
             args,
             9,

@@ -1,322 +1,186 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the NIM benchmark adapter.
-
-Covers:
-  - ``select_adapter`` returns ``HttpxAdapter`` when ``genai_perf`` is not
-    importable (fallback path).
-  - ``select_adapter`` returns ``GenaiPerfAdapter`` when ``genai_perf``
-    *is* importable.
-  - Both adapters' ``BenchmarkResult.to_json()`` emit the IDENTICAL key
-    set (identical artifact schema).
-  - ``HttpxAdapter`` percentile math is correct on a known sample.
-"""
+"""Behavioral tests for the mandatory AIPerf serving adapter."""
 
 from __future__ import annotations
 
 import asyncio
-import sys
-from pathlib import Path
-from unittest.mock import MagicMock
+import json
+from unittest.mock import AsyncMock
 
-import httpx
+import pytest
 
 from vlm_feedback_loop.services.benchmark_adapter import (
+    AIPerfAdapter,
     BenchmarkResult,
-    GenaiPerfAdapter,
-    HttpxAdapter,
-    _percentiles,
+    parse_aiperf_output,
     select_adapter,
 )
 
-# ── select_adapter ────────────────────────────────────────────────────────────
+
+def _summary(*, successful: int = 20, failed: int = 0) -> dict:
+    result = {
+        "schema_version": "1.3",
+        "aiperf_version": "0.10.0",
+        "start_time": "2026-08-04T10:00:00Z",
+        "end_time": "2026-08-04T10:00:10Z",
+        "was_cancelled": False,
+        "request_latency": {
+            "unit": "ms",
+            "p50": 164.25,
+            "p90": 201.75,
+            "p99": 227.5,
+            "count": successful,
+        },
+        "request_throughput": {"unit": "requests/sec", "avg": 2.0},
+        "request_count": {"unit": "requests", "avg": float(successful)},
+        "input_sequence_length": {"unit": "tokens", "avg": 423.5},
+        "output_sequence_length": {"unit": "tokens", "avg": 37.25},
+    }
+    if failed:
+        result["error_request_count"] = {
+            "unit": "requests",
+            "avg": float(failed),
+        }
+        result["error_summary"] = [{"count": failed, "message": "HTTP 500"}]
+    return result
 
 
-class TestAdapterSelection:
-    def test_select_returns_httpx_when_genai_perf_missing(self, monkeypatch):
-        # Force the import to fail: a None sys.modules entry makes
-        # ``import genai_perf`` raise ImportError.
-        monkeypatch.setitem(sys.modules, "genai_perf", None)
-        adapter = select_adapter()
-        assert isinstance(adapter, HttpxAdapter)
-
-    def test_select_returns_genai_perf_when_present(self, monkeypatch):
-        # Inject a stub module so the import succeeds.
-        monkeypatch.setitem(sys.modules, "genai_perf", MagicMock())
-        adapter = select_adapter()
-        assert isinstance(adapter, GenaiPerfAdapter)
+def test_select_adapter_has_no_synthetic_fallback():
+    assert isinstance(select_adapter(), AIPerfAdapter)
 
 
-# ── BenchmarkResult schema parity ───────────────────────────────────────
+def test_parser_preserves_precise_latency_throughput_and_counts(tmp_path):
+    output = tmp_path / "profile_export_aiperf.json"
+    output.write_text(json.dumps(_summary()))
+
+    result = parse_aiperf_output(
+        artifact_dir=tmp_path,
+        concurrency=8,
+        expected_request_count=20,
+        return_code=0,
+    )
+
+    assert result.status == "passed"
+    assert result.failed is False
+    assert result.latency_p50_ms == 164.25
+    assert result.latency_p99_ms == 227.5
+    assert result.request_throughput_rps == 2.0
+    assert result.attempted_request_count == 20
+    assert result.successful_request_count == 20
+    assert result.failed_request_count == 0
+    assert result.failure_rate == 0.0
+    assert result.benchmark_duration_s == 10.0
+    assert result.input_tokens_mean == 423.5
+    assert result.output_tokens_mean == 37.25
+    assert result.driver_version == "0.10.0"
 
 
-class TestArtifactSchemaParity:
-    def test_both_adapters_emit_identical_keys(self):
-        """Both drivers MUST produce the same artifact
-        shape. The router/UI consume only ``BenchmarkResult.to_json()``.
-        """
-        # Build a minimal BenchmarkResult to assert the dataclass field set.
-        sample = BenchmarkResult(
+def test_any_request_failure_fails_the_concurrency_but_keeps_evidence(tmp_path):
+    (tmp_path / "profile_export_aiperf.json").write_text(
+        json.dumps(_summary(successful=19, failed=1))
+    )
+
+    result = parse_aiperf_output(
+        artifact_dir=tmp_path,
+        concurrency=24,
+        expected_request_count=20,
+        return_code=0,
+    )
+
+    assert result.failed is True
+    assert result.status == "failed"
+    assert result.attempted_request_count == 20
+    assert result.failed_request_count == 1
+    assert result.failure_rate == 0.05
+    assert result.latency_p50_ms == 164.25
+    assert result.error_summary == [{"count": 1, "message": "HTTP 500"}]
+
+
+def test_missing_or_non_finite_metrics_never_become_fake_zeroes(tmp_path):
+    summary = _summary()
+    summary["request_latency"].pop("p99")
+    summary["request_throughput"]["avg"] = float("nan")
+    (tmp_path / "profile_export_aiperf.json").write_text(json.dumps(summary))
+
+    result = parse_aiperf_output(
+        artifact_dir=tmp_path,
+        concurrency=1,
+        expected_request_count=20,
+        return_code=0,
+    )
+
+    assert result.failed is True
+    assert result.latency_p99_ms is None
+    assert result.request_throughput_rps is None
+    assert "missing_or_non_finite_required_metric" in (result.failure_reason or "")
+
+
+def test_process_failure_is_explicit_non_measurement(tmp_path):
+    result = parse_aiperf_output(
+        artifact_dir=tmp_path,
+        concurrency=1,
+        expected_request_count=20,
+        return_code=2,
+    )
+
+    assert result == BenchmarkResult(
+        concurrency=1,
+        status="failed",
+        artifact_dir=str(tmp_path),
+        failure_reason="aiperf_exit_2",
+        failed=True,
+    )
+    assert result.latency_p50_ms is None
+
+
+def test_unpinned_driver_version_fails_closed(tmp_path):
+    summary = _summary()
+    summary["aiperf_version"] = "0.11.0"
+    (tmp_path / "profile_export_aiperf.json").write_text(json.dumps(summary))
+
+    result = parse_aiperf_output(
+        artifact_dir=tmp_path,
+        concurrency=1,
+        expected_request_count=20,
+        return_code=0,
+    )
+
+    assert result.failed is True
+    assert "driver_version_0.11.0_expected_0.10.0" in (result.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_aiperf_cancellation_uses_shared_cleanup_and_propagates(
+    tmp_path, monkeypatch
+):
+    from vlm_feedback_loop.services import benchmark_adapter
+
+    class FakeProcess:
+        returncode = None
+
+    async def fake_exec(*_args, **_kwargs):
+        return FakeProcess()
+
+    communication = AsyncMock(side_effect=asyncio.CancelledError)
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        benchmark_adapter,
+        "communicate_with_timeout",
+        communication,
+    )
+    input_file = tmp_path / "workload.jsonl"
+    input_file.write_text("{}\n")
+
+    with pytest.raises(asyncio.CancelledError):
+        await AIPerfAdapter().run(
+            base_url="http://127.0.0.1:8001/v1",
+            model="student",
             concurrency=1,
-            latency_p50_ms=10.0,
-            latency_p90_ms=12.0,
-            latency_p99_ms=14.0,
-            ttft_p50_ms=None,
-            ttft_p90_ms=None,
-            itl_p50_ms=None,
-            itl_p90_ms=None,
-            request_count=100,
-            error_count=0,
-            prometheus={},
-            artifact_dir="/tmp",
-            driver="httpx",
-        )
-        keyset = set(sample.to_json().keys())
-        # The contract: both drivers emit exactly this keyset.
-        expected = {
-            "concurrency",
-            "latency_p50_ms",
-            "latency_p90_ms",
-            "latency_p99_ms",
-            "ttft_p50_ms",
-            "ttft_p90_ms",
-            "itl_p50_ms",
-            "itl_p90_ms",
-            "request_count",
-            "error_count",
-            "prometheus",
-            "artifact_dir",
-            "driver",
-            "failed",
-        }
-        assert keyset == expected
-
-
-# ── _percentiles math ────────────────────────────────────────────────────────
-
-
-class TestPercentileMath:
-    def test_empty_returns_zeros(self):
-        p50, p90, p99 = _percentiles([])
-        assert (p50, p90, p99) == (0.0, 0.0, 0.0)
-
-    def test_small_sample_falls_back_to_max(self):
-        # Fewer than 4 samples — quantiles rejects, helper falls back.
-        p50, p90, p99 = _percentiles([10.0, 20.0, 30.0])
-        # Median (p50) is the middle element 20.0; tail percentiles use max.
-        assert p50 == 20.0
-        assert p90 == 30.0
-        assert p99 == 30.0
-
-    def test_uniform_distribution(self):
-        samples = [float(i) for i in range(1, 101)]
-        p50, p90, p99 = _percentiles(samples)
-        # Inclusive method on 100 samples → p50 ≈ 50.5, p90 ≈ 90.1, p99 ≈ 99.01
-        assert 49.0 <= p50 <= 52.0
-        assert 89.0 <= p90 <= 91.0
-        assert 98.0 <= p99 <= 100.0
-
-
-# ── HttpxAdapter end-to-end with mocked NIM ──────────────────────────────────
-
-
-class TestHttpxAdapter:
-    def test_run_writes_artifact_and_returns_result(self, tmp_path, monkeypatch):
-        """Mock the NIM endpoint; assert the adapter calls it the right
-        number of times, emits a BenchmarkResult, and writes result.json.
-        """
-        adapter = HttpxAdapter()
-
-        async def _fake_post(self, url, json=None):
-            # Simulate a successful chat completion.
-            return httpx.Response(
-                200,
-                json={"choices": [{"message": {"content": '{"ok": true}'}}]},
-            )
-
-        monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
-
-        async def _go():
-            return await adapter.run(
-                base_url="http://localhost:8002/v1",
-                model="student-foo",
-                concurrency=2,
-                project_dir=str(tmp_path),
-                student_model_id="abcdef0123456789",
-                request_count=10,
-            )
-
-        result: BenchmarkResult = asyncio.run(_go())
-        assert result.driver == "httpx"
-        assert result.concurrency == 2
-        assert result.request_count == 10
-        assert result.error_count == 0
-        assert result.failed is False  # real measurement
-        # TTFT/ITL not measured by httpx adapter — None.
-        assert result.ttft_p50_ms is None
-        # Artifact file exists.
-        artifact_path = Path(result.artifact_dir) / "result.json"
-        assert artifact_path.exists()
-        text = artifact_path.read_text()
-        # The driver field round-trips through the JSON serialization.
-        assert '"driver": "httpx"' in text
-
-    def test_errors_count_distinct_from_latencies(self, tmp_path, monkeypatch):
-        """Failed responses (e.g. 500) should increment error_count without
-        contaminating the latency samples.
-        """
-        adapter = HttpxAdapter()
-
-        call_index = {"i": 0}
-
-        async def _fake_post(self, url, json=None):
-            i = call_index["i"]
-            call_index["i"] += 1
-            if i % 2 == 0:
-                return httpx.Response(500, json={"error": "boom"})
-            return httpx.Response(
-                200,
-                json={"choices": [{"message": {"content": "ok"}}]},
-            )
-
-        monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
-
-        async def _go():
-            return await adapter.run(
-                base_url="http://localhost:8002/v1",
-                model="student-foo",
-                concurrency=1,
-                project_dir=str(tmp_path),
-                student_model_id="abcdef0123456789",
-                request_count=4,
-            )
-
-        result = asyncio.run(_go())
-        assert result.request_count == 2  # Only successful calls
-        assert result.error_count == 2
-
-    def test_all_requests_error_marks_failed(self, tmp_path, monkeypatch):
-        """Every request failing → zero successful samples is a
-        non-measurement, not a genuine zero-latency result. failed=True so
-        the sweep records the concurrency skipped instead of persisting
-        fake zeros the ServingMatrix would render as valid (the httpx
-        counterpart to genai-perf's process-failure path)."""
-        adapter = HttpxAdapter()
-
-        async def _fake_post(self, url, json=None):
-            return httpx.Response(500, json={"error": "down"})
-
-        monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
-
-        async def _go():
-            return await adapter.run(
-                base_url="http://localhost:8002/v1",
-                model="student-foo",
-                concurrency=1,
-                project_dir=str(tmp_path),
-                student_model_id="abcdef0123456789",
-                request_count=4,
-            )
-
-        result = asyncio.run(_go())
-        assert result.request_count == 0
-        assert result.error_count == 4
-        assert result.failed is True
-        assert result.latency_p50_ms == 0.0
-
-    def test_requests_carry_blueprint_source_header(self, tmp_path, monkeypatch):
-        """Every backend-constructed outbound NIM request carries the
-        {"source": "vlm-feedback-loop"} usage-tracking header — including
-        the benchmark sweep's chat-completions traffic, which bypasses the
-        shared nim_client for latency-measurement fidelity."""
-        adapter = HttpxAdapter()
-        captured_headers = []
-
-        # Patch send (not post) so the client-level default headers are
-        # merged into the built request before capture.
-        async def _fake_send(self, request, **kwargs):
-            captured_headers.append(request.headers)
-            return httpx.Response(
-                200,
-                json={"choices": [{"message": {"content": "ok"}}]},
-                request=request,
-            )
-
-        monkeypatch.setattr(httpx.AsyncClient, "send", _fake_send)
-
-        async def _go():
-            return await adapter.run(
-                base_url="http://localhost:8002/v1",
-                model="student-foo",
-                concurrency=1,
-                project_dir=str(tmp_path),
-                student_model_id="abcdef0123456789",
-                request_count=2,
-            )
-
-        result = asyncio.run(_go())
-        assert result.request_count == 2
-        assert captured_headers
-        for headers in captured_headers:
-            assert headers.get("source") == "vlm-feedback-loop"
-
-
-# ── GenaiPerfAdapter parser ──────────────────────────────────────────────────
-
-
-class TestGenaiPerfParser:
-    def test_parse_succeeds_with_full_output(self, tmp_path):
-        """The parser handles a typical genai-perf JSON output shape."""
-        from vlm_feedback_loop.services.benchmark_adapter import (
-            _parse_genai_perf_output,
+            input_file=input_file,
+            artifact_dir=tmp_path / "artifacts",
+            request_count=1,
         )
 
-        # Simulate genai-perf's output file.
-        output = {
-            "request_latency": {"p50": 100.0, "p90": 200.0, "p99": 300.0},
-            "time_to_first_token": {"p50": 50.0, "p90": 80.0},
-            "inter_token_latency": {"p50": 12.0, "p90": 18.0},
-            "request_count": 100,
-            "error_count": 1,
-        }
-        import json
-
-        artifact_dir = tmp_path / "bench"
-        artifact_dir.mkdir()
-        (artifact_dir / "profile_export_genai_perf.json").write_text(json.dumps(output))
-
-        result = _parse_genai_perf_output(
-            artifact_dir=artifact_dir,
-            concurrency=8,
-            return_code=0,
-        )
-        assert result.driver == "genai-perf"
-        assert result.concurrency == 8
-        assert result.latency_p50_ms == 100.0
-        assert result.latency_p90_ms == 200.0
-        assert result.latency_p99_ms == 300.0
-        assert result.ttft_p50_ms == 50.0
-        assert result.itl_p90_ms == 18.0
-        assert result.request_count == 100
-        assert result.error_count == 1
-        assert result.failed is False
-
-    def test_parse_handles_missing_file(self, tmp_path):
-        from vlm_feedback_loop.services.benchmark_adapter import (
-            _parse_genai_perf_output,
-        )
-
-        artifact_dir = tmp_path / "bench"
-        artifact_dir.mkdir()
-        result = _parse_genai_perf_output(
-            artifact_dir=artifact_dir,
-            concurrency=8,
-            return_code=1,
-        )
-        # Returns a zeroed BenchmarkResult; does not crash. failed=True marks
-        # it as no-measurement so the sweep records the concurrency skipped
-        # instead of persisting fake zeros the UI would render as valid.
-        assert result.latency_p50_ms == 0.0
-        assert result.ttft_p50_ms is None
-        assert result.failed is True
+    communication.assert_awaited_once()

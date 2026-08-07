@@ -50,7 +50,8 @@ import type {
 } from "@/types/nim";
 import { fetchModelConfigs, updateProject } from "@/api/model-configs";
 import { localNimKeys, modelConfigKeys, projectKeys } from "@/api/query-keys";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useEnvironmentSetupContext } from "@/pages/setup-context";
+import { SetupTransitionCard } from "@/components/common/SetupTransitionCard";
 import { LOCAL_NIM_POLL_INTERVAL_MS, latestPerRole } from "@/lib/local-nim";
 import { formatModelDisplayName, localTeacherDisplayName } from "@/lib/model-display";
 import { runStatusRefetchInterval } from "@/lib/run-status-polling";
@@ -97,7 +98,7 @@ function statusSuffix(deployment: LocalNimDeploymentResponse | undefined): strin
 }
 
 export function NIMSetupGatePage(): JSX.Element {
-  const { projectId, environment } = useSetupContext();
+  const { projectId, environment } = useEnvironmentSetupContext();
   const navigate = useNavigate();
   const location = useLocation();
   const queryClient = useQueryClient();
@@ -230,7 +231,10 @@ export function NIMSetupGatePage(): JSX.Element {
         void queryClient.invalidateQueries({
           queryKey: projectKeys.detail(projectId),
         });
-        navigate("../confirm-defaults", { replace: true });
+        navigate("../confirm-defaults", {
+          replace: true,
+          state: { activePath, cameFromAutoSkip, localDeployQueued },
+        });
       });
   }, [
     cameFromAutoSkip,
@@ -238,6 +242,7 @@ export function NIMSetupGatePage(): JSX.Element {
     env.recommended_embedding_mode,
     env.embedding_deployment.provider,
     localDeployQueued,
+    activePath,
     navigate,
     projectId,
     queryClient,
@@ -373,7 +378,15 @@ export function NIMSetupGatePage(): JSX.Element {
     compatibleTeacherResident,
   ]);
 
-  if (cameFromAutoSkip) return <></>;
+  if (cameFromAutoSkip) {
+    return (
+      <SetupTransitionCard
+        title="Finishing project setup…"
+        description="Saving the selected model configuration. You'll continue automatically."
+        testId="setup-gate-auto-skip-transition"
+      />
+    );
+  }
 
   /**
    * Result returned by ``dispatchLocalDeploys``. When the Teacher
@@ -586,7 +599,9 @@ export function NIMSetupGatePage(): JSX.Element {
       console.warn("mark_setup_completed (manual 2C) failed:", err);
     } finally {
       if (!blockedByGpuGate) {
-        navigate("../confirm-defaults");
+        navigate("../confirm-defaults", {
+          state: { activePath, cameFromAutoSkip, localDeployQueued },
+        });
       }
     }
   }
@@ -613,7 +628,10 @@ export function NIMSetupGatePage(): JSX.Element {
 
   return (
     <div className="flex flex-1 flex-col items-center justify-center p-6">
-      <div className="glass-card--elevated flex w-full max-w-[640px] flex-col gap-6 p-8">
+      <div
+        className="glass-card glass-card--elevated flex w-full max-w-[640px] flex-col gap-6 p-8"
+        data-testid="setup-gate-card"
+      >
         <div className="flex flex-col gap-3">
           <div className="flex items-center gap-3">
             <span

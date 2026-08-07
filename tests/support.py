@@ -326,7 +326,7 @@ def seed_hosted_teacher_project(
                 test_pool_fraction=0.0,
                 scaleup_exact_match_threshold=0.80,
                 scaleup_per_field_match_threshold=0.80,
-                scaleup_min_per_value_f1_threshold=0.80,
+                scaleup_min_per_value_f1_threshold=0.60,
                 scaleup_accept_rate_threshold=0.80,
                 scaleup_accept_rate_window=50,
                 scaleup_min_test_pool_size=20,

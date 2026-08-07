@@ -32,18 +32,13 @@ from vlm_feedback_loop.db.models.example import Example
 
 # Supported image extensions — canonical set lives in
 # ``image_transport``; re-exported here for the browse/ingest call sites.
+from vlm_feedback_loop.services.authorized_file import check_image_access_allowed
 from vlm_feedback_loop.services.image_transport import SUPPORTED_IMAGE_EXTENSIONS
 from vlm_feedback_loop.services.project_service import get_project_engine
 
 logger = logging.getLogger("vlm_feedback_loop.filesystem")
 
 # ── Security helpers ────────────────────────────────────────────────────────
-
-_LOOPBACK_ADDRESSES = frozenset({"127.0.0.1", "::1", "localhost"})
-
-
-def _is_loopback(bind_host: str) -> bool:
-    return bind_host in _LOOPBACK_ADDRESSES
 
 
 def check_browse_allowed(settings: Settings) -> str | None:
@@ -56,11 +51,10 @@ def check_browse_allowed(settings: Settings) -> str | None:
     networked container is correctly treated as non-loopback and must
     configure ``IMAGE_ROOT``.
     """
-    if settings.IMAGE_ROOT is None and not _is_loopback(settings.BIND_HOST):
+    if check_image_access_allowed(settings) is not None:
         return (
             "Filesystem browsing is disabled. Configure IMAGE_ROOT to allow "
-            "browsing when the "
-            "backend is network-accessible."
+            "browsing when the backend is network-accessible."
         )
     return None
 
@@ -231,9 +225,10 @@ def _resolve_bundled_sample_path(settings: Settings) -> str | None:
     """Return the shipped RPS sample when it is readable and in scope.
 
     Compose mounts the sample itself as ``IMAGE_ROOT=/data/images``. Source
-    mode leaves ``IMAGE_ROOT`` unset, so the repository-relative candidate is
-    available without making the SME navigate from ``/``. A configured custom
-    root remains authoritative: repository data outside it is never offered.
+    mode leaves ``IMAGE_ROOT`` unset, so the repository-relative candidate lets
+    the UI start beside it without changing the unrestricted ``/`` boundary. A
+    configured custom root remains authoritative: repository data outside it
+    is never offered.
     """
     candidates: list[Path] = []
     if settings.IMAGE_ROOT is not None:
@@ -267,17 +262,17 @@ def _resolve_bundled_sample_path(settings: Settings) -> str | None:
 _SLUG_CLEAN = re.compile(r"[^a-zA-Z0-9_-]+")
 
 
-def _generate_example_key(relative_path: str) -> str:
+def _generate_example_key(canonical_path: str) -> str:
     """Generate a deterministic, collision-resistant example key.
 
     Rule:
-      1. Normalize relative path to POSIX form.
-      2. Build slug from relative path without extension, replacing path
+      1. Normalize the canonical path to POSIX form.
+      2. Build slug from the canonical path without extension, replacing path
          separators with ``_``.
-      3. ``hash12 = first_12_hex(sha256(relative_path_with_extension_normalized))``.
+      3. ``hash12 = first_12_hex(sha256(canonical_path_with_extension))``.
       4. ``suggested_example_key = "{slug}--{hash12}"``.
     """
-    posix = PurePosixPath(relative_path)
+    posix = PurePosixPath(canonical_path)
     stem_path = str(posix.with_suffix(""))  # relative path without extension
     slug = _SLUG_CLEAN.sub("_", stem_path).strip("_")
 
@@ -286,6 +281,21 @@ def _generate_example_key(relative_path: str) -> str:
     hash12 = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()[:12]
 
     return f"{slug}--{hash12}"
+
+
+def _canonical_key_path(file_path: Path, settings: Settings) -> str:
+    """Return the scan-root-independent path identity used for example keys.
+
+    A configured ``IMAGE_ROOT`` is the stable deployment boundary, so keys use
+    paths relative to it. Loopback development may intentionally omit that
+    boundary; there the normalized absolute path is the only identity that
+    remains stable when the same file is scanned from different directories.
+    """
+    resolved_file = file_path.resolve(strict=False)
+    if settings.IMAGE_ROOT is not None:
+        resolved_root = Path(settings.IMAGE_ROOT).resolve(strict=False)
+        return str(PurePosixPath(resolved_file.relative_to(resolved_root)))
+    return str(PurePosixPath(resolved_file))
 
 
 def scan_directory(
@@ -349,6 +359,7 @@ def scan_directory(
 
     # Load existing keys for collision checking
     existing_keys: dict[str, str] = {}  # example_key → storage_ref
+    existing_paths: dict[str, str] = {}  # storage_ref → example_key
     if project_id and workspace_root:
         engine = get_project_engine(project_id, workspace_root)
         if engine is not None:
@@ -359,6 +370,7 @@ def scan_directory(
                     )
                 ).all()
                 existing_keys = {row[0]: row[1] for row in rows}
+                existing_paths = {row[1]: row[0] for row in rows}
 
     total_collisions = 0
 
@@ -368,15 +380,8 @@ def scan_directory(
             skipped.append({"path": str(fp), "reason": "unsupported_format"})
             continue
 
-        # Relative path within the scanned root
-        try:
-            rel = fp.relative_to(target)
-        except ValueError:
-            skipped.append({"path": str(fp), "reason": "path_error"})
-            continue
-
-        relative_str = str(PurePosixPath(rel))
-        suggested_key = _generate_example_key(relative_str)
+        canonical_key_path = _canonical_key_path(fp, settings)
+        suggested_key = _generate_example_key(canonical_key_path)
         storage_ref = str(fp)
         size_bytes = fp.stat().st_size
 
@@ -384,7 +389,13 @@ def scan_directory(
         key_status = "available"
         existing_storage_ref: str | None = None
 
-        if project_id and suggested_key in existing_keys:
+        if project_id and storage_ref in existing_paths:
+            # Existing projects may contain keys generated by an older scan
+            # root. Path identity still wins: never offer the same source
+            # image for ingestion under a second key.
+            suggested_key = existing_paths[storage_ref]
+            key_status = "already_exists_same_path"
+        elif project_id and suggested_key in existing_keys:
             if existing_keys[suggested_key] == storage_ref:
                 key_status = "already_exists_same_path"
             else:

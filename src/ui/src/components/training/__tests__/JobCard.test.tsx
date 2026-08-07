@@ -6,7 +6,13 @@ import { render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import type { TAOJob, TAOJobStatus, TrainingSuiteJob } from "@/types/training";
-import { JobCard, humanizeFailureReason, splitClassifiedFailure } from "../JobCard";
+import {
+  humanizeFailureReason,
+  humanizeHaltedReason,
+  splitClassifiedFailure,
+} from "@/lib/training/failure-display";
+import { isTAOJobPollingSettled } from "@/lib/run-status-polling";
+import { JobCard } from "../JobCard";
 
 vi.mock("@/api/training", () => ({
   getTAOJob: vi.fn(),
@@ -33,6 +39,8 @@ function makeJob(status: TAOJobStatus, extras: Partial<TAOJob> = {}): TAOJob {
     tao_external_job_id: "ext-j-1",
     progress: null,
     outputs: null,
+    outputs_fetch_status: status === "succeeded" ? "completed" : "pending",
+    outputs_fetch_error_ref: null,
     parent_tao_job_id: null,
     chain_id: "chain-8b",
     chain_sequence: 1,
@@ -48,7 +56,11 @@ function makeJob(status: TAOJobStatus, extras: Partial<TAOJob> = {}): TAOJob {
   };
 }
 
-function renderCard(status: TAOJobStatus, extras: Partial<TAOJob> = {}) {
+function renderCard(
+  status: TAOJobStatus,
+  extras: Partial<TAOJob> = {},
+  onOpenCompare?: () => void,
+) {
   mockGetJob.mockResolvedValue(makeJob(status, extras));
   const suiteJob: TrainingSuiteJob = {
     tao_job_id: "j-1",
@@ -57,13 +69,16 @@ function renderCard(status: TAOJobStatus, extras: Partial<TAOJob> = {}) {
     status,
     tao_external_job_id: "ext-j-1",
     chain_halted_reason: null,
+    outputs_fetch_status:
+      extras.outputs_fetch_status ?? (status === "succeeded" ? "completed" : "pending"),
+    outputs_fetch_error_ref: extras.outputs_fetch_error_ref ?? null,
   };
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: 0, staleTime: 0 } },
   });
   return render(
     <QueryClientProvider client={qc}>
-      <JobCard projectId="pid-1" suiteJob={suiteJob} />
+      <JobCard projectId="pid-1" suiteJob={suiteJob} onOpenCompare={onOpenCompare} />
     </QueryClientProvider>,
   );
 }
@@ -161,7 +176,21 @@ describe("JobCard state bodies", () => {
     expect(card.textContent).not.toContain("—");
   });
 
-  it("outputs block maps known artifact keys to friendly labels and passes unknown names through", async () => {
+  it("explains an intentionally omitted evaluation instead of calling it canceled", async () => {
+    renderCard("canceled", {
+      action: "evaluate",
+      chain_halted_reason:
+        "auto-skip: action=evaluate auto-skipped; Student quality uses local NIM",
+    });
+
+    await screen.findByText("Not Required");
+    const card = screen.getByTestId("training-job-card-j-1");
+    expect(card).toHaveTextContent("Not Required");
+    expect(card).toHaveTextContent("local Student NIM quality");
+    expect(card).not.toHaveTextContent("Canceled");
+  });
+
+  it("does not expose backend training artifact references", async () => {
     renderCard("succeeded", {
       completed_at: "2026-04-17T11:45:00Z",
       outputs: {
@@ -174,13 +203,52 @@ describe("JobCard state bodies", () => {
         metrics_ref: "/art/metrics.json",
       },
     });
-    const outputs = await screen.findByTestId("training-job-outputs");
-    expect(outputs.textContent).toContain("Best model");
-    expect(outputs.textContent).toContain("Metrics");
-    expect(outputs.textContent).toContain("evaluate_results.tar.gz");
-    expect(outputs.textContent).not.toContain("best_model");
-    expect(outputs.textContent).not.toContain("metrics_ref");
-    expect(outputs.textContent).toContain("/art/metrics.json");
+    await screen.findByText(/^Completed:/);
+    expect(screen.queryByText("/art/best.pth")).toBeNull();
+    expect(screen.queryByText("/art/metrics.json")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Download" })).toBeNull();
+  });
+
+  it("shows artifact finalization as active after TAO reports success", async () => {
+    renderCard("succeeded", {
+      outputs_fetch_status: "in_progress",
+      completed_at: "2026-04-17T11:45:00Z",
+    });
+
+    expect(await screen.findByText("Finalizing")).toBeTruthy();
+    expect(
+      screen.getByTestId("training-job-finalizing-artifacts").textContent,
+    ).toContain("retrieving and processing artifacts");
+    expect(screen.queryByText(/^Completed:/)).toBeNull();
+  });
+
+  it("surfaces artifact-processing failure separately from TAO success", async () => {
+    renderCard("succeeded", {
+      outputs_fetch_status: "failed",
+      outputs_fetch_error_ref: "workspace S3 download failed",
+    });
+
+    expect(await screen.findByText("Artifact Failed")).toBeTruthy();
+    const body = screen.getByTestId("training-job-artifact-failed");
+    expect(body.textContent).toContain("TAO completed");
+    expect(body.textContent).toContain("workspace S3 download failed");
+    expect(screen.getByText("Report TAO Issue")).toBeTruthy();
+  });
+
+  it("keeps polling a succeeded job until post-success processing is terminal", () => {
+    expect(
+      isTAOJobPollingSettled(
+        makeJob("succeeded", { outputs_fetch_status: "in_progress" }),
+      ),
+    ).toBe(false);
+    expect(
+      isTAOJobPollingSettled(
+        makeJob("succeeded", { outputs_fetch_status: "completed" }),
+      ),
+    ).toBe(true);
+    expect(
+      isTAOJobPollingSettled(makeJob("succeeded", { outputs_fetch_status: "failed" })),
+    ).toBe(true);
   });
 
   it("identifies a Blueprint-merged local Student NIM baseline evaluation", async () => {
@@ -191,11 +259,9 @@ describe("JobCard state bodies", () => {
         evaluation_run_id: "run-local-baseline",
       },
     });
-    const outputs = await screen.findByTestId("training-job-outputs");
-    expect(outputs.textContent).toContain("Evaluation source");
-    expect(outputs.textContent).toContain("Merged checkpoint · local Student NIM");
-    expect(outputs.textContent).toContain("Evaluation run");
-    expect(outputs.textContent).toContain("run-local-baseline");
+    const result = await screen.findByTestId("training-job-result");
+    expect(result.textContent).toContain("Local Student NIM evaluation");
+    expect(result.textContent).toContain("run-local-baseline");
   });
 
   it("failed card renders a friendly reason for bare-token error_refs, never raw snake_case", async () => {
@@ -203,6 +269,27 @@ describe("JobCard state bodies", () => {
     await screen.findByText(/Submission interrupted/);
     const body = screen.getByTestId("training-job-failed-body");
     expect(body.textContent).not.toContain("submission_interrupted");
+  });
+
+  it("routes a Blueprint-local Student NIM failure to Compare instead of reporting TAO", async () => {
+    const onOpenCompare = vi.fn();
+    renderCard(
+      "failed",
+      {
+        training_backend: "student_nim_local",
+        error_ref: "student_nim_evaluation_failed",
+        outputs: { student_model_id: "student-1" },
+      },
+      onOpenCompare,
+    );
+
+    const openCompare = await screen.findByTestId("training-job-open-compare");
+    expect(screen.getByTestId("training-job-failed-body").textContent).toContain(
+      "Student NIM serving validation failed",
+    );
+    expect(screen.queryByText("Report TAO Issue")).toBeNull();
+    openCompare.click();
+    expect(onOpenCompare).toHaveBeenCalledOnce();
   });
 });
 
@@ -213,6 +300,12 @@ describe("humanizeFailureReason", () => {
     );
   });
 
+  it("renders TAO quality failure tokens as SME-facing copy", () => {
+    expect(humanizeFailureReason("tao_evaluate_failed")).toBe(
+      "TAO quality evaluation failed.",
+    );
+  });
+
   it("humanizes unknown snake_case tokens via underscore→space + sentence case", () => {
     expect(humanizeFailureReason("worker_disk_full")).toBe("Worker disk full");
   });
@@ -220,6 +313,30 @@ describe("humanizeFailureReason", () => {
   it("passes full-sentence provider messages through unchanged", () => {
     const msg = "CUDA out of memory on GPU 3. Reduce batch size or use larger GPU.";
     expect(humanizeFailureReason(msg)).toBe(msg);
+  });
+
+  it("removes transport escaping around quotes in provider messages", () => {
+    expect(humanizeFailureReason("parameter can\\'t contain a period")).toBe(
+      "parameter can't contain a period",
+    );
+  });
+});
+
+describe("humanizeHaltedReason", () => {
+  it("removes internal chain sequence and job IDs", () => {
+    expect(
+      humanizeHaltedReason(
+        "Chain halted: train (seq 1, id=721dc8fe-1209-4040-82f0-8ba69c0ff253) reached terminal 'failed'",
+      ),
+    ).toBe("Chain halted: train failed.");
+  });
+
+  it("removes bookkeeping IDs from non-failure halt outcomes", () => {
+    expect(
+      humanizeHaltedReason(
+        "Chain halted: evaluate (seq 2, id=09de3bac-42e5-41c7-b384-045954fe3f17) canceled by SME",
+      ),
+    ).toBe("Chain halted: evaluate canceled by SME.");
   });
 });
 

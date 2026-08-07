@@ -3,19 +3,18 @@
 
 """Cold-start live smoke for the Interactive Loop, per hosted Teacher.
 
-Drives the smallest viable cold-start path on each of the four hosted
-Teachers (Mistral default, Qwen alternate, Nemotron Omni alternate, Nemotron
-alternate) and verifies the ICL attachment invariant (``icl_images_attached_count
-== len(icl_example_keys_used)``) holds when ICL transitions from zero
-examples to one example.
+Drives the smallest viable cold-start path across the current hosted Teacher
+matrix (the commercially permitted seeded hosted Teachers) and
+verifies the ICL attachment invariant (``icl_images_attached_count ==
+len(icl_example_keys_used)``) holds when ICL transitions from zero examples to
+one example.
 
 For each Teacher::
 
     1. Create a fresh project (Verified=0).
     2. Patch ``teacher_model_config_id`` to the target.
     3. Save the RPS Guidance.
-    4. Synthesize two distinct PNGs (one rock-styled, one paper-styled);
-       ingest both by absolute path.
+    4. Ingest one rock and one paper image from the canonical RPS smoke data.
     5. First proposal — assert ``invocation_status=success`` and
        ``icl_images_attached_count=0`` (cold start: no ICL).
     6. Save with ``rationale_source="sme_edited"`` and a corrected label
@@ -24,14 +23,16 @@ For each Teacher::
        ``len(icl_example_keys_used) == 1``, ``icl_images_attached_count == 1``,
        and ``prompt_hash`` non-null on the persisted OperationRecord.
 
-Because the SECOND proposal must carry the just-saved Edit as ICL,
-this catches "we assume ICL >= 1 somewhere" regressions and the
-load-bearing transition from cold start to first-edit-in-context.
+Because the SECOND proposal must carry the just-saved Edit as ICL, this catches
+"we assume ICL >= 1 somewhere" regressions and the load-bearing transition from
+cold start to first-edit-in-context. The final OperationRecord assertion reads
+``project.db`` directly, so run this harness against a local-source backend on
+the same host; it is not a Compose/remote-backend smoke.
 
 Usage::
 
     uv run python scripts/cold_start_smoke.py
-    uv run python scripts/cold_start_smoke.py --teachers mistral
+    uv run python scripts/cold_start_smoke.py --teachers step
 """
 
 from __future__ import annotations
@@ -48,7 +49,13 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from PIL import Image, ImageDraw
+
+from vlm_feedback_loop.model_catalog_constants import (
+    MISTRAL_MEDIUM_3_5,
+    NEMOTRON_3_NANO_OMNI_REASONING,
+    NEMOTRON_NANO_12B_VL,
+    STEP_3_7_FLASH,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_helpers import (  # noqa: E402
@@ -58,38 +65,25 @@ from smoke_helpers import (  # noqa: E402
 )
 
 BACKEND_URL = "http://127.0.0.1:8000"
-
-
-def _resolve_workspace_root() -> Path:
-    """Match the live backend's workspace: env override, then the operator's
-    config.yaml, then the historical /tmp default."""
-    env = os.environ.get("WORKSPACE_ROOT")
-    if env:
-        return Path(env)
-    config = Path.home() / ".vlm_feedback_loop" / "config.yaml"
-    if config.exists():
-        for line in config.read_text().splitlines():
-            if line.startswith("WORKSPACE_ROOT:"):
-                return Path(line.split(":", 1)[1].strip())
-    return Path("/tmp/vlm_workspace")
-
-
-WORKSPACE_ROOT = _resolve_workspace_root()
+DEFAULT_RPS_ROOT = Path(
+    os.environ.get("RPS_TEST_SET_ROOT", "~/rps-test-set")
+).expanduser()
+RPS_RELATIVE_IMAGES: tuple[tuple[str, Path], ...] = (
+    ("rock", Path("rock/testrock01-00.png")),
+    ("paper", Path("paper/testpaper01-00.png")),
+)
 
 TEACHER_LOOKUP: dict[str, str] = {
-    "mistral": "mistralai/mistral-large-3-675b-instruct-2512",
-    "qwen": "qwen/qwen3.5-397b-a17b",
-    "omni": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-    "nemotron": "nvidia/nemotron-nano-12b-v2-vl",
+    "step": STEP_3_7_FLASH,
+    "mistral_medium": MISTRAL_MEDIUM_3_5,
+    "nemotron": NEMOTRON_NANO_12B_VL,
+    "omni": NEMOTRON_3_NANO_OMNI_REASONING,
 }
+DEFAULT_TEACHERS = ",".join(TEACHER_LOOKUP)
 
-# Two distinct synthetic images so the Edit is forced (proposal will
-# probably get the gesture wrong on a stylized synthetic gesture, and
-# even if it doesn't, we submit a different rationale to force Edit).
 GUIDANCE_BODY: dict[str, Any] = {
     "description": (
-        "Determine if the hand depicted is a rock, paper, or scissors "
-        "gesture. The image is a stylized illustration."
+        "Determine if the hand depicted is a rock, paper, or scissors gesture."
     ),
     "rules": "",
     "schema": [
@@ -115,6 +109,7 @@ class TeacherColdStartReport:
     teacher_label: str
     teacher_model_name: str
     project_id: str | None = None
+    project_dir: Path | None = None
     stages: list[StageResult] = field(default_factory=list)
 
     def add(
@@ -128,25 +123,27 @@ class TeacherColdStartReport:
         return all(s.ok for s in self.stages)
 
 
-def _synth_image(out_path: Path, label: str, color: tuple[int, int, int]) -> None:
-    """Create a deterministic 256x256 PNG with a styled gesture marker."""
-    img = Image.new("RGB", (256, 256), color=(240, 240, 240))
-    draw = ImageDraw.Draw(img)
-    if label == "rock":
-        draw.ellipse([(40, 40), (216, 216)], fill=color)
-    elif label == "paper":
-        draw.rectangle([(40, 40), (216, 216)], fill=color)
-    elif label == "scissors":
-        draw.polygon([(128, 30), (40, 220), (216, 220)], fill=color)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(out_path, "PNG")
+def _resolve_rps_images(rps_root: Path) -> list[tuple[str, Path]]:
+    """Resolve the two real RPS fixtures without writing outside IMAGE_ROOT."""
+    root = rps_root.expanduser().resolve()
+    resolved = [
+        (label, (root / relative).resolve()) for label, relative in RPS_RELATIVE_IMAGES
+    ]
+    missing = [str(path) for _, path in resolved if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "cold-start RPS image(s) missing: "
+            + ", ".join(missing)
+            + "; set --rps-root or RPS_TEST_SET_ROOT"
+        )
+    return resolved
 
 
 def _read_operation_record(
-    project_id: str, inference_invocation_id: str
+    project_dir: Path, inference_invocation_id: str
 ) -> dict[str, Any] | None:
-    """Read OperationRecord directly from the project SQLite DB."""
-    db_path = WORKSPACE_ROOT / "projects" / project_id / "project.db"
+    """Read an OperationRecord from the API-reported local project directory."""
+    db_path = project_dir / "project.db"
     if not db_path.exists():
         return None
     conn = sqlite3.connect(str(db_path))
@@ -162,7 +159,10 @@ def _read_operation_record(
 
 
 async def _smoke_one(
-    client: httpx.AsyncClient, teacher_label: str, teacher_model: str
+    client: httpx.AsyncClient,
+    teacher_label: str,
+    teacher_model: str,
+    rps_images: list[tuple[str, Path]],
 ) -> TeacherColdStartReport:
     report = TeacherColdStartReport(
         teacher_label=teacher_label, teacher_model_name=teacher_model
@@ -180,9 +180,16 @@ async def _smoke_one(
     if r.status_code != 201:
         report.add("create_project", False, f"HTTP {r.status_code}: {r.text[:200]}", t0)
         return report
-    project_id = r.json()["project_id"]
+    project_payload = r.json()
+    project_id = project_payload["project_id"]
     report.project_id = project_id
-    report.add("create_project", True, f"project_id={project_id}", t0)
+    report.project_dir = Path(project_payload["project_dir"])
+    report.add(
+        "create_project",
+        True,
+        f"project_id={project_id} project_dir={report.project_dir}",
+        t0,
+    )
 
     # ─ Stage 2: switch teacher ──────────────────────────────────────────
     t0 = time.monotonic()
@@ -225,22 +232,18 @@ async def _smoke_one(
         return report
     report.add("save_guidance", True, f"guidance_id={guidance_id}", t0)
 
-    # ─ Stage 4: synthesize + ingest 2 images ────────────────────────────
+    # ─ Stage 4: ingest 2 canonical RPS images ──────────────────────────
     t0 = time.monotonic()
-    img_dir = Path(f"/tmp/vlm_smoke_imgs/{project_id}")
-    paths = [
-        (img_dir / "img_rock.png", "rock", (180, 80, 80)),
-        (img_dir / "img_paper.png", "paper", (80, 180, 80)),
-    ]
-    for p, lbl, color in paths:
-        _synth_image(p, lbl, color)
     items = [
         {
             "example_key": f"cold_{lbl}",
             "storage_ref": str(p),
-            "source_metadata": {"ground_truth_class": lbl, "synth": True},
+            "source_metadata": {
+                "dataset": "rps-test-set",
+                "ground_truth_class": lbl,
+            },
         }
-        for p, lbl, _ in paths
+        for lbl, p in rps_images
     ]
     r = await client.post(
         f"{BACKEND_URL}/v1/projects/{project_id}/examples:ingest",
@@ -319,9 +322,7 @@ async def _smoke_one(
     t0 = time.monotonic()
     gt_first = "rock" if first_key == "cold_rock" else "paper"
     label_body = {
-        "rationale_note": (
-            f"Stylized {gt_first} gesture. Verified ground truth from synthetic fixture."
-        ),
+        "rationale_note": (f"Verified {gt_first} gesture from the RPS smoke dataset."),
         "category": gt_first,
     }
     save = await client.post(
@@ -422,7 +423,8 @@ async def _smoke_one(
         return report
 
     # ─ DB-level audit: confirm prompt_hash persisted on second proposal ─
-    rec = _read_operation_record(project_id, inv_2)
+    assert report.project_dir is not None
+    rec = _read_operation_record(report.project_dir, inv_2)
     prompt_hash = (rec or {}).get("prompt_hash")
     if not prompt_hash:
         report.add(
@@ -447,14 +449,31 @@ async def amain(argv: list[str]) -> int:
     parser.add_argument(
         "--teachers",
         type=str,
-        default="mistral,qwen,omni,nemotron",
-        help="Comma list of teacher labels",
+        default=DEFAULT_TEACHERS,
+        help=(
+            f"Comma list of hosted Teacher labels (default: {DEFAULT_TEACHERS}). "
+            "The DB audit requires a local-source backend on this host."
+        ),
+    )
+    parser.add_argument(
+        "--rps-root",
+        type=Path,
+        default=DEFAULT_RPS_ROOT,
+        help=(
+            "Canonical RPS dataset root visible beneath the backend IMAGE_ROOT "
+            f"(default: {DEFAULT_RPS_ROOT}; env: RPS_TEST_SET_ROOT)."
+        ),
     )
     args = parser.parse_args(argv)
     requested = [t.strip() for t in args.teachers.split(",") if t.strip()]
     unknown = [t for t in requested if t not in TEACHER_LOOKUP]
     if unknown:
         print(f"unknown teacher labels: {unknown}", file=sys.stderr)
+        return 2
+    try:
+        rps_images = _resolve_rps_images(args.rps_root)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
 
     reports: list[TeacherColdStartReport] = []
@@ -465,7 +484,7 @@ async def amain(argv: list[str]) -> int:
             print(f"Backend not reachable: {exc}", file=sys.stderr)
             return 1
         for label in requested:
-            r = await _smoke_one(client, label, TEACHER_LOOKUP[label])
+            r = await _smoke_one(client, label, TEACHER_LOOKUP[label], rps_images)
             reports.append(r)
 
     print("\n" + "─" * 72)

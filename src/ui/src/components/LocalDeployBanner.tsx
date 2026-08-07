@@ -17,9 +17,8 @@
  *      starting/running deploy for that role superseding it. Friendly
  *      message for ``401 unauthorized`` (almost always a bad NGC key);
  *      generic "Deploy failed" with the short reason for everything
- *      else. Always carries a [Reconfigure NIM] CTA so the SME has a
- *      one-click path to ``/projects/:id/settings/nim`` where they can
- *      re-paste the key and retry.
+ *      else. Teacher/embedding failures link to NIM configuration;
+ *      temporary Student-validation failures link back to Compare.
  *
  *      Two staleness guards (a failure banner must not outlive
  *      its truth): (a) failures whose model config the project's active
@@ -43,7 +42,8 @@ import { Button, Spinner, Text } from "@kui/react";
 import { AlertTriangle } from "lucide-react";
 
 import { listLocalNimDeployments } from "@/api/nim";
-import { localNimKeys } from "@/api/query-keys";
+import { listStudentModels } from "@/api/students";
+import { localNimKeys, studentModelKeys } from "@/api/query-keys";
 import { LOCAL_NIM_POLL_INTERVAL_MS, latestPerRole } from "@/lib/local-nim";
 import type { LocalNimDeploymentResponse } from "@/types/nim";
 
@@ -97,6 +97,20 @@ function friendlyReason(deployment: LocalNimDeploymentResponse): string {
   return head.length > 160 ? `${head.slice(0, 160)}…` : head;
 }
 
+function startingDetail(deployments: LocalNimDeploymentResponse[]): string {
+  if (deployments.length !== 1) {
+    return "project services update as each becomes ready";
+  }
+  switch (deployments[0].role) {
+    case "student":
+      return "temporary serving validation is running; Compare updates when complete";
+    case "embedding":
+      return "image-similarity review activates once ready";
+    default:
+      return "switchable from the Teacher picker once ready";
+  }
+}
+
 export function LocalDeployBanner(): JSX.Element | null {
   const match = useMatch("/projects/:projectId/*");
   const projectId = match?.params.projectId;
@@ -114,6 +128,21 @@ export function LocalDeployBanner(): JSX.Element | null {
 
   const items = query.data?.items;
 
+  // A Student lifecycle becomes durable before its local-NIM deployment row
+  // exists: preflight runs first, then the container deployment is recorded.
+  // Reuse the Compare cache so an older failed Student deployment cannot flash
+  // as current while that newer, backend-authoritative lifecycle is pending.
+  const studentQuery = useQuery({
+    queryKey: studentModelKeys.list(projectId ?? ""),
+    queryFn: () => listStudentModels(projectId ?? "", { limit: 200 }),
+    enabled: projectId !== undefined,
+    refetchInterval: LOCAL_NIM_POLL_INTERVAL_MS,
+    staleTime: LOCAL_NIM_POLL_INTERVAL_MS / 2,
+  });
+  const hasPendingStudent = studentQuery.data?.items.some(
+    (student) => student.serving_status === "pending",
+  );
+
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(readDismissedIds);
 
   const { starting, failed } = useMemo(() => {
@@ -123,13 +152,16 @@ export function LocalDeployBanner(): JSX.Element | null {
       failed: latest.filter(
         (d) =>
           d.status === "failed" &&
+          // Student lifecycle authority precedes its local deployment row.
+          // Suppress an older failure while a newer lifecycle is in preflight.
+          !(d.role === "student" && hasPendingStudent) &&
           // Staleness guard (a): the active role config moved on — stale evidence.
           d.matches_active_role_config !== false &&
           // Staleness guard (b): explicitly dismissed by the SME.
           !dismissedIds.has(d.local_nim_deployment_id),
       ),
     };
-  }, [items, dismissedIds]);
+  }, [items, dismissedIds, hasPendingStudent]);
 
   const dismissFailed = useCallback(() => {
     setDismissedIds((prev) => {
@@ -158,6 +190,7 @@ export function LocalDeployBanner(): JSX.Element | null {
   // starting. (In practice they tend to fail together — same key.)
   if (failed.length > 0) {
     const firstFailed = failed[0];
+    const studentFailure = firstFailed.role === "student";
     const label =
       failed.length === 1
         ? `${shortModelName(firstFailed.nim_container_image)} deploy failed`
@@ -186,10 +219,16 @@ export function LocalDeployBanner(): JSX.Element | null {
         </Text>
         <Button
           kind="tertiary"
-          onClick={() => navigate(`/projects/${projectId}/settings/nim`)}
+          onClick={() =>
+            navigate(
+              studentFailure
+                ? `/projects/${projectId}/compare`
+                : `/projects/${projectId}/settings/nim`,
+            )
+          }
           data-testid="local-deploy-banner-fix-cta"
         >
-          Reconfigure NIM
+          {studentFailure ? "Open Compare" : "Reconfigure NIM"}
         </Button>
         <Button
           kind="tertiary"
@@ -215,7 +254,11 @@ export function LocalDeployBanner(): JSX.Element | null {
 
   const label =
     starting.length === 1
-      ? `${shortModelName(starting[0].nim_container_image)} deploying`
+      ? starting[0].role === "student"
+        ? "Student NIM deploying"
+        : starting[0].role === "embedding"
+          ? "Embedding NIM deploying"
+          : `${shortModelName(starting[0].nim_container_image)} deploying`
       : `${starting.length} local NIMs deploying`;
 
   return (
@@ -235,8 +278,7 @@ export function LocalDeployBanner(): JSX.Element | null {
         {label}
       </Text>
       <Text kind="body/regular/sm" style={{ color: "var(--text-muted)" }}>
-        · {formatElapsed(elapsedSec)} elapsed · switchable from the Teacher picker once
-        ready
+        · {formatElapsed(elapsedSec)} elapsed · {startingDetail(starting)}
       </Text>
     </div>
   );

@@ -347,6 +347,109 @@ class TestTypeValidation:
         settings = load_settings()
         assert settings.STUDENT_LATENCY_TEST_CONCURRENCIES == [2, 4, 8]
 
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "EMBEDDING_DIM",
+            "EMBEDDING_CONCURRENCY_HOSTED",
+            "EMBEDDING_BATCH_SIZE_HOSTED",
+            "EMBEDDING_CONCURRENCY_SELF_HOSTED",
+            "EMBEDDING_BATCH_SIZE_SELF_HOSTED",
+            "ICL_MAX_EXAMPLES",
+            "BATCH_LABEL_RUN_LIMIT",
+            "BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD",
+            "BATCH_LABEL_CONCURRENCY_HOSTED",
+            "BATCH_LABEL_CONCURRENCY_SELF_HOSTED",
+            "EVAL_CONCURRENCY_HOSTED",
+            "EVAL_CONCURRENCY_SELF_HOSTED",
+            "NIM_STARTUP_TIMEOUT_S",
+            "NIM_BENCHMARK_TIMEOUT_S",
+            "HTTP_DEADLINE_INTERACTIVE_S",
+            "HTTP_DEADLINE_BACKGROUND_S",
+            "HTTP_MAX_RETRIES",
+            "RUNTIME_PROMPT_OUTPUT_MAX_TOKENS_OVERRIDE",
+            "BASE_OUTPUT_TOKENS_FLOOR",
+            "RATIONALE_NOTE_ESTIMATE_TOKENS",
+            "DEFAULT_UNBOUNDED_STRING_BUDGET",
+            "MODEL_REASONING_HEADROOM_TOKENS",
+        ],
+    )
+    def test_non_positive_operational_setting_fails_fast(
+        self, field, patch_config_paths, write_config, capsys
+    ):
+        write_config(overrides={field: 0})
+
+        with pytest.raises(SystemExit):
+            load_settings()
+
+        assert field in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("JSON_STRUCTURAL_OVERHEAD_TOKENS", -1),
+            ("RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN", 0),
+            ("RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN", 1.1),
+            ("MAX_OUTPUT_FRACTION", 0),
+            ("MAX_OUTPUT_FRACTION", 1.1),
+            ("MODEL_REASONING_HEADROOM_TOKENS", 4095),
+            ("ICL_SIM_GAP", -0.1),
+            ("ICL_ABS_THRESHOLD", -1.1),
+            ("ICL_ABS_THRESHOLD", 1.1),
+        ],
+    )
+    def test_bounded_inference_setting_fails_fast(
+        self, field, value, patch_config_paths, write_config, capsys
+    ):
+        write_config(overrides={field: value})
+
+        with pytest.raises(SystemExit):
+            load_settings()
+
+        assert field in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "presets",
+        [
+            {},
+            {"precise": {"temperature": -0.1, "top_p": 1.0}},
+            {"precise": {"temperature": 0.0, "top_p": 0.0}},
+            {"precise": {"temperature": 0.0}},
+            {"precise": {"temperature": 0.0, "top_p": 1.0, "seed": 1.0}},
+        ],
+    )
+    def test_invalid_labeling_preset_fails_fast(
+        self, presets, patch_config_paths, write_config, capsys
+    ):
+        write_config(overrides={"LABELING_PRESETS": presets})
+
+        with pytest.raises(SystemExit):
+            load_settings()
+
+        assert "LABELING_PRESETS" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("value", [[], [1, 0], [1, -1]])
+    def test_benchmark_concurrencies_require_positive_entries(
+        self, value, patch_config_paths, write_config, capsys
+    ):
+        write_config(overrides={"STUDENT_LATENCY_TEST_CONCURRENCIES": value})
+
+        with pytest.raises(SystemExit):
+            load_settings()
+
+        assert "STUDENT_LATENCY_TEST_CONCURRENCIES" in capsys.readouterr().err
+
+    def test_invalid_operational_environment_override_fails_fast(
+        self, patch_config_paths, write_config, monkeypatch, capsys
+    ):
+        write_config()
+        monkeypatch.setenv("HTTP_MAX_RETRIES", "0")
+
+        with pytest.raises(SystemExit):
+            load_settings()
+
+        assert "HTTP_MAX_RETRIES" in capsys.readouterr().err
+
     def test_nested_dict_preserved_from_yaml(self, patch_config_paths, write_config):
         """Visual budget presets (deeply nested) survive YAML round-trip."""
         write_config()

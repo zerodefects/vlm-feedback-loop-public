@@ -273,10 +273,11 @@ async def regenerate_rationale(
     image_transport_mode: str | None = None
     image_format_transmitted: str | None = None
     t_image_prep_ms: int | None = None
+    image_prep_error: str | None = None
 
     if storage_ref:
         stage_t0 = time.monotonic()
-        prep = await prepare_images([storage_ref])
+        prep = await prepare_images([storage_ref], settings=settings)
         t_image_prep_ms = int((time.monotonic() - stage_t0) * 1000)
         if prep.success and prep.images:
             img = prep.images[0]
@@ -290,12 +291,10 @@ async def regenerate_rationale(
                 {"type": "text", "text": user_text},
             ]
         elif prep.images:
-            # Capture the transport mode for OperationRecord persistence.
-            # The model call still proceeds without the image — rationale
-            # regeneration text-only is degraded but non-fatal.
             failed = next((p for p in prep.images if p.error), None)
             if failed:
                 image_transport_mode = failed.transport_mode
+                image_prep_error = failed.error or "unknown image preparation error"
 
     # ── Build request kwargs ─────────────────────────────────────────────
     # Run the full request-construction sequence even on the bypass path:
@@ -362,17 +361,27 @@ async def regenerate_rationale(
     )
 
     # ── Call NIM ─────────────────────────────────────────────────────────
-    stage_t0 = time.monotonic()
-    nim_result = await nim_client.chat_completions(
-        endpoint_base_url,
-        auth_headers,
-        model_name,
-        messages,
-        deadline_s,
-        max_retries=settings.HTTP_MAX_RETRIES,
-        **extra_kwargs,
-    )
-    t_nim_call_ms = int((time.monotonic() - stage_t0) * 1000)
+    if image_prep_error is not None:
+        # A rationale is an image-grounded observation. Silently dispatching
+        # the text-only prompt after a denied or stale image read would create
+        # a plausible-looking rationale that was never grounded in the sample.
+        nim_result = nim_client.NimChatCompletionsResult(
+            success=False,
+            error=f"Image preparation failed: {image_prep_error}",
+        )
+        t_nim_call_ms = 0
+    else:
+        stage_t0 = time.monotonic()
+        nim_result = await nim_client.chat_completions(
+            endpoint_base_url,
+            auth_headers,
+            model_name,
+            messages,
+            deadline_s,
+            max_retries=settings.HTTP_MAX_RETRIES,
+            **extra_kwargs,
+        )
+        t_nim_call_ms = int((time.monotonic() - stage_t0) * 1000)
 
     elapsed_ms = int((time.monotonic() - start_time) * 1000)
 

@@ -26,14 +26,16 @@ Flow:
      (optionally self-service provision it first via
      ``--auto-provision-base-experiments``); fail with operator
      guidance if none is indexed.
-  4. Create a fresh project; activate a minimal Guidance and ingest 3
-     generated JPEGs through production services; seed 3 Verified labels
-     through an explicit fixture-only database boundary (no Teacher call).
+  4. Create a fresh project; activate a minimal Guidance, explicitly set the
+     wiring fixture's Test Pool minimum to 1, and ingest 3 generated JPEGs
+     through production services; seed 3 Verified labels through an explicit
+     fixture-only database boundary (no Teacher call).
   5. Patch the project's Cosmos Reason2 2B ModelConfig row with
      ``tao_base_experiment_id`` + pull status.
   6. ``create_training_suite`` with Quick preset, 2B only, no quant.
-  7. Drive TAO polling + inspect the suite every 30s
-     until evaluate(baseline) succeeds or the deadline hits.
+  7. Drive TAO polling + inspect the suite every 30s until the LoRA
+     baseline is merged, served through local Student NIM, and evaluated,
+     or the deadline hits.
   8. Verify StudentModel wiring: packaging, evaluation lineage, and
      checkpoint shape. A quality failure is expected for the 2-sample
      training fixture and does not fail this wiring smoke.
@@ -147,7 +149,14 @@ def _build_smoke_project(settings, base_experiment_id: str) -> dict:
     guidance_id = guidance.guidance_id
     updated_project = project_service.update_project(
         project_id,
-        {"active_guidance_id": guidance_id},
+        {
+            "active_guidance_id": guidance_id,
+            # This disposable three-image smoke proves TAO chain wiring, not
+            # benchmark quality. Keep the production data-readiness contract
+            # intact by explicitly configuring its one-example Test Pool as
+            # the project minimum instead of bypassing preflight.
+            "scaleup_min_test_pool_size": 1,
+        },
         settings.WORKSPACE_ROOT,
     )
     if updated_project is None:
@@ -203,6 +212,7 @@ def _build_smoke_project(settings, base_experiment_id: str) -> dict:
             }
             for key, image_path in example_paths
         ],
+        settings=settings,
     )
     ingest_errors = [
         f"{result['example_key']}: {result['error']}"
@@ -281,6 +291,87 @@ def _build_smoke_project(settings, base_experiment_id: str) -> dict:
     }
 
 
+def _evaluation_lineage_failures(
+    *,
+    run: RunRecord,
+    student: StudentModel,
+    evaluate_job: TAOJob | None,
+    train_job: TAOJob | None,
+) -> list[str]:
+    """Validate either supported Student quality-lineage path.
+
+    LoRA baselines are merged and evaluated through local Student NIM because
+    FTMS 6.26.3 cannot evaluate an adapter-only parent checkpoint. Quantized
+    variants remain TAO-native and retain the TAO rescoring record shape.
+    """
+    failures: list[str] = []
+    if train_job is None:
+        failures.append(f"StudentModel.tao_job_id={student.tao_job_id!r} is missing")
+    else:
+        if train_job.action != "train" or train_job.status != "succeeded":
+            failures.append(
+                f"training TAOJob action/status={train_job.action!r}/"
+                f"{train_job.status!r} (expected 'train'/'succeeded')"
+            )
+        if not train_job.tao_external_job_id:
+            failures.append("training TAOJob.tao_external_job_id is null")
+
+    if run.evaluation_source == "tao":
+        if not run.rescored_metrics:
+            failures.append("RunRecord.rescored_metrics empty/null")
+        if not run.tao_native_metrics:
+            failures.append("RunRecord.tao_native_metrics empty/null")
+        if not run.tao_job_id:
+            failures.append("TAO RunRecord.tao_job_id null")
+    elif run.evaluation_source == "nim":
+        if run.student_model_config_id != student.student_model_id:
+            failures.append(
+                "NIM RunRecord.student_model_config_id does not match StudentModel"
+            )
+        if not run.metrics:
+            failures.append("NIM RunRecord.metrics empty/null")
+        if run.tao_job_id is not None:
+            failures.append("NIM RunRecord.tao_job_id must be null")
+    else:
+        failures.append(
+            f"RunRecord.evaluation_source={run.evaluation_source!r} "
+            "(expected 'tao' or 'nim')"
+        )
+
+    if evaluate_job is None:
+        failures.append("no evaluate job links to the quality RunRecord")
+        return failures
+    if evaluate_job.action != "evaluate" or evaluate_job.status != "succeeded":
+        failures.append(
+            f"evaluate job action/status={evaluate_job.action!r}/"
+            f"{evaluate_job.status!r} (expected 'evaluate'/'succeeded')"
+        )
+
+    if run.evaluation_source == "nim":
+        outputs = dict(evaluate_job.outputs or {})
+        if evaluate_job.training_backend != "student_nim_local":
+            failures.append(
+                "LoRA baseline evaluate job training_backend is not 'student_nim_local'"
+            )
+        if evaluate_job.parent_tao_job_id != student.tao_job_id:
+            failures.append(
+                "LoRA baseline evaluate job does not parent on Student train"
+            )
+        if outputs.get("evaluation_source") != "student_nim_local":
+            failures.append(
+                "LoRA baseline evaluate output source is not student_nim_local"
+            )
+        if outputs.get("evaluation_run_id") != run.run_id:
+            failures.append(
+                "LoRA baseline evaluate output does not link quality RunRecord"
+            )
+        if outputs.get("student_model_id") != student.student_model_id:
+            failures.append("LoRA baseline evaluate output does not link StudentModel")
+    elif evaluate_job.tao_job_id != run.tao_job_id:
+        failures.append("TAO evaluate job does not match RunRecord.tao_job_id")
+    return failures
+
+
 def _verify_training_wiring(settings, suite: dict) -> bool:
     """Verify Student packaging, evaluation lineage, and checkpoint shape.
 
@@ -288,9 +379,8 @@ def _verify_training_wiring(settings, suite: dict) -> bool:
     fail this deliberately tiny wiring fixture. Structural failures still do:
 
       * StudentModel row exists with validated checkpoint packaging
-      * Eval RunRecord has evaluation_source="tao", non-null+truthy
-        rescored_metrics, non-null+truthy tao_native_metrics, and a
-        tao_job_id pointing at a succeeded evaluate TAOJob
+      * The quality RunRecord and evaluate job form either the TAO-native
+        quantized lineage or the Spec §9.8 merged-LoRA Student-NIM lineage
       * nim_checkpoint_ref resolves to a directory under
         {project_dir}/artifacts/
       * The merged checkpoint directory contains config.json, at least
@@ -342,51 +432,51 @@ def _verify_training_wiring(settings, suite: dict) -> bool:
                 )
             else:
                 print(f"  Run.evaluation_source: {run.evaluation_source}")
-                has_rescored = bool(run.rescored_metrics)
-                has_native = bool(run.tao_native_metrics)
+                print(f"  Run.metrics: populated={bool(run.metrics)}")
+                print(f"  Run.rescored_metrics: populated={bool(run.rescored_metrics)}")
                 print(
-                    f"  Run.rescored_metrics: populated={has_rescored}; "
-                    f"tao_native_metrics: populated={has_native}"
+                    f"  Run.tao_native_metrics: populated={bool(run.tao_native_metrics)}"
                 )
                 print(f"  Run.tao_job_id: {run.tao_job_id}")
-                if run.evaluation_source != "tao":
-                    failures.append(
-                        f"RunRecord.evaluation_source={run.evaluation_source!r} "
-                        "(expected 'tao')"
-                    )
-                if not has_rescored:
-                    failures.append("RunRecord.rescored_metrics empty/null")
-                if not has_native:
-                    failures.append("RunRecord.tao_native_metrics empty/null")
-                if not run.tao_job_id:
-                    failures.append("RunRecord.tao_job_id null")
-                else:
+                train_job = (
+                    session.query(TAOJob)
+                    .filter_by(tao_job_id=sm.tao_job_id)
+                    .one_or_none()
+                )
+                if run.tao_job_id:
                     eval_job = (
                         session.query(TAOJob)
                         .filter_by(tao_job_id=run.tao_job_id)
                         .one_or_none()
                     )
-                    if eval_job is None:
-                        failures.append(
-                            f"RunRecord.tao_job_id={run.tao_job_id!r} "
-                            "but no TAOJob row found"
-                        )
-                    else:
-                        print(
-                            f"  TAOJob {eval_job.tao_job_id}: "
-                            f"action={eval_job.action!r}, "
-                            f"status={eval_job.status!r}"
-                        )
-                        if eval_job.action != "evaluate":
-                            failures.append(
-                                f"TAOJob({run.tao_job_id}).action="
-                                f"{eval_job.action!r} (expected 'evaluate')"
+                else:
+                    eval_job = next(
+                        (
+                            job
+                            for job in session.query(TAOJob)
+                            .filter_by(
+                                project_id=suite["project_id"], action="evaluate"
                             )
-                        if eval_job.status != "succeeded":
-                            failures.append(
-                                f"TAOJob({run.tao_job_id}).status="
-                                f"{eval_job.status!r} (expected 'succeeded')"
-                            )
+                            .all()
+                            if (job.outputs or {}).get("evaluation_run_id")
+                            == run.run_id
+                        ),
+                        None,
+                    )
+                if eval_job is not None:
+                    print(
+                        f"  evaluate job {eval_job.tao_job_id}: "
+                        f"backend={eval_job.training_backend!r}, "
+                        f"status={eval_job.status!r}"
+                    )
+                failures.extend(
+                    _evaluation_lineage_failures(
+                        run=run,
+                        student=sm,
+                        evaluate_job=eval_job,
+                        train_job=train_job,
+                    )
+                )
 
         # nim_checkpoint_ref shape on disk.
         from pathlib import Path
@@ -568,7 +658,11 @@ async def _amain() -> int:
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get(
             "HUGGING_FACE_HUB_TOKEN"
         )
-        prov = await provision_base_experiments(settings, hf_token=hf_token)
+        prov = await provision_base_experiments(
+            settings,
+            target_model_names=[MODEL_NAME_2B],
+            hf_token=hf_token,
+        )
         print(
             f"  registered={prov.registered}  "
             f"already_registered={prov.already_registered}  "

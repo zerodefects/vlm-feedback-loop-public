@@ -445,8 +445,8 @@ class TestBrowseFileSize:
         assert files[0]["size_bytes"] == len(content)
 
 
-class TestBundledSampleShortcut:
-    """The browser advertises the shipped sample only when it is in scope."""
+class TestBundledSampleDiscovery:
+    """The browser identifies the shipped sample only when it is in scope."""
 
     def test_configured_sample_root_is_advertised(self, tmp_path: Path):
         sample = tmp_path / "example-images"
@@ -483,7 +483,7 @@ class TestScanDeterministicKey:
         scan_root.mkdir()
         (scan_root / "img_001.jpg").write_bytes(b"\xff\xd8" + b"\x00" * 10)
 
-        settings = make_settings(tmp_path)
+        settings = make_settings(tmp_path, IMAGE_ROOT=str(scan_root))
 
         from vlm_feedback_loop.services.filesystem_service import scan_directory
 
@@ -504,7 +504,7 @@ class TestScanDeterministicKey:
         sub.mkdir(parents=True)
         (sub / "img_001.jpg").write_bytes(b"\xff\xd8" + b"\x00" * 10)
 
-        settings = make_settings(tmp_path)
+        settings = make_settings(tmp_path, IMAGE_ROOT=str(scan_root))
 
         from vlm_feedback_loop.services.filesystem_service import scan_directory
 
@@ -530,6 +530,48 @@ class TestScanDeterministicKey:
         keys = [img["suggested_example_key"] for img in result["images"]]
         assert len(set(keys)) == 2, (
             "Same stem + different ext must produce different keys"
+        )
+
+    def test_same_file_has_same_key_when_scanned_from_parent_or_subdirectory(
+        self, tmp_path: Path
+    ):
+        image_root = tmp_path / "images"
+        class_dir = image_root / "class-a"
+        class_dir.mkdir(parents=True)
+        image = class_dir / "sample.jpg"
+        image.write_bytes(b"\xff\xd8" + b"\x00" * 10)
+        settings = make_settings(tmp_path, IMAGE_ROOT=str(image_root))
+
+        from vlm_feedback_loop.services.filesystem_service import scan_directory
+
+        parent_scan = scan_directory(str(image_root), settings)
+        class_scan = scan_directory(str(class_dir), settings)
+
+        assert parent_scan["images"][0]["storage_ref"] == str(image)
+        assert class_scan["images"][0]["storage_ref"] == str(image)
+        assert (
+            parent_scan["images"][0]["suggested_example_key"]
+            == class_scan["images"][0]["suggested_example_key"]
+        )
+
+    def test_unconfigured_loopback_scan_is_independent_of_selected_root(
+        self, tmp_path: Path
+    ):
+        parent = tmp_path / "datasets"
+        class_dir = parent / "class-a"
+        class_dir.mkdir(parents=True)
+        image = class_dir / "sample.jpg"
+        image.write_bytes(b"\xff\xd8" + b"\x00" * 10)
+        settings = make_settings(tmp_path)
+
+        from vlm_feedback_loop.services.filesystem_service import scan_directory
+
+        parent_scan = scan_directory(str(parent), settings)
+        class_scan = scan_directory(str(class_dir), settings)
+
+        assert (
+            parent_scan["images"][0]["suggested_example_key"]
+            == class_scan["images"][0]["suggested_example_key"]
         )
 
 
@@ -622,7 +664,7 @@ class TestScanCollisionChecking:
         client = make_api_client(tmp_path)
         project_id = self._create_project_with_example(client, img_path, expected_key)
 
-        settings = make_settings(tmp_path)
+        settings = make_settings(tmp_path, IMAGE_ROOT=str(scan_root))
         from vlm_feedback_loop.services.filesystem_service import scan_directory
 
         result = scan_directory(
@@ -632,6 +674,30 @@ class TestScanCollisionChecking:
             workspace_root=settings.WORKSPACE_ROOT,
         )
         assert result["images"][0]["key_status"] == "already_exists_same_path"
+        assert result["total_collisions"] == 0
+
+    def test_existing_path_wins_when_legacy_key_differs(self, tmp_path: Path):
+        scan_root = tmp_path / "images"
+        scan_root.mkdir()
+        img_path = scan_root / "img.jpg"
+        img_path.write_bytes(b"\xff\xd8" + b"\x00" * 10)
+        client = make_api_client(tmp_path)
+        project_id = self._create_project_with_example(
+            client, img_path, "legacy-scan-root-key"
+        )
+        settings = make_settings(tmp_path, IMAGE_ROOT=str(scan_root))
+
+        from vlm_feedback_loop.services.filesystem_service import scan_directory
+
+        result = scan_directory(
+            str(scan_root),
+            settings,
+            project_id=project_id,
+            workspace_root=settings.WORKSPACE_ROOT,
+        )
+
+        assert result["images"][0]["key_status"] == "already_exists_same_path"
+        assert result["images"][0]["suggested_example_key"] == "legacy-scan-root-key"
         assert result["total_collisions"] == 0
 
     def test_collision_different_path(self, tmp_path: Path):
@@ -650,7 +716,7 @@ class TestScanCollisionChecking:
             client, different_path, expected_key
         )
 
-        settings = make_settings(tmp_path)
+        settings = make_settings(tmp_path, IMAGE_ROOT=str(scan_root))
         from vlm_feedback_loop.services.filesystem_service import scan_directory
 
         result = scan_directory(
@@ -877,7 +943,7 @@ class TestEndpointIntegration:
         project_dir = Path(resp.json()["project_dir"])
 
         # Insert an example with the same key but different path
-        expected_key = _expected_key("test_img.jpg")
+        expected_key = _expected_key(str(img.resolve()))
 
         from sqlalchemy.orm import Session
 

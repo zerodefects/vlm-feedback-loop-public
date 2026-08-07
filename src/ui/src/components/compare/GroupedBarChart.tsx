@@ -16,6 +16,7 @@
 
 import { Text } from "@kui/react";
 
+import { chartGroupKey } from "@/lib/chart-group";
 import { formatPct } from "@/lib/format-percent";
 
 export interface ChartSeries {
@@ -35,14 +36,6 @@ export interface ChartGroup {
   cluster?: string | null;
 }
 
-/** Series-value lookup key for a group. Group identity is the
-    (cluster, label) pair — bare labels repeat across fields in
-    Per-value mode (two boolean Core fields both emit "true"/"false"),
-    so a label-only key would collide. */
-export function chartGroupKey(group: ChartGroup): string {
-  return `${group.cluster ?? ""}::${group.label}`;
-}
-
 export interface GroupedBarChartProps {
   title: string;
   groups: ChartGroup[];
@@ -50,12 +43,18 @@ export interface GroupedBarChartProps {
   "data-testid"?: string;
 }
 
-const CHART_HEIGHT = 220;
+const CHART_HEIGHT = 232;
 const TOP_PAD = 24;
-const BOTTOM_PAD = 64; // room for group + cluster captions
+const BOTTOM_PAD = 76; // room for wrapped group + cluster captions
 const LEFT_PAD = 36;
 const RIGHT_PAD = 12;
-const GROUP_GAP = 16;
+const DEFAULT_GROUP_GAP = 16;
+const DENSE_GROUP_GAP = 8;
+const DENSE_GROUP_THRESHOLD = 12;
+// Compare uses PageContainer's max-w-6xl canvas. After the page and chart
+// card insets, 1056 px is available to the SVG at the assigned desktop
+// viewport. Wider charts remain intentionally scrollable.
+const COMPARE_CHART_CONTENT_WIDTH = 1056;
 const BAR_GAP = 2;
 // Cap individual bar width so single-group / few-bucket charts don't
 // render their bars as flat 80–90 px color blocks (pathology:
@@ -81,24 +80,28 @@ export function GroupedBarChart({
     );
   }
 
-  // Compute geometry. We allocate equal width to each group and split
-  // it among the series. ``minmax(140px, …)`` style sizing mirrors the
-  // per-value drill-down so 25-bucket charts stay legible.
+  // Compute geometry. Dense categorical charts use tighter groups so a
+  // common 25-value field with four comparison series fits the Compare
+  // canvas. Do not cap a wider natural layout: doing so makes the final bars
+  // and captions escape the SVG's own coordinate bounds. Larger series
+  // matrices remain intentionally scrollable instead.
   const groupCount = groups.length;
   const seriesCount = series.length;
-  const minBarWidth = 8;
-  const minGroupWidth = seriesCount * minBarWidth + GROUP_GAP;
-  const naturalWidth = LEFT_PAD + RIGHT_PAD + groupCount * (minGroupWidth + GROUP_GAP);
-  // Cap at 1200 px so the chart wraps within the page container, but
-  // floor at 720 px so a 3-group Match-rate chart fills the panel
-  // instead of leaving a conspicuous void to the right.
-  // Charts with >1200 px of natural content scroll horizontally via
-  // the parent panel's ``overflow-x-auto``.
+  const dense = groupCount > DENSE_GROUP_THRESHOLD;
+  const groupGap = dense ? DENSE_GROUP_GAP : DEFAULT_GROUP_GAP;
+  const minBarWidth = dense ? 5 : 8;
+  const minBarsWidth =
+    seriesCount * minBarWidth + BAR_GAP * Math.max(0, seriesCount - 1);
+  const minGroupWidth = Math.max(dense ? 32 : 0, minBarsWidth);
+  const naturalWidth = LEFT_PAD + RIGHT_PAD + groupCount * (minGroupWidth + groupGap);
+  // A few groups still fill a useful 720 px plot. Dense layouts use their
+  // full natural width, which is 1048 px for Freiburg's 25 values × four
+  // series and therefore fits without clipping in the 1056 px canvas.
   const FLOOR_WIDTH = 720;
-  const width = Math.max(FLOOR_WIDTH, Math.min(naturalWidth, 1200));
+  const width = Math.max(FLOOR_WIDTH, naturalWidth);
   const usableWidth = width - LEFT_PAD - RIGHT_PAD;
   const groupWidth = usableWidth / groupCount;
-  const innerGroupWidth = Math.max(minBarWidth * seriesCount, groupWidth - GROUP_GAP);
+  const innerGroupWidth = Math.max(minBarsWidth, groupWidth - groupGap);
   const naiveBarWidth = Math.max(
     minBarWidth,
     (innerGroupWidth - BAR_GAP * (seriesCount - 1)) / seriesCount,
@@ -121,6 +124,12 @@ export function GroupedBarChart({
     <div
       className="glass-card p-6 flex flex-col gap-3 overflow-x-auto"
       data-testid={testid ?? "grouped-bar-chart"}
+      tabIndex={width > COMPARE_CHART_CONTENT_WIDTH ? 0 : undefined}
+      aria-label={
+        width > COMPARE_CHART_CONTENT_WIDTH
+          ? `${title}. Scroll horizontally to view all chart values.`
+          : undefined
+      }
     >
       <div className="flex items-center justify-between">
         <Text kind="label/bold/sm">{title}</Text>
@@ -148,6 +157,16 @@ export function GroupedBarChart({
           ))}
         </div>
       </div>
+
+      {width > COMPARE_CHART_CONTENT_WIDTH && (
+        <Text
+          kind="body/regular/xs"
+          style={{ color: "var(--text-muted)" }}
+          data-testid="chart-scroll-guidance"
+        >
+          Scroll horizontally to view all chart values.
+        </Text>
+      )}
 
       <svg
         width={width}
@@ -187,7 +206,11 @@ export function GroupedBarChart({
         {/* Group bars + per-bar captions (no cluster repetition here —
             cluster captions are emitted once per run below). */}
         {groups.map((group, gIdx) => {
-          const groupX = LEFT_PAD + gIdx * groupWidth + GROUP_GAP / 2;
+          const groupX = LEFT_PAD + gIdx * groupWidth + groupGap / 2;
+          const labelLines = group.label.split("_");
+          const labelX = groupX + innerGroupWidth / 2;
+          const labelY = CHART_HEIGHT - BOTTOM_PAD + 14;
+          const denseLabel = group.label.replaceAll("_", " ");
           return (
             <g key={`${group.cluster ?? ""}::${group.label}::${gIdx}`}>
               {series.map((s, sIdx) => {
@@ -221,13 +244,27 @@ export function GroupedBarChart({
               {/* Per-bar group caption (e.g. enum value name in
                   Per-value mode, or Core field name in Match-rate mode). */}
               <text
-                x={groupX + innerGroupWidth / 2}
-                y={CHART_HEIGHT - BOTTOM_PAD + 14}
+                x={labelX}
+                y={labelY}
                 textAnchor="middle"
                 fontSize={11}
                 fill="var(--text-secondary)"
+                data-testid={`chart-group-label-${chartGroupKey(group)}`}
+                transform={dense ? `rotate(-40 ${labelX} ${labelY})` : undefined}
               >
-                {group.label}
+                {dense
+                  ? denseLabel
+                  : labelLines.length === 1
+                    ? group.label
+                    : labelLines.map((line, lineIndex) => (
+                        <tspan
+                          key={`${line}-${lineIndex}`}
+                          x={labelX}
+                          dy={lineIndex === 0 ? 0 : 12}
+                        >
+                          {line}
+                        </tspan>
+                      ))}
               </text>
             </g>
           );
@@ -240,8 +277,8 @@ export function GroupedBarChart({
             Each run gets a thin bracket-style underline so the cluster
             boundary is visible without a geometric inter-cluster gap. */}
         {computeClusterRuns(groups).map((run, rIdx) => {
-          const startX = LEFT_PAD + run.startIdx * groupWidth + GROUP_GAP / 2;
-          const endX = LEFT_PAD + (run.endIdx + 1) * groupWidth - GROUP_GAP / 2;
+          const startX = LEFT_PAD + run.startIdx * groupWidth + groupGap / 2;
+          const endX = LEFT_PAD + (run.endIdx + 1) * groupWidth - groupGap / 2;
           const centerX = (startX + endX) / 2;
           const bracketY = CHART_HEIGHT - BOTTOM_PAD + 24;
           return (
@@ -265,7 +302,7 @@ export function GroupedBarChart({
                 fontSize={11}
                 fill="var(--text-muted)"
               >
-                {run.cluster}
+                {run.cluster.replaceAll("_", " ")}
               </text>
             </g>
           );

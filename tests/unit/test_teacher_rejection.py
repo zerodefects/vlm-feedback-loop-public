@@ -19,14 +19,20 @@ directly. Coverage:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy.orm import Session
 
+from conftest import add_standard_project_row, make_stub_settings, setup_project_db
+from vlm_feedback_loop.db.models.run import RunRecord
 from vlm_feedback_loop.services import teacher_rejection
 from vlm_feedback_loop.services.teacher_rejection import (
+    finalize_runtime_rejection,
     is_structured_gen_rejection,
     is_thinking_toggle_rejection,
     is_visual_budget_rejection,
+    record_runtime_rejections,
 )
 
 # ── Test fixture: minimal TeacherInvocationResult-like surface ──────────────
@@ -345,3 +351,53 @@ class TestVisualBudgetRejection:
             error="mm_processor_kwargs reset (transport)",  # no "400"
         )
         assert is_visual_budget_rejection(r) is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejection_does_not_emit_after_another_terminal_owner(tmp_path):
+    """A rejected executor stops without contradicting durable terminal state."""
+    engine, project_dir = setup_project_db(tmp_path)
+    project_id = "rejection-terminal-owner"
+    run_id = "rejection-terminal-run"
+    with Session(engine) as session:
+        add_standard_project_row(session, project_id, project_dir)
+        session.add(
+            RunRecord(
+                run_id=run_id,
+                project_id=project_id,
+                run_type="evaluation_run",
+                status="failed",
+                status_reason="schema_evolution_canceled",
+            )
+        )
+        session.commit()
+
+    record_runtime_rejections(
+        run_id,
+        _StubResult(
+            invocation_status="endpoint_error",
+            error="HTTP 400: response_format is not supported",
+            structured_generation_attempted=True,
+        ),
+        sgm_effective="auto",
+        settings=make_stub_settings(WORKSPACE_ROOT=str(tmp_path / "workspace")),
+        cancel_event=None,
+    )
+    with patch.object(teacher_rejection.sse_manager, "emit", new=AsyncMock()) as emit:
+        found = await finalize_runtime_rejection(
+            engine,
+            project_id,
+            run_id,
+            run_type="evaluation_run",
+            terminal_statuses=frozenset(
+                {"completed", "incomplete", "failed", "canceled"}
+            ),
+        )
+
+    assert found is True
+    emit.assert_not_awaited()
+    with Session(engine) as session:
+        run = session.get(RunRecord, run_id)
+        assert run is not None
+        assert run.status == "failed"
+        assert run.status_reason == "schema_evolution_canceled"

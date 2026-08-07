@@ -19,8 +19,14 @@ Contract:
 - Uses a small ``S3ClientProtocol`` so tests can inject a fake client
   without depending on ``boto3`` / ``moto``.
 - Threshold for multipart: 8 MiB (configurable).
+- Before any S3 call, the archive must match its recorded checksum and its
+  root ``annotations.json`` must equal the separate sidecar as a complete,
+  type-sensitive JSON value.
+- Both files are opened beneath the owning project's ``exports/`` directory;
+  validation and upload consume those same descriptors, and the exact bytes
+  sent are rehashed to detect in-place mutation after validation.
 - Idempotency: ``head_object`` + SHA-256 comparison short-circuits a
-  re-upload of an already-staged archive.
+  re-upload only when both representations are already staged.
 - Persistence: after a successful upload, the caller-provided session
   is used to finalise ``DatasetExport.dataset_upload_ref`` and
   ``DatasetExport.dataset_upload_uri``. The upload itself happens
@@ -37,17 +43,24 @@ Contract:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast, runtime_checkable
+from typing import Any, BinaryIO, Protocol, cast, runtime_checkable
 
 from sqlalchemy.orm import Session
 
 from vlm_feedback_loop.config import Settings
 from vlm_feedback_loop.db.deployment_models import TAODeploymentConfig
 from vlm_feedback_loop.db.models.dataset_export import DatasetExport
-from vlm_feedback_loop.services.hashing import sha256_file
+from vlm_feedback_loop.services.authorized_file import (
+    OpenedRegularFile,
+    open_regular_file_beneath,
+)
+from vlm_feedback_loop.services.project_service import project_dir_path
 
 logger = logging.getLogger("vlm_feedback_loop.services.tao_dataset_upload")
 
@@ -59,6 +72,10 @@ MULTIPART_PART_SIZE_BYTES = 8 * 1024 * 1024
 # Metadata key that carries the content SHA-256 on the uploaded object so
 # idempotent re-upload can skip work (HEAD + compare).
 SHA256_METADATA_KEY = "dataset-export-sha256"
+
+
+class OpenedFileChangedError(RuntimeError):
+    """The bytes read for upload no longer match the validated file."""
 
 
 # ── S3 client protocol ───────────────────────────────────────────────────────
@@ -262,14 +279,21 @@ def do_single_put(
     *,
     bucket: str,
     key: str,
-    archive_path: Path,
+    opened_file: OpenedRegularFile,
     sha256: str,
 ) -> None:
-    with open(archive_path, "rb") as fh:
+    with opened_file.open_binary() as fh:
+        fh.seek(0)
+        body = fh.read()
+        actual_sha256 = hashlib.sha256(body).hexdigest()
+        if actual_sha256 != sha256:
+            raise OpenedFileChangedError(
+                "File changed after validation and before upload"
+            )
         s3_client.put_object(
             Bucket=bucket,
             Key=key,
-            Body=fh.read(),
+            Body=body,
             Metadata={SHA256_METADATA_KEY: sha256},
         )
 
@@ -279,7 +303,7 @@ def do_multipart_put(
     *,
     bucket: str,
     key: str,
-    archive_path: Path,
+    opened_file: OpenedRegularFile,
     sha256: str,
     part_size_bytes: int = MULTIPART_PART_SIZE_BYTES,
 ) -> None:
@@ -292,12 +316,15 @@ def do_multipart_put(
 
     parts: list[dict[str, Any]] = []
     try:
-        with open(archive_path, "rb") as fh:
+        uploaded_digest = hashlib.sha256()
+        with opened_file.open_binary() as fh:
+            fh.seek(0)
             part_number = 1
             while True:
                 chunk = fh.read(part_size_bytes)
                 if not chunk:
                     break
+                uploaded_digest.update(chunk)
                 resp = s3_client.upload_part(
                     Bucket=bucket,
                     Key=key,
@@ -307,6 +334,11 @@ def do_multipart_put(
                 )
                 parts.append({"ETag": resp.get("ETag", ""), "PartNumber": part_number})
                 part_number += 1
+
+        if uploaded_digest.hexdigest() != sha256:
+            raise OpenedFileChangedError(
+                "File changed after validation and during multipart upload"
+            )
 
         s3_client.complete_multipart_upload(
             Bucket=bucket,
@@ -347,15 +379,15 @@ def _run_upload_sync(
     *,
     bucket: str,
     key: str,
-    archive_path: Path,
+    opened_file: OpenedRegularFile,
+    sha256: str,
     multipart_threshold_bytes: int,
     multipart_part_size_bytes: int,
-) -> tuple[str, bool]:
+) -> bool:
     """Synchronous upload path — wrapped in asyncio.to_thread by the caller.
 
-    Returns ``(sha256, already_uploaded)``.
+    Returns whether the matching object was already present.
     """
-    sha256 = sha256_file(archive_path)
     if already_uploaded(s3_client, bucket=bucket, key=key, sha256=sha256):
         logger.info(
             "Dataset archive already uploaded: s3://%s/%s (sha256=%s)",
@@ -363,15 +395,15 @@ def _run_upload_sync(
             key,
             sha256[:12],
         )
-        return sha256, True
+        return True
 
-    size_bytes = archive_path.stat().st_size
+    size_bytes = opened_file.stat_result.st_size
     if size_bytes > multipart_threshold_bytes:
         do_multipart_put(
             s3_client,
             bucket=bucket,
             key=key,
-            archive_path=archive_path,
+            opened_file=opened_file,
             sha256=sha256,
             part_size_bytes=multipart_part_size_bytes,
         )
@@ -380,31 +412,160 @@ def _run_upload_sync(
             s3_client,
             bucket=bucket,
             key=key,
-            archive_path=archive_path,
+            opened_file=opened_file,
             sha256=sha256,
         )
-    return sha256, False
+    return False
+
+
+def _json_values_equal(left: Any, right: Any) -> bool:
+    """Compare parsed JSON without conflating booleans and numbers."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        left_dict = cast("dict[str, Any]", left)
+        right_dict = cast("dict[str, Any]", right)
+        return left_dict.keys() == right_dict.keys() and all(
+            _json_values_equal(left_dict[key], right_dict[key]) for key in left_dict
+        )
+    if isinstance(left, list):
+        left_list = cast("list[Any]", left)
+        right_list = cast("list[Any]", right)
+        return len(left_list) == len(right_list) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left_list, right_list, strict=True)
+        )
+    return bool(left == right)
+
+
+def _artifact_path(dataset_export: DatasetExport, key: str, label: str) -> Path:
+    refs = dataset_export.artifact_refs
+    raw_path: Any = refs.get(key) if isinstance(refs, dict) else None
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(
+            f"DatasetExport has no {label}; re-export the dataset before TAO upload"
+        )
+    return Path(raw_path)
+
+
+class _DigestingReader:
+    """Hash each source byte as a streaming parser consumes it."""
+
+    def __init__(self, source: BinaryIO) -> None:
+        self._source = source
+        self._digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._source.read(size)
+        self._digest.update(data)
+        return data
+
+    def hexdigest(self) -> str:
+        return self._digest.hexdigest()
+
+
+def _validate_frozen_export_artifacts(
+    *,
+    dataset_export: DatasetExport,
+    archive: OpenedRegularFile,
+    annotations: OpenedRegularFile,
+) -> tuple[str, str]:
+    """Validate both frozen representations through their authorized inodes."""
+    artifact_refs = dataset_export.artifact_refs
+    recorded_checksum_raw: Any = (
+        artifact_refs.get("checksum_sha256")
+        if isinstance(artifact_refs, dict)
+        else None
+    )
+    if (
+        not isinstance(recorded_checksum_raw, str)
+        or len(recorded_checksum_raw) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in recorded_checksum_raw)
+    ):
+        raise ValueError(
+            "DatasetExport has no valid recorded archive checksum; re-export "
+            "the dataset before TAO upload"
+        )
+
+    with archive.open_binary() as archive_stream:
+        archive_stream.seek(0)
+        digesting_stream = _DigestingReader(archive_stream)
+        missing_annotations = object()
+        archive_annotations: Any = missing_annotations
+        try:
+            with tarfile.open(
+                fileobj=cast("BinaryIO", digesting_stream),
+                mode="r|gz",
+            ) as tf:
+                for member in tf:
+                    if member.name != "annotations.json":
+                        continue
+                    if archive_annotations is not missing_annotations:
+                        raise ValueError(
+                            "Archive contains duplicate root annotations.json members"
+                        )
+                    if not member.isfile():
+                        raise ValueError(
+                            "Archive annotations.json is not a regular file"
+                        )
+                    extracted = tf.extractfile(member)
+                    if extracted is None:
+                        raise ValueError("Archive annotations.json cannot be read")
+                    archive_annotations = json.loads(extracted.read())
+            # Tar readers may stop at the end marker before the compressed
+            # source reaches EOF. Drain the remaining bytes so the digest is
+            # the complete archive hash, not merely the parsed prefix.
+            while digesting_stream.read(1024 * 1024):
+                pass
+        except (EOFError, OSError, tarfile.TarError, UnicodeError) as exc:
+            raise ValueError(f"Archive annotations.json is unreadable: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Archive annotations.json is malformed: {exc}") from exc
+        if archive_annotations is missing_annotations:
+            raise ValueError("Archive does not contain annotations.json")
+        actual_checksum = digesting_stream.hexdigest()
+        if actual_checksum.lower() != recorded_checksum_raw.lower():
+            raise ValueError(
+                "Archive checksum does not match the frozen DatasetExport; "
+                "re-export the dataset before TAO upload"
+            )
+
+    with annotations.open_binary() as annotations_stream:
+        annotations_stream.seek(0)
+        try:
+            annotations_bytes = annotations_stream.read()
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"Annotations sidecar is unreadable: {exc}") from exc
+        annotations_checksum = hashlib.sha256(annotations_bytes).hexdigest()
+        try:
+            sidecar_annotations = json.loads(annotations_bytes)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Annotations sidecar is malformed: {exc}") from exc
+
+    if not _json_values_equal(archive_annotations, sidecar_annotations):
+        raise ValueError(
+            "Annotations sidecar does not match the frozen archive annotations"
+        )
+    return actual_checksum, annotations_checksum
 
 
 async def upload_dataset_archive(
     session: Session,
     *,
     dataset_export: DatasetExport,
-    archive_path: Path,
     deployment_config: TAODeploymentConfig,
     s3_client: S3ClientProtocol,
+    settings: Settings,
     multipart_threshold_bytes: int = MULTIPART_THRESHOLD_BYTES,
     multipart_part_size_bytes: int = MULTIPART_PART_SIZE_BYTES,
-    annotations_path: Path | None = None,
 ) -> UploadResult:
     """Upload a dataset archive to the workspace bucket and persist lineage.
 
-    Idempotent per ``(workspace_id, dataset_export_id)``. The archive's
-    SHA-256 is ALWAYS recomputed from the local file (the ``dataset_upload_ref``
-    row field is not consulted as a pre-check); what the idempotency skips is
-    the NETWORK upload — when the remote object already exists with a matching
-    hash, ``_run_upload_sync`` returns ``already=True`` and no bytes are sent
-    over the wire.
+    Both paths come from the completed DatasetExport record. Before any S3
+    operation, the archive must match its recorded SHA-256 and its root
+    ``annotations.json`` must be type-sensitively equal to the required
+    standalone sidecar. Validation and upload reuse the same two descriptors
+    opened beneath the canonical project ``exports/`` directory.
 
     The caller owns the ``Session``. This function:
     - Reads fields off the provided ``dataset_export`` instance (no
@@ -427,6 +588,35 @@ async def upload_dataset_archive(
                 "— run `vlm-feedback-loop tao-bootstrap` first."
             ),
         )
+    if dataset_export.status != "completed":
+        return UploadResult(
+            success=False,
+            dataset_export_id=dataset_export_id,
+            bucket=bucket,
+            error=(
+                "Dataset export integrity check failed: DatasetExport is not "
+                "completed; wait for completion or re-export before TAO upload"
+            ),
+        )
+
+    try:
+        archive_path = _artifact_path(
+            dataset_export,
+            "archive_path",
+            "archive path",
+        )
+        annotations_path = _artifact_path(
+            dataset_export,
+            "annotations_path",
+            "annotations sidecar path",
+        )
+    except ValueError as exc:
+        return UploadResult(
+            success=False,
+            dataset_export_id=dataset_export_id,
+            bucket=bucket,
+            error=f"Dataset export integrity check failed: {exc}",
+        )
 
     archive_name = archive_path.name
     key = build_s3_key(
@@ -436,95 +626,148 @@ async def upload_dataset_archive(
     )
     spec_reference = build_tao_spec_reference(deployment_config, bucket=bucket, key=key)
 
-    if not archive_path.exists():
-        return UploadResult(
-            success=False,
-            dataset_export_id=dataset_export_id,
-            bucket=bucket,
-            key=key,
-            error=f"Archive not found: {archive_path}",
-        )
-
-    try:
-        sha256, already = await asyncio.to_thread(
-            _run_upload_sync,
-            s3_client,
-            bucket=bucket,
-            key=key,
-            archive_path=archive_path,
-            multipart_threshold_bytes=multipart_threshold_bytes,
-            multipart_part_size_bytes=multipart_part_size_bytes,
-        )
-    except Exception as exc:
-        logger.exception(
-            "Dataset upload failed for %s (bucket=%s key=%s)",
-            dataset_export_id,
-            bucket,
-            key,
-        )
+    annotation_key = build_s3_key(
+        project_id=project_id,
+        dataset_export_id=dataset_export_id,
+        archive_name=annotations_path.name,
+    )
+    annotation_spec_reference = build_tao_spec_reference(
+        deployment_config,
+        bucket=bucket,
+        key=annotation_key,
+    )
+    if annotation_key == key:
         return UploadResult(
             success=False,
             dataset_export_id=dataset_export_id,
             bucket=bucket,
             key=key,
             spec_reference=spec_reference,
-            error=f"S3 upload failed: {exc}",
+            annotation_key=annotation_key,
+            annotation_spec_reference=annotation_spec_reference,
+            error=(
+                "Dataset export integrity check failed: archive and annotations "
+                "sidecar map to the same workspace object; re-export the dataset"
+            ),
+        )
+    export_root = project_dir_path(settings.WORKSPACE_ROOT, project_id) / "exports"
+    try:
+        with (
+            open_regular_file_beneath(archive_path, export_root) as archive,
+            open_regular_file_beneath(annotations_path, export_root) as annotations,
+        ):
+            try:
+                archive_sha256, annotations_sha256 = await asyncio.to_thread(
+                    _validate_frozen_export_artifacts,
+                    dataset_export=dataset_export,
+                    archive=archive,
+                    annotations=annotations,
+                )
+            except (OSError, ValueError) as exc:
+                return UploadResult(
+                    success=False,
+                    dataset_export_id=dataset_export_id,
+                    bucket=bucket,
+                    key=key,
+                    spec_reference=spec_reference,
+                    annotation_key=annotation_key,
+                    annotation_spec_reference=annotation_spec_reference,
+                    error=f"Dataset export integrity check failed: {exc}",
+                )
+            try:
+                archive_already_uploaded = await asyncio.to_thread(
+                    _run_upload_sync,
+                    s3_client,
+                    bucket=bucket,
+                    key=key,
+                    opened_file=archive,
+                    sha256=archive_sha256,
+                    multipart_threshold_bytes=multipart_threshold_bytes,
+                    multipart_part_size_bytes=multipart_part_size_bytes,
+                )
+            except OpenedFileChangedError as exc:
+                return UploadResult(
+                    success=False,
+                    dataset_export_id=dataset_export_id,
+                    bucket=bucket,
+                    key=key,
+                    spec_reference=spec_reference,
+                    annotation_key=annotation_key,
+                    annotation_spec_reference=annotation_spec_reference,
+                    error=f"Dataset export integrity check failed: {exc}",
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Dataset archive upload failed for %s (bucket=%s key=%s)",
+                    dataset_export_id,
+                    bucket,
+                    key,
+                )
+                return UploadResult(
+                    success=False,
+                    dataset_export_id=dataset_export_id,
+                    bucket=bucket,
+                    key=key,
+                    spec_reference=spec_reference,
+                    annotation_key=annotation_key,
+                    annotation_spec_reference=annotation_spec_reference,
+                    error=f"Archive S3 upload failed: {exc}",
+                )
+            try:
+                sidecar_already_uploaded = await asyncio.to_thread(
+                    _run_upload_sync,
+                    s3_client,
+                    bucket=bucket,
+                    key=annotation_key,
+                    opened_file=annotations,
+                    sha256=annotations_sha256,
+                    multipart_threshold_bytes=multipart_threshold_bytes,
+                    multipart_part_size_bytes=multipart_part_size_bytes,
+                )
+            except OpenedFileChangedError as exc:
+                return UploadResult(
+                    success=False,
+                    dataset_export_id=dataset_export_id,
+                    bucket=bucket,
+                    key=key,
+                    spec_reference=spec_reference,
+                    annotation_key=annotation_key,
+                    annotation_spec_reference=annotation_spec_reference,
+                    error=f"Dataset export integrity check failed: {exc}",
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Annotations sidecar upload failed for %s (bucket=%s key=%s)",
+                    dataset_export_id,
+                    bucket,
+                    annotation_key,
+                )
+                return UploadResult(
+                    success=False,
+                    dataset_export_id=dataset_export_id,
+                    bucket=bucket,
+                    key=key,
+                    spec_reference=spec_reference,
+                    annotation_key=annotation_key,
+                    annotation_spec_reference=annotation_spec_reference,
+                    error=f"Annotations sidecar S3 upload failed: {exc}",
+                )
+    except (FileNotFoundError, PermissionError) as exc:
+        return UploadResult(
+            success=False,
+            dataset_export_id=dataset_export_id,
+            bucket=bucket,
+            key=key,
+            spec_reference=spec_reference,
+            annotation_key=annotation_key,
+            annotation_spec_reference=annotation_spec_reference,
+            error=f"Dataset export integrity check failed: {exc}",
         )
 
     upload_uri = f"s3://{bucket}/{key}"
+    annotation_upload_uri = f"s3://{bucket}/{annotation_key}"
 
-    # Sidecar annotations.json upload (cosmos-rl needs annotation_path
-    # to be a separate JSON-file URL distinct from media_path; see
-    # UploadResult docstring).
-    annotation_key: str | None = None
-    annotation_upload_uri: str | None = None
-    annotation_spec_reference: str | None = None
-    if annotations_path is not None:
-        if not annotations_path.exists():
-            return UploadResult(
-                success=False,
-                dataset_export_id=dataset_export_id,
-                bucket=bucket,
-                key=key,
-                spec_reference=spec_reference,
-                error=f"Annotations sidecar not found: {annotations_path}",
-            )
-        annotation_key = build_s3_key(
-            project_id=project_id,
-            dataset_export_id=dataset_export_id,
-            archive_name=annotations_path.name,
-        )
-        annotation_spec_reference = build_tao_spec_reference(
-            deployment_config, bucket=bucket, key=annotation_key
-        )
-        try:
-            await asyncio.to_thread(
-                _run_upload_sync,
-                s3_client,
-                bucket=bucket,
-                key=annotation_key,
-                archive_path=annotations_path,
-                multipart_threshold_bytes=multipart_threshold_bytes,
-                multipart_part_size_bytes=multipart_part_size_bytes,
-            )
-        except Exception as exc:
-            logger.exception(
-                "Annotations sidecar upload failed for %s (bucket=%s key=%s)",
-                dataset_export_id,
-                bucket,
-                annotation_key,
-            )
-            return UploadResult(
-                success=False,
-                dataset_export_id=dataset_export_id,
-                bucket=bucket,
-                key=key,
-                spec_reference=spec_reference,
-                error=f"Annotations sidecar upload failed: {exc}",
-            )
-        annotation_upload_uri = f"s3://{bucket}/{annotation_key}"
-
-    # Short write transaction on the caller's session.
+    # Persist lineage only after both representations are staged.
     dataset_export.dataset_upload_ref = key
     dataset_export.dataset_upload_uri = upload_uri
     session.add(dataset_export)
@@ -539,6 +782,6 @@ async def upload_dataset_archive(
         annotation_key=annotation_key,
         annotation_upload_uri=annotation_upload_uri,
         annotation_spec_reference=annotation_spec_reference,
-        sha256=sha256,
-        already_uploaded=already,
+        sha256=archive_sha256,
+        already_uploaded=archive_already_uploaded and sidecar_already_uploaded,
     )

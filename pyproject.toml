@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vlm-feedback-loop"
-version = "0.1.0"
+version = "1.0.0"
 description = "Interactive VLM labeling with ICL, fine-tuning via Cosmos-RL / TAO VLM, and Student deployment via NIM."
 readme = "README.md"
 license = "Apache-2.0"
@@ -23,7 +23,7 @@ dependencies = [
     "jinja2>=3.1,<4.0",
     "tiktoken>=0.9,<1.0",
     "python-dotenv>=1.0,<2.0",
-    "pillow>=12.2,<13.0",
+    "pillow>=12.3,<13.0",
     # Vectorized diversity selection. The review selector scores every
     # eligible candidate's CLIP cosine / pHash hamming against the recent
     # window on the interactive request path (the labeling screen waits on
@@ -40,27 +40,26 @@ dependencies = [
     "botocore>=1.34,<2.0",
 ]
 
-[project.optional-dependencies]
-# NIM benchmark adapter. The primary load
-# driver is genai-perf via subprocess; an httpx fallback ships in core
-# install (services/benchmark_adapter.py::HttpxAdapter) so CI / Profile A
-# does not need this extra. Install with:
-#   uv sync --extra benchmarking
-# Pin lower bound only — genai-perf is being deprecated upstream in favor
-# of AIPerf and we don't want to lock to a release that may not stay
-# published on PyPI.
-benchmarking = [
-    "genai-perf>=0.0.10",
-]
-
 [project.scripts]
 vlm-feedback-loop = "vlm_feedback_loop.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/backend/vlm_feedback_loop"]
 
+# The GitHub Blueprint is the complete teaching source. The Python sdist is a
+# backend package artifact, so keep it focused and never sweep private release
+# evidence or the frontend dependency tree into a package upload.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/backend/vlm_feedback_loop",
+    "/README.md",
+    "/LICENSE",
+    "/LICENSE-3rd-party.txt",
+]
+
 [dependency-groups]
 dev = [
+    "httpx2>=2.9,<3.0",
     "pyright>=1.1.408",
     "pytest>=8.0,<10.0",
     "pytest-asyncio>=0.25,<2.0",
@@ -68,6 +67,20 @@ dev = [
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.8.0",
     "ruff>=0.9,<1.0",
+]
+# Canonical production VLM load driver. Keep it in a default operational
+# group rather than wheel metadata: AIPerf 0.10.0's metadata caps aiohttp and
+# Pillow below current security fixes even though its raw-payload driver works
+# with the patched releases. Source and container `uv sync` still install it.
+aiperf = [
+    "aiperf==0.10.0",
+]
+
+[tool.uv]
+default-groups = ["dev", "aiperf"]
+override-dependencies = [
+    "aiohttp>=3.14.3,<4.0",
+    "pillow>=12.3,<13.0",
 ]
 
 [tool.pytest.ini_options]

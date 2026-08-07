@@ -243,6 +243,38 @@ class TestResolveMergePython:
         assert ready is False
         assert str(missing) in message
 
+    @pytest.mark.asyncio
+    async def test_merge_readiness_timeout_uses_shared_process_cleanup(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import AsyncMock
+
+        python = tmp_path / "python"
+        python.touch()
+        settings = make_settings(tmp_path, MERGE_LORA_PYTHON=str(python))
+
+        class FakeProcess:
+            returncode = None
+
+        async def fake_exec(*_args, **_kwargs):
+            return FakeProcess()
+
+        communication = AsyncMock(side_effect=TimeoutError)
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(
+            student_model_service,
+            "communicate_with_timeout",
+            communication,
+        )
+
+        ready, message = await student_model_service.check_lora_merge_readiness(
+            settings
+        )
+
+        assert ready is False
+        assert "probe failed" in message
+        communication.assert_awaited_once()
+
 
 class TestPackaging:
     @pytest.mark.asyncio
@@ -279,6 +311,10 @@ class TestPackaging:
             assert student.quantization_method is None
             assert student.quantize_tao_job_id is None
             assert student.guidance_id == guidance_id
+            assert (
+                student.training_suite_id
+                == (s.query(TrainingSuite.training_suite_id).one()[0])
+            )
             assert student.training_preset == "standard"
             assert student.lora_config["enable_lora"] is True
 
@@ -516,6 +552,57 @@ class TestPackaging:
         with Session(engine) as s:
             student = s.query(StudentModel).filter_by(student_model_id=sid).one()
             assert student.checkpoint_packaging_status == "failed"
+
+    @pytest.mark.asyncio
+    async def test_repackage_refreshes_quantize_root_without_retraining(
+        self, tmp_path, monkeypatch
+    ):
+        """Repackage repairs a mixed-listing quantize fetch in place."""
+        from unittest.mock import AsyncMock
+
+        from vlm_feedback_loop.services import tao_polling_service
+
+        engine, workspace, pdir, guidance_id = _setup_project(tmp_path)
+        quant_cache = pdir / "artifacts" / "tao_jobs" / "tao-quant-refresh"
+        _make_adapter_only_dir(quant_cache)
+        _, _, quant_id, _ = _seed_chain(
+            engine,
+            chain_id="chain-QRefresh",
+            guidance_id=guidance_id,
+            include_quantize=True,
+            train_outputs={"artifact_cache_dir": str(pdir / "train")},
+            quant_outputs={"artifact_cache_dir": str(quant_cache)},
+            quant_status="succeeded",
+        )
+        settings = make_settings(workspace)
+        sid = await student_model_service.register_from_tao_terminal(
+            PID, quant_id, settings=settings
+        )
+
+        async def refresh_quantize(*args, **kwargs):
+            assert args == ("ext-quant",)
+            assert kwargs["local_cache_dir"] == quant_cache
+            _make_hf_checkpoint_dir(quant_cache)
+            return {"success": True, "artifacts": [], "error": None}
+
+        refresh = AsyncMock(side_effect=refresh_quantize)
+        monkeypatch.setattr(
+            tao_polling_service, "refresh_quantized_checkpoint_artifacts", refresh
+        )
+
+        result = await student_model_service.repackage_student_model(
+            project_id=PID, student_model_id=sid, settings=settings
+        )
+
+        assert result == {
+            "error": None,
+            "student_model_id": sid,
+            "checkpoint_packaging_status": "validated",
+        }
+        refresh.assert_awaited_once()
+        with Session(engine) as s:
+            student = s.get(StudentModel, sid)
+            assert student.nim_checkpoint_ref == str(quant_cache)
 
     @pytest.mark.asyncio
     async def test_evaluate_action_is_a_noop(self, tmp_path):
@@ -857,6 +944,37 @@ class TestPackageCheckpointDirect:
 
 class TestMergeSubprocessEnv:
     @pytest.mark.asyncio
+    async def test_merge_cancellation_uses_shared_cleanup_and_propagates(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        class FakeProcess:
+            returncode = None
+
+        async def fake_exec(*_args, **_kwargs):
+            return FakeProcess()
+
+        communication = AsyncMock(side_effect=asyncio.CancelledError)
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(
+            student_model_service,
+            "communicate_with_timeout",
+            communication,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await student_model_service._run_merge_lora_subprocess(
+                adapter_dir=tmp_path / "adapter",
+                base_model_path="nvidia/Cosmos3-Nano-Reasoner",
+                out_dir=tmp_path / "merged",
+                settings=make_settings(tmp_path),
+            )
+
+        communication.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_merge_spawn_forwards_hf_token(self, tmp_path, monkeypatch):
         """The LoRA merge pulls a gated/auth'd HF base model; the spawned
         subprocess must carry settings.HF_TOKEN (both env names
@@ -866,27 +984,35 @@ class TestMergeSubprocessEnv:
         import asyncio as aio
 
         captured: dict = {}
+        opaque_token = "opaque-merge-credential-9274"
 
         class _FakeProc:
             returncode = 0
 
             async def communicate(self):
-                return (b"ok", b"")
+                return (
+                    f"stdout echoed {opaque_token}".encode(),
+                    f"stderr echoed {opaque_token}".encode(),
+                )
 
         async def fake_exec(*cmd, **kwargs):
             captured["env"] = kwargs.get("env")
             return _FakeProc()
 
         monkeypatch.setattr(aio, "create_subprocess_exec", fake_exec)
-        settings = make_settings(tmp_path, HF_TOKEN="hf_test_token")
+        settings = make_settings(tmp_path, HF_TOKEN=opaque_token)
         adapter = tmp_path / "adapter"
         adapter.mkdir()
-        await student_model_service._run_merge_lora_subprocess(
+        result = await student_model_service._run_merge_lora_subprocess(
             adapter_dir=str(adapter),
             base_model_path="nvidia/Cosmos3-Nano-Reasoner",
             out_dir=str(tmp_path / "merged"),
             settings=settings,
         )
         env = captured["env"]
-        assert env["HF_TOKEN"] == "hf_test_token"
-        assert env["HUGGING_FACE_HUB_TOKEN"] == "hf_test_token"
+        assert env["HF_TOKEN"] == opaque_token
+        assert env["HUGGING_FACE_HUB_TOKEN"] == opaque_token
+        assert opaque_token not in result["stdout"]
+        assert opaque_token not in result["stderr"]
+        assert result["stdout"] == "stdout echoed [REDACTED]"
+        assert result["stderr"] == "stderr echoed [REDACTED]"

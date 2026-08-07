@@ -25,7 +25,7 @@ import { validateDraft } from "@/api/guidance";
 import { RATIONALE_NOTE_FIELD_NAME } from "@/lib/guidance-templates";
 import {
   type ClientField,
-  stripClientIds,
+  stripDraftIds,
   recalcDisplayOrders,
   computeFieldPathPrefixes,
 } from "./field-utils";
@@ -106,7 +106,7 @@ export function useGuidanceForm({
       try {
         const result = await validateDraft(projectId, {
           description,
-          schema: stripClientIds(fields),
+          schema: stripDraftIds(fields),
           rules,
         });
         if (seq !== validationSeq.current) return false; // stale — superseded

@@ -36,6 +36,8 @@ state plumbing. Key VALUES are never logged or returned in error paths.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Final
 
@@ -61,6 +63,30 @@ class InvalidSecretNameError(ValueError):
 
 
 _runtime_overrides: dict[str, str] = {}
+
+
+def _write_private_file_atomically(target: Path, content: str) -> None:
+    """Publish ``content`` with mode 0600 without exposing a partial file."""
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    temp_path = Path(temp_name)
+    try:
+        # Apply the required mode before any secret bytes are written. A
+        # permission failure aborts while the existing target is untouched.
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1  # ownership transferred to the file object
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temp_path.unlink(missing_ok=True)
 
 
 def _validate_name(name: str) -> None:
@@ -134,18 +160,14 @@ def set_runtime_secret(name: str, value: str) -> None:
     """Install ``value`` into the process-level override layer.
 
     Subsequent :func:`get_effective_secret` calls return this value until
-    the process exits. Also invalidates the environment-assessment cache
-    so the model-catalog list endpoint picks up the new credential on its
-    next call without waiting for the TTL.
+    the process exits. Environment responses compose credential state fresh
+    over the cached machine capabilities, so no hardware cache invalidation is
+    required when a key changes.
     """
     _validate_name(name)
     _validate_value(value)
     _runtime_overrides[name] = value
     logger.info("Runtime secret %s set (length=%d)", name, len(value))
-    # Late import to avoid environment.py loading at process start.
-    from vlm_feedback_loop.services.environment import invalidate_env_cache
-
-    invalidate_env_cache()
 
 
 def persist_secret_to_env(name: str, value: str, env_path: Path | None = None) -> Path:
@@ -210,18 +232,7 @@ def persist_secret_to_env(name: str, value: str, env_path: Path | None = None) -
     if not content.endswith("\n"):
         content += "\n"
 
-    target.write_text(content, encoding="utf-8")
-    # User-only file permissions.
-    try:
-        target.chmod(0o600)
-    except OSError:
-        # Permission setting may fail on filesystems that don't support it
-        # (e.g. mounted FAT). The write succeeded; log and continue.
-        logger.warning(
-            "Could not chmod 0o600 on %s; file written but permissions "
-            "could not be tightened.",
-            target,
-        )
+    _write_private_file_atomically(target, content)
 
     # Reload Settings so subsequent get_settings() calls pick up the new
     # value. We deliberately do NOT clear the runtime override — see the
@@ -266,11 +277,3 @@ def persist_secret_to_env(name: str, value: str, env_path: Path | None = None) -
         replaced,
     )
     return target
-
-
-def reset_overrides_for_testing() -> None:
-    """Clear all runtime overrides. Test-only helper.
-
-    Exists for test fixtures that need a clean slate between cases.
-    """
-    _runtime_overrides.clear()

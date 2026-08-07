@@ -116,9 +116,8 @@ class TestRedaction:
 
     def test_hf_and_jwt_tokens_redacted(self):
         # HuggingFace token and a TAO FTMS JWT (bare, no Bearer prefix).
-        assert "hf_" not in redact("token=hf_ABCdef0123456789ghijkl").replace(
-            "[REDACTED]", ""
-        )
+        fake_hf_token = "hf_ABCdef0123456789ghijkl"  # gitleaks:allow
+        assert "hf_" not in redact(f"token={fake_hf_token}").replace("[REDACTED]", "")
         jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc-DEF_123"
         assert jwt not in redact(f"Auth failed for {jwt}")
         assert "[REDACTED]" in redact(f"Auth failed for {jwt}")
@@ -170,7 +169,7 @@ class TestRedaction:
         buf, _ = _capture_log_output()
         log = get_logger("test")
         log.info(
-            "Config: api_key=nvapi-SECRET123 token=Bearer SECRET_TOKEN",
+            "Config: api_key=nvapi-SECRET123 token=Bearer SECRET_TOKEN",  # gitleaks:allow
         )
 
         output = buf.getvalue()

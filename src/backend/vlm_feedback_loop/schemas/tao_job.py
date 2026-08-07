@@ -106,6 +106,8 @@ class TAOJobResponse(BaseModel):
     # Progress and outputs
     progress: dict[str, Any] | None = None
     outputs: dict[str, Any] | None = None
+    outputs_fetch_status: Literal["pending", "in_progress", "completed", "failed"]
+    outputs_fetch_error_ref: str | None = None
 
     # Chain + linkage
     parent_tao_job_id: str | None = None

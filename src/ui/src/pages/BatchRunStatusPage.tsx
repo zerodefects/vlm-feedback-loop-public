@@ -18,6 +18,7 @@ import { Download, Play } from "lucide-react";
 import {
   cancelBatchLabelRun,
   createDatasetExport,
+  datasetExportArchiveUrl,
   getBatchLabelRun,
   getDatasetExport,
   listDatasetExports,
@@ -26,6 +27,7 @@ import {
 } from "@/api/batch";
 import { parseApiErrorDetail } from "@/api/client";
 import { batchKeys } from "@/api/query-keys";
+import { ConfigRow } from "@/components/common/ConfigRow";
 import { InfoBanner } from "@/components/common/InfoBanner";
 import { PageContainer } from "@/components/common/PageContainer";
 import { SectionCard } from "@/components/common/SectionCard";
@@ -36,7 +38,7 @@ import { ProgressBar, type ProgressBarVariant } from "@/components/ProgressBar";
 import { titleCasePreset } from "@/lib/formatPreset";
 import { runStatusRefetchInterval } from "@/lib/run-status-polling";
 import type { Tone } from "@/lib/tone";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useSetupContext } from "@/pages/setup-context";
 import type { BatchLabelRunResponse, CommonErrorEntry } from "@/types/batch";
 
 const TERMINAL = new Set(["completed", "canceled", "failed"]);
@@ -60,6 +62,7 @@ const STATUS_REASON_COPY: Record<string, string> = {
   internal_error: `Internal error during batch labeling. ${LOGS_HINT}`,
   prompt_rendering_error: `Internal error during prompt rendering. ${LOGS_HINT}`,
   database_error: `Database error during batch labeling. ${LOGS_HINT}`,
+  unhandled_exception: `An unexpected error stopped batch labeling. ${LOGS_HINT}`,
   gate_revoked:
     "Scale-Up gate was revoked while the run was in flight. Rerun after the gate passes.",
   unrecoverable_config: `Unrecoverable configuration issue. ${LOGS_HINT}`,
@@ -80,7 +83,14 @@ function formatConfigLine(run: BatchLabelRunResponse): string {
     run.guidance_version_number != null ? `v${run.guidance_version_number}` : "—";
   const stability = titleCasePreset(run.generation_preset_key ?? "precise");
   const visualBudget = titleCasePreset(run.visual_budget_preset_key ?? "high_detail");
-  return `Config: ${model} · Guidance ${guidance} · ${stability} · ${visualBudget}`;
+  const thinking =
+    run.thinking_mode_effective === "on" ? "Thinking On" : "Thinking Off";
+  const icl = run.icl_mode === "disabled" ? "ICL Off" : "ICL On";
+  const structured =
+    run.structured_generation_mode_effective === "prompt_only"
+      ? "Prompt-only"
+      : "Structured Auto";
+  return `Config: ${model} · Guidance ${guidance} · ${stability} · ${thinking} · ${visualBudget} · ${icl} · ${structured}`;
 }
 
 export function BatchRunStatusPage() {
@@ -165,7 +175,7 @@ export function BatchRunStatusPage() {
     exportMut.data?.dataset_export_id ??
     existingExports?.items.find(
       (e) =>
-        e.status === "running" &&
+        (e.status === "running" || e.status === "completed") &&
         e.selection_definition_snapshot.batch_label_run_id === runId,
     )?.dataset_export_id ??
     null;
@@ -199,6 +209,17 @@ export function BatchRunStatusPage() {
     onError: (e: Error) => setManifestError(e.message),
     onSuccess: () => setManifestError(null),
   });
+
+  const downloadCompletedExport = () => {
+    if (exportId == null || exportRecord?.status !== "completed") return;
+    const link = document.createElement("a");
+    link.href = datasetExportArchiveUrl(projectId, exportId);
+    // The backend's Content-Disposition owns the stable archive filename.
+    link.download = "";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
 
   // Derived values
   const status = run?.status ?? "loading";
@@ -377,7 +398,9 @@ export function BatchRunStatusPage() {
           heading="Endpoint appears unreachable."
           body={
             run.paused_reason === "circuit_breaker_threshold_reached"
-              ? `${timedOut + endpointErr} consecutive failures.`
+              ? run.circuit_breaker_threshold != null
+                ? `${run.circuit_breaker_threshold} consecutive endpoint failures reached the run's safety threshold.`
+                : "The run reached its consecutive endpoint-failure safety threshold."
               : (run.paused_reason ?? "Run paused.")
           }
           data-testid="circuit-breaker-banner"
@@ -411,7 +434,14 @@ export function BatchRunStatusPage() {
         <InfoBanner
           tone="info"
           align="center"
-          body={<>Canceled by user. {partialRetainedLine ?? "No outputs retained."}</>}
+          body={
+            <>
+              {run.paused_reason === "circuit_breaker_threshold_reached"
+                ? "Canceled by user after circuit breaker pause."
+                : "Canceled by user."}{" "}
+              {partialRetainedLine ?? "No outputs retained."}
+            </>
+          }
         />
       )}
 
@@ -432,15 +462,22 @@ export function BatchRunStatusPage() {
       {/* ── Export lifecycle notice ─────────────────────────────────── */}
       {exportId != null && exportRecord?.status !== "failed" && (
         <InfoBanner
-          tone="success"
+          tone={exportRecord?.status === "completed" ? "success" : "info"}
           align="center"
+          icon={
+            exportRecord?.status === "completed" ? undefined : (
+              <Spinner size="small" aria-label="Building dataset export" />
+            )
+          }
           data-testid="export-status-banner"
           body={
             exportRecord?.status === "completed"
               ? `Dataset exported successfully — ${
                   exportRecord.progress?.images_written ?? "all"
                 } images archived.`
-              : "Dataset export started — the archive builds in the background; this page tracks it to completion."
+              : `Dataset export in progress — ${
+                  exportRecord?.progress?.images_written ?? 0
+                } of ${exportRecord?.progress?.images_total ?? exportRecord?.example_count ?? 0} images archived. You can leave this screen; the run will keep tracking it.`
           }
         />
       )}
@@ -453,6 +490,40 @@ export function BatchRunStatusPage() {
             exportRecord.status_reason ? `: ${exportRecord.status_reason}` : ""
           }. Fix the cause and export again.`}
         />
+      )}
+
+      {/* Export records carry private workspace refs. Surface the stable
+          logical package contract while keeping those host paths out of the
+          browser. */}
+      {exportId != null && exportRecord != null && (
+        <SectionCard density="dense" data-testid="export-details">
+          <SectionHeading>Export details</SectionHeading>
+          <ConfigRow
+            size="sm"
+            label="Format"
+            value="Cosmos-RL (annotations.json + images)"
+          />
+          <ConfigRow
+            size="sm"
+            label="Fields"
+            value={titleCasePreset(exportRecord.export_field_mode)}
+          />
+          <ConfigRow
+            size="sm"
+            label="Labels"
+            value={titleCasePreset(exportRecord.label_tier_filter)}
+          />
+          <ConfigRow
+            size="sm"
+            label="Examples"
+            value={`${exportRecord.example_count} images`}
+          />
+          <ConfigRow
+            size="sm"
+            label="Manifest"
+            value={exportRecord.manifest_ref ? "Included" : "Pending"}
+          />
+        </SectionCard>
       )}
 
       {/* ── Actions ───────────────────────────────────────────────── */}
@@ -526,8 +597,17 @@ export function BatchRunStatusPage() {
                   onClick={() => exportMut.mutate()}
                   data-testid="export-dataset-btn"
                 >
-                  <Download size={14} />
-                  {status === "completed" ? "Export Dataset" : "Export Partial"}
+                  {exportMut.isPending ? (
+                    <>
+                      <Spinner size="small" aria-label="Requesting dataset export" />
+                      Requesting…
+                    </>
+                  ) : (
+                    <>
+                      <Download size={14} />
+                      {status === "completed" ? "Export Dataset" : "Export Partial"}
+                    </>
+                  )}
                 </Button>
               )}
             {isStructuredGenRejected && (
@@ -542,6 +622,17 @@ export function BatchRunStatusPage() {
                 data-testid="restart-prompt-only"
               >
                 Restart with prompt-only
+              </Button>
+            )}
+            {exportRecord?.status === "completed" && exportId != null && (
+              <Button
+                kind={isStructuredGenRejected ? "secondary" : "primary"}
+                className={isStructuredGenRejected ? undefined : "nvidia-green-button"}
+                onClick={downloadCompletedExport}
+                data-testid="download-export-archive-btn"
+              >
+                <Download size={14} />
+                Download archive
               </Button>
             )}
           </>

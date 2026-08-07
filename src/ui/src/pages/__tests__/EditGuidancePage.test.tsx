@@ -136,6 +136,10 @@ function createWrapper(initialPath = "/projects/test-pid/edit-guidance") {
           <Routes>
             <Route path="/projects/:projectId" element={<ProjectSetupLayout />}>
               <Route path="edit-guidance" element={<EditGuidancePage />} />
+              <Route
+                path="create-guidance"
+                element={<div data-testid="create-guidance-page">Create</div>}
+              />
               <Route path="ready" element={<div data-testid="ready-page">Ready</div>} />
             </Route>
           </Routes>
@@ -183,6 +187,19 @@ describe("EditGuidancePage", () => {
     expect(screen.queryByLabelText("Start from:")).not.toBeInTheDocument();
   });
 
+  it("offers a direct recovery path when no Guidance is active", async () => {
+    mockFetchProject.mockResolvedValue(
+      makeProjectResponse({ ...PROJECT, active_guidance_id: null }),
+    );
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+    render(<div />, { wrapper: Wrapper });
+
+    await user.click(await screen.findByRole("button", { name: "Create Guidance" }));
+    expect(await screen.findByTestId("create-guidance-page")).toBeInTheDocument();
+    expect(mockFetchGuidance).not.toHaveBeenCalled();
+  });
+
   it("shows post-save banner with correct text", async () => {
     await renderPage();
     const banner = screen.getByTestId("post-save-banner");
@@ -202,6 +219,32 @@ describe("EditGuidancePage", () => {
     expect(
       screen.getByRole("switch", { name: "Enable rationale notes" }),
     ).toBeChecked();
+  });
+
+  it("names editable Guidance controls for assistive technology", async () => {
+    await renderPage();
+    expect(screen.getByRole("textbox", { name: "Task description" })).toBe(
+      screen.getByTestId("description-textarea"),
+    );
+    expect(screen.getByRole("textbox", { name: "Rules and edge cases" })).toBe(
+      screen.getByTestId("rules-textarea"),
+    );
+    expect(screen.getByRole("textbox", { name: "Field name: damage_type" })).toBe(
+      screen.getByDisplayValue("damage_type"),
+    );
+    expect(
+      screen.getByRole("combobox", { name: "Field type for damage_type" }),
+    ).toBeInTheDocument();
+  });
+
+  it("validates loaded fields without sending persisted identities", async () => {
+    await renderPage();
+    await waitFor(() => expect(mockValidateDraft).toHaveBeenCalled());
+    const request = mockValidateDraft.mock.calls.at(-1)?.[1] as {
+      schema: Array<Record<string, unknown>>;
+    };
+    expect(request.schema).not.toHaveLength(0);
+    expect(request.schema.every((field) => !("field_id" in field))).toBe(true);
   });
 
   // ── Label-invalidation markers (~) ────────────────────────────────────

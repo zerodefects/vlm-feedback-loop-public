@@ -35,8 +35,8 @@ Usage
 ::
 
     NVIDIA_API_KEY=nvapi-... uv run python scripts/probe_hosted_image_caps.py
-    uv run python scripts/probe_hosted_image_caps.py --models qwen,mistral
-    uv run python scripts/probe_hosted_image_caps.py --ladder 1,5,8,10
+    uv run python scripts/probe_hosted_image_caps.py --models minimax,step
+    uv run python scripts/probe_hosted_image_caps.py --ladder 1,5,8,10,11
 
 Exits 0 with a one-line-per-model report. Mismatches against the
 currently-seeded values (derived from
@@ -61,6 +61,12 @@ import httpx
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src" / "backend"))
 
+from vlm_feedback_loop.model_catalog_constants import (  # noqa: E402
+    MISTRAL_MEDIUM_3_5,
+    NEMOTRON_3_NANO_OMNI_REASONING,
+    NEMOTRON_NANO_12B_VL,
+    STEP_3_7_FLASH,
+)
 from vlm_feedback_loop.services.model_config_service import (  # noqa: E402
     generate_probe_image_data_url,
 )
@@ -81,24 +87,20 @@ CURRENT_SEEDED_CAPS: dict[str, int] = {
     for entry in SEEDED_MODEL_CATALOG
 }
 
-# Default models to probe — the hosted Teachers with `supports_image_input=True`.
-# Cosmos Reason 2 is NVCF-gated on hosted (per README "Current Status"),
-# so it's omitted by default; pass ``--models cosmos_8b`` to include it
-# (will report 404 if your account doesn't have access).
-DEFAULT_MODEL_LABELS = ["qwen", "kimi", "mistral", "nemotron"]
-
 MODEL_LOOKUP = {
-    "qwen": "qwen/qwen3.5-397b-a17b",
-    "kimi": "moonshotai/kimi-k2-thinking",
-    "mistral": "mistralai/mistral-large-3-675b-instruct-2512",
-    "nemotron": "nvidia/nemotron-nano-12b-v2-vl",
-    "cosmos_8b": "nvidia/cosmos-reason2-8b",
-    "cosmos_2b": "nvidia/cosmos-reason2-2b",
+    "step": STEP_3_7_FLASH,
+    "mistral_medium": MISTRAL_MEDIUM_3_5,
+    "nemotron": NEMOTRON_NANO_12B_VL,
+    "omni": NEMOTRON_3_NANO_OMNI_REASONING,
 }
 
-# Default probe ladder. Picks values around the seeded caps so the cap
-# is bracketed for every seeded Teacher (5, 8, 10).
-DEFAULT_LADDER = [1, 2, 4, 6, 7, 8, 9, 10, 12]
+# Probe every hosted-compatible seeded Teacher by default. Keeping the labels
+# beside the lookup makes an obsolete alias fail the delivery drift guard.
+DEFAULT_MODEL_LABELS = list(MODEL_LOOKUP)
+
+# Default probe ladder. Picks values around the current seeded caps (8 and 10)
+# so every hosted Teacher is bracketed without assuming a shared cap.
+DEFAULT_LADDER = [1, 2, 4, 6, 7, 8, 9, 10, 11, 12]
 
 
 @dataclass

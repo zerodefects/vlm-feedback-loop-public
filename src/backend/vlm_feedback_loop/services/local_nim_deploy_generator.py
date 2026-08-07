@@ -16,6 +16,8 @@ from typing import Any
 
 from vlm_feedback_loop.services.action_requests import register_generator
 
+NIM_MIN_DRIVER_VERSION = "580.65.06"
+
 
 def _generate_student_nim_deploy(
     project_name: str,
@@ -95,7 +97,7 @@ def _generate_student_nim_deploy(
             f"  NIM_SERVED_MODEL_NAME:   {nim_served_model_name}\n"
             f"  Quantization:            {quantization_method}\n"
             f"  NIM release:             {nim_release_version}\n"
-            f"  GPU memory minimum (this precision): >{gpu_memory_minimum_gb} GB\n"
+            f"  GPU memory minimum (this precision): at least {gpu_memory_minimum_gb} GB\n"
         )
         student_section_dict = {
             "student_model_id": student_model_id,
@@ -127,10 +129,10 @@ def _generate_student_nim_deploy(
         f"\n"
         f"Host prerequisites:\n"
         f"  - Linux OS (Ubuntu 22.04 LTS recommended)\n"
-        f"  - NVIDIA driver 535.104.05+\n"
+        f"  - NVIDIA driver {NIM_MIN_DRIVER_VERSION}+\n"
         f"  - Docker 29.4.0+\n"
         f"  - NVIDIA Container Toolkit 1.19.0+\n"
-        f"  - GPU: >{gpu_memory_minimum_gb} GB memory\n"
+        f"  - GPU: at least {gpu_memory_minimum_gb} GB memory\n"
         f"  - NGC_API_KEY configured\n"
         f"\n"
         f"Preflight results:\n"
@@ -162,7 +164,7 @@ def _generate_student_nim_deploy(
         "host_port": host_port,
         "host_prerequisites": {
             "os": "Linux (Ubuntu 22.04 LTS)",
-            "nvidia_driver": "535.104.05+",
+            "nvidia_driver": f"{NIM_MIN_DRIVER_VERSION}+",
             "docker": "29.4.0+",
             "nvidia_container_toolkit": "1.19.0+",
             "no_vgpu": True,

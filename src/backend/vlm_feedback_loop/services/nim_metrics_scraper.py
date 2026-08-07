@@ -11,21 +11,19 @@ pipeline to attach per-concurrency Prometheus snapshots to the
 
 The scraper is best-effort:
 
-  - Missing metric → ``0.0`` for that key (NIM endpoints that don't expose
-    Prometheus metrics still produce a usable ``BenchmarkResult``).
-  - Non-200 response or transport error → all-zeros dict.
+  - Missing metric → ``None`` (absence is never represented as a real zero).
+  - Non-200 response or transport error → all-null dict.
   - Single GET with a tight 10s deadline; one retry only (the benchmark is
     the heavy operation, not this scrape).
 
-This is intentionally NOT a full Prometheus parser — it extracts only the
-three metric names the Blueprint tracks and ignores everything else
-(including labels). If a metric appears multiple times (per-instance, per-
-endpoint), the first numeric sample wins.
+This is intentionally NOT a full Prometheus parser. Counter series are summed
+across label sets and the cache gauge records the maximum observed series.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from typing import Final
 
 from vlm_feedback_loop.services.http_client import resilient_request
@@ -58,16 +56,14 @@ def _build_metrics_url(base_url: str) -> str:
     return f"{cleaned}/metrics"
 
 
-def _parse_prom_text(body: str) -> dict[str, float]:
+def _parse_prom_text(body: str) -> dict[str, float | None]:
     """Parse Prometheus exposition-format text and extract tracked metrics.
 
-    Returns a dict keyed on the metric name with float values. Missing
-    metrics are filled with 0.0 so downstream consumers always see the full
-    keyset. The first numeric sample wins when a metric appears multiple
-    times (per-label/per-instance variants are intentionally collapsed).
+    Missing metrics remain null. Counter series are additive; for the cache
+    percentage gauge the maximum labeled series is the useful saturation
+    signal.
     """
-    result: dict[str, float] = dict.fromkeys(TRACKED_METRICS, 0.0)
-    seen: set[str] = set()
+    samples: dict[str, list[float]] = {name: [] for name in TRACKED_METRICS}
 
     for raw_line in body.splitlines():
         line = raw_line.strip()
@@ -86,32 +82,39 @@ def _parse_prom_text(body: str) -> dict[str, float]:
         # The metric name is everything before either "{" or whitespace.
         name = head if head and " " not in head else parts[0].split("{", 1)[0]
 
-        if name not in TRACKED_METRICS or name in seen:
+        if name not in TRACKED_METRICS:
             continue
 
         try:
             value = float(parts[-1])
         except ValueError:
             continue
+        if not math.isfinite(value):
+            continue
 
-        result[name] = value
-        seen.add(name)
-        if len(seen) == len(TRACKED_METRICS):
-            break
+        samples[name].append(value)
 
-    return result
+    return {
+        name: (
+            None
+            if not values
+            else max(values)
+            if name == "gpu_cache_usage_perc"
+            else sum(values)
+        )
+        for name, values in samples.items()
+    }
 
 
 async def scrape_prometheus(
     base_url: str,
     *,
     deadline_s: float = 10.0,
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     """Scrape the NIM Prometheus metrics endpoint.
 
-    Returns a dict with all three TRACKED_METRICS keys. Missing data —
-    metric absent, non-200, transport error — produces 0.0 defaults so
-    callers never see a partial dict.
+    Returns all three keys. Missing data remains null so callers cannot
+    mistake observability absence for a measured zero.
     """
     metrics_url = _build_metrics_url(base_url)
 
@@ -135,6 +138,6 @@ async def scrape_prometheus(
                 metrics_url,
                 result.error_detail,
             )
-        return dict.fromkeys(TRACKED_METRICS, 0.0)
+        return dict.fromkeys(TRACKED_METRICS, None)
 
     return _parse_prom_text(result.body)

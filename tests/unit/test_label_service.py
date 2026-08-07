@@ -708,6 +708,33 @@ class TestSaveLabel:
         assert result["verified_outcome"] == "Edit"
         assert "severity" in result["edited_core_fields"]
 
+    def test_save_edit_persists_core_and_aux_diff_arrays(self, tmp_path):
+        """A saved Edit retains which Core and Aux fields the SME changed."""
+        engine, pid, gid, mcid, keys, iid, ws, proposal = _setup_full(tmp_path)
+        edited = {
+            **proposal,
+            "severity": "low",
+            "rationale_note": "SME corrected the rationale",
+        }
+        result = save_label(
+            pid,
+            example_key=keys[0],
+            inference_invocation_id=iid,
+            label_json=edited,
+            rationale_source="sme_edited",
+            rationale_regeneration_invocation_id=None,
+            workspace_root=ws,
+        )
+
+        assert not isinstance(result, str)
+        assert result["verified_outcome"] == "Edit"
+        assert result["edited_core_fields"] == ["severity"]
+        assert result["edited_aux_fields"] == ["rationale_note"]
+        with Session(engine) as session:
+            label = session.query(Label).filter_by(project_id=pid).one()
+            assert label.edited_core_fields == ["severity"]
+            assert label.edited_aux_fields == ["rationale_note"]
+
     def test_save_edit_rejects_teacher_proposal_rationale(self, tmp_path):
         """Edit + rationale_source='teacher_proposal' → 400."""
         engine, pid, gid, mcid, keys, iid, ws, proposal = _setup_full(tmp_path)

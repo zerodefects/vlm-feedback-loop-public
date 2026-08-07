@@ -6,7 +6,7 @@
 
 Build and maintain the **Interactive VLM Feedback Loop** — an NVIDIA Blueprint for interactive VLM labeling with In-Context Learning (ICL), optional fine-tuning via Cosmos-RL / TAO, and Student deployment via NIM.
 
-The product loop: a **Teacher VLM** (served via NVIDIA NIM) proposes a label for an image → the SME **Accepts / Edits / Skips** → Accepted and Edited labels become **Verified** ground truth → Verified Edits feed subsequent proposals via **ICL** → background **evaluation** against a held-out Test Pool measures accuracy → a 5-criteria **Scale-Up Readiness Gate** unlocks **Batch Labeling** (auto-label at scale) and **Student training** (Cosmos-RL / TAO fine-tunes of the seeded Cosmos Reason bases) → trained Students deploy behind local NIM and are benchmarked against the Teacher on the Compare screen.
+The product loop: a **Teacher VLM** (served via NVIDIA NIM) proposes a label for an image → the SME **Accepts / Edits / Skips** → Accepted and Edited labels become **Verified** ground truth → Verified Edits feed subsequent proposals via **ICL** → background **evaluation** against a held-out Test Pool measures accuracy → a 5-criteria **Scale-Up Readiness Gate** unlocks **Batch Labeling** (auto-label at scale). **Student training** is independent of the Teacher-quality gate but requires its own server-side data readiness (at least one non-pool Verified training example plus the project-configured minimum Test Pool) and TAO infrastructure readiness → Cosmos-RL / TAO fine-tunes the seeded Cosmos Reason bases → trained Students deploy behind local NIM and are benchmarked against the Teacher on the Compare screen.
 
 Single-repo app: **Python + FastAPI** backend · **React 19 + TypeScript + Vite** frontend · **KUI Foundations + Tailwind 4** · **SQLite per project** (WAL) with Alembic · in-process **asyncio** background jobs — no external task queue.
 
@@ -17,28 +17,6 @@ This is an **open-source NVIDIA Blueprint reference application**. Optimize for 
 
 Any change touching startup, networking, ports, env vars, build steps, static serving, proxying, or local-NIM behavior must update BOTH modes and their docs/launch helpers in the same change. Do not silently diverge from recent NVIDIA Blueprint conventions unless the Engineering Spec requires it.
 
-## Development environment
-
-Full sudo on this machine. Install any packages or tools (apt, pip, npm, Docker) without asking. Unrestricted filesystem access. Machine-local companion checkouts referenced below live in the home directory (`~`); the team moves between dev boxes (CPU box, GPU boxes) with different usernames, so always write `~/...`, never a literal `/home/<user>/...`.
-
-## Local datasets
-
-Image datasets live in the home directory and are rsync'd between dev/GPU boxes at the same `~`-relative locations:
-
-| Dataset | Path | Layout | Contents |
-|---|---|---|---|
-| **rps-test-set** | `~/rps-test-set/` | dir-per-class | rock/paper/scissors, 124 each (372 PNG, 300×300). The canonical smoke/e2e dataset — default for `rps_e2e.py`, `icl_loop_smoke.py`, `profile_b_live_validation.py`, `test_full_pipeline_smoke.py` |
-| **trashnet** | `~/trashnet/dataset-original/` | dir-per-class | 6 recyclables classes (cardboard/glass/metal/paper/plastic/trash), 2,527 JPG at 4032×3024 |
-| **Freiburg groceries** | `~/freiburg_groceries_dataset/` | dir-per-class under `images/` + `manifest.jsonl` | 25 grocery classes, 4,947 PNG (256×256) |
-| **grocery-bottles-6** | `~/grocery-bottles-6/` | dir-per-class | Freiburg-derived bottle subset: HONEY/JUICE/OIL/SODA/VINEGAR/WATER, 1,226 PNG |
-| **FGVC-Aircraft** | `~/fgvc-aircraft/fgvc-aircraft-2013b/` | flat `data/images/` + label txts | 10,000 JPG; 3 label hierarchies (30 manufacturers / 70 families / 100 variants). The ICL-negative limit case in our studies |
-| **VisA** | `~/VisA/` (+ split CSVs in `~/split_csv/`) | per-object `{Normal,Anomaly}` + masks | 12 industrial objects, ~12k images — anomaly-detection studies (`build_visa_fixture.py`) |
-| **Open Food Facts sample** | `~/openfoodfacts-images-sample/` | EAN-sharded tree; each JPG has an OCR `.json.gz` sidecar | 20,000 product photos used in structured/OCR studies |
-| **cord-v2** | `~/cord-v2/` | HF parquet only (no loose images) | **RETIRED** — receipts set no longer used in studies |
-
-These datasets are developer-machine resources and are not part of the public Blueprint package. `~/datasets.md` is a stale partial manifest; this table supersedes it.
-
-Distinct from these dev-box datasets, the repo itself ships a 15-image rps subset at `deploy/example-images/` (CC BY 2.0, `LICENSE.DATA`) as the Blueprint's bundled first-run sample — it is product surface, not experiment data.
 
 ## Documents — authority and when to read what
 
@@ -113,10 +91,11 @@ uv run pytest tests/integration/ -q -n 0 # integration tests — SERIAL ONLY (th
 uv run ruff check . && uv run ruff format --check .
 uv run pyright src/backend/              # strict mode; must stay 0 errors / 0 warnings
 cd src/ui && pnpm test                   # vitest
+cd src/ui && pnpm test:e2e               # Playwright first-time workflow
 cd src/ui && pnpm typecheck && pnpm lint && pnpm build
 
 uv run python scripts/generate_third_party_licenses.py   # regenerate LICENSE-3rd-party.txt after dependency changes
-python3 scripts/render_architecture_diagram.py           # re-render docs/images/architecture.png after editing the .mmd
+uv run scripts/render_architecture_diagram.py            # re-render docs/images/architecture.png after editing the .mmd
 ```
 
 
@@ -139,14 +118,14 @@ Migrations apply automatically when a project DB is opened (`db/engine.py`). The
 - **HTTP out**: `httpx.AsyncClient` for all outbound calls (NIM, TAO, embeddings); `asyncio.to_thread()` for unavoidable sync work. Every outbound NIM request includes the `{"source": "vlm-feedback-loop"}` header (Blueprint usage-tracking convention).
 - **Errors**: structured JSON with specific codes — 503 connection errors, 504 timeouts, 400 validation, 409 conflicts.
 - **Logging**: named loggers `vlm_feedback_loop.{module}`, structured JSON with contextual fields.
-- **Docker**: multi-stage (deps → builder → runtime) from `python:3.12-slim`, `uv sync --frozen`, non-root user, healthcheck. Entry: `uvicorn` on `main:app`, port 8000.
+- **Docker**: multi-stage (deps → builder → runtime) from `python:3.12-alpine3.24`, `uv sync --frozen`, non-root user, healthcheck. Native build tools stay in the discarded builder stage; runtime carries only `libstdc++` for the locked AIPerf dependencies. Entry: `uvicorn` on `main:app`, port 8000.
 - **Token counting**: `tiktoken` with `cl100k_base` fallback. **pHash**: DCT-based 64-bit.
 
 ## Frontend patterns
 
 - **State**: Zustand for scoped client state; React Query (`@tanstack/react-query`) for server state. Typed fetch client functions in `api/`, interfaces in `types/` — no axios. Icons: `lucide-react`.
 - **KUI**: vendored tgz referenced in `src/ui/package.json` as `"@kui/react": "./assets/kui-foundations-react-external-0.504.1.tgz"`; `index.css` imports `tailwindcss` then `@kui/react/base.css`; app wrapped in `<ThemeProvider theme="dark" density="standard">` with `nv-dark` on `<html>`.
-- **Styling references** (clones in the home directory): `~/Retail-Agentic-Commerce` (primary), `~/Retail-Catalog-Enrichment` (secondary), `~/rag` (KUI package source; also Vite + React). Borrow their *values*: radii 18px cards / 14px inner / 999px pills; rgba-white text at .92/.82/.62/.4; NVIDIA green `#76b900` (+opacity variants); `backdrop-filter: blur(20px) saturate(150%)` glass; 24px card padding; 140/200/300 ms animation tiers.
+- **Styling values**: radii 18px cards / 14px inner / 999px pills; rgba-white text at .92/.82/.62/.4; NVIDIA green `#76b900` (+opacity variants); `backdrop-filter: blur(20px) saturate(150%)` glass; 24px card padding; 140/200/300 ms animation tiers.
 
 **KUI-first rules** — every new UI element starts from a KUI component; raw HTML is the exception. The decision framework:
 
@@ -168,17 +147,9 @@ nginx edge proxy in front of ui + backend (SSE buffering off, upload limits, tim
 
 Every UI change must be visually verified before it is reported complete: after CSS/styling changes, new pages, layout/structure changes, and before committing any UI work. Headless capture is installed (Playwright ≥1.58 with headless Chromium; `shot-scraper` for one-offs). No display server needed.
 
-**Prefer the inspector CLI** — the companion project at `~/vlm-ui-inspector` (see its CLAUDE.md for the full contract):
 
-```bash
-cd ~/vlm-ui-inspector && uv run inspector list          # catalog of capturable screens/states
-uv run inspector vlm <screen>                           # capture a VLM screen state → /tmp/screenshots/vlm/
-uv run inspector blueprints all                         # re-capture Retail references (only on Blueprint upgrades)
-```
 
-Its committed **Retail Blueprint reference library** (`~/vlm-ui-inspector/references/`, with INDEX.md) is the styling ground truth — load those PNGs with original image detail for side-by-side comparison instead of re-capturing the Retail apps.
-
-**Reviewer model and image contract.** Use Codex `gpt-5.6-sol` with `xhigh` reasoning. Load every model-consumed screenshot with `view_image(path=..., detail="original")`; GPT-5.6 then preserves the PNG's native dimensions instead of resizing it to a fixed patch or pixel limit, and input tokenization scales with those dimensions.
+Review screenshots at their original dimensions with the highest-detail visual reviewer available; do not resample evidence before inspection.
 
 | Viewport (dsf=1) | Use for |
 |---|---|
@@ -186,7 +157,7 @@ Its committed **Retail Blueprint reference library** (`~/vlm-ui-inspector/refere
 | **2560×1600** | Taller folds (three vertical sections in one frame) |
 | **2000×1250** | Intentional narrower layout for content-dense forms/builders |
 
-Do not shrink a capture or alter the browser viewport merely to fit a fixed image-token estimate. Keep `device_scale_factor=1` for model-consumed full screens. Crop at capture time when the question is local; this improves focus and lowers native input size without resampling the evidence. The active rationale is `~/vlm-ui-inspector/docs/codex_vision_policy.md`; the old Fable calibration is historical only.
+Do not shrink a capture or alter the browser viewport merely to fit a fixed image-token estimate. Keep `device_scale_factor=1` for model-consumed full screens. Crop at capture time when the question is local; this improves focus and lowers native input size without resampling the evidence.
 
 ```python
 from playwright.sync_api import sync_playwright
@@ -210,7 +181,7 @@ with sync_playwright() as p:
 7. Wireframes and specs can't prescribe case/tracking/density — write pros/cons before "fixing" a Blueprint-refined treatment to match ASCII art. If the code is more correct than the doc, fix the doc.
 8. After a fix: typecheck, rerun the affected test file, re-capture only the changed state, read that one crop. No full re-sweeps.
 
-Dev servers must run the latest code — kill stale ones before capturing. Screenshots under `/tmp/screenshots/` are ephemeral and never committed; the Retail reference library in the inspector repo is committed and versioned there.
+Dev servers must run the latest code — kill stale ones before capturing. Screenshots under `/tmp/screenshots/` are ephemeral and never committed.
 
 ## Testing
 

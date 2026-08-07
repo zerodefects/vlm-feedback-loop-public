@@ -40,6 +40,7 @@ export function ProposalFailure({
       <InfoBanner
         tone="error"
         icon={AlertTriangle}
+        role="alert"
         data-testid="proposal-failure-schema"
       >
         <div className="space-y-1">
@@ -115,6 +116,7 @@ export function ProposalFailure({
       <InfoBanner
         tone="error"
         icon={Clock}
+        role="alert"
         heading="Proposal failed"
         body="Timeout: the model did not respond within the deadline (180s)."
         extra="If this keeps happening, check with your administrator."
@@ -131,6 +133,7 @@ export function ProposalFailure({
       <InfoBanner
         tone="error"
         icon={Hourglass}
+        role="alert"
         heading="Proposal failed"
         body="Rate limited: the hosted endpoint is throttling requests. Wait a moment, then retry."
         extra="If this keeps happening, the shared request quota may be saturated — try again later."
@@ -146,7 +149,7 @@ export function ProposalFailure({
   // sibling — it is a richer composite component, not a button.
   return (
     <div className="flex flex-col gap-3" data-testid="proposal-failure-endpoint">
-      <InfoBanner tone="error" icon={WifiOff}>
+      <InfoBanner tone="error" icon={WifiOff} role="alert">
         <div className="space-y-1">
           <Text kind="label/bold/sm" className="block">
             Proposal failed

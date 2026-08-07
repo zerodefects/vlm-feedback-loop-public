@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { formatDeltaPoints, formatPct } from "../format-percent";
+import { formatDeltaPoints, formatMetricPct, formatPct } from "../format-percent";
 
 describe("formatPct", () => {
   it("renders a 0-1 rate as a rounded whole percent", () => {
@@ -28,6 +28,20 @@ describe("formatPct", () => {
   });
 });
 
+describe("formatMetricPct", () => {
+  it("preserves one meaningful decimal for close evaluation results", () => {
+    expect(formatMetricPct(0.908333)).toBe("90.8%");
+    expect(formatMetricPct(0.912)).toBe("91.2%");
+    expect(formatMetricPct(0.92)).toBe("92%");
+  });
+
+  it("renders em-dash for missing or non-numeric metrics", () => {
+    expect(formatMetricPct(null)).toBe("—");
+    expect(formatMetricPct(undefined)).toBe("—");
+    expect(formatMetricPct(Number.NaN)).toBe("—");
+  });
+});
+
 describe("formatDeltaPoints", () => {
   it("renders a signed whole-point delta with the pts suffix", () => {
     expect(formatDeltaPoints(0.07)).toBe("+7 pts");
@@ -35,9 +49,10 @@ describe("formatDeltaPoints", () => {
     expect(formatDeltaPoints(0)).toBe("+0 pts");
   });
 
-  it("rounds ties half-to-even, matching formatPct", () => {
-    expect(formatDeltaPoints(0.025)).toBe("+2 pts");
-    expect(formatDeltaPoints(0.035)).toBe("+4 pts");
-    expect(formatDeltaPoints(-0.025)).toBe("-2 pts");
+  it("preserves fractional percentage-point gaps without adding noise to whole points", () => {
+    expect(formatDeltaPoints(0.025)).toBe("+2.5 pts");
+    expect(formatDeltaPoints(0.035)).toBe("+3.5 pts");
+    expect(formatDeltaPoints(-0.025)).toBe("-2.5 pts");
+    expect(formatDeltaPoints(0.0354)).toBe("+3.5 pts");
   });
 });

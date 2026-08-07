@@ -23,13 +23,12 @@ export class ApiError extends Error {
 }
 
 /**
- * Extract the backend's structured ``detail`` string from a failed
- * request. ``ApiError.body`` is raw response text; the backend's error
- * handlers emit JSON like ``{"detail": "..."}``, but proxy errors and
- * plain-text bodies also flow through here, so parsing must never
- * throw. Returns null when ``err`` is not an ApiError or the body
- * carries no non-empty string detail — callers supply their own
- * fallback message.
+ * Extract the backend's user-facing detail from a failed request.
+ * ``ApiError.body`` is raw response text; handlers emit either
+ * ``{"detail": "..."}`` or a coded form such as
+ * ``{"detail": {"code": "...", "message": "..."}}``. Proxy errors and
+ * plain-text bodies also flow through here, so parsing must never throw.
+ * Returns null when no non-empty user-facing message is present.
  */
 export function parseApiErrorDetail(err: unknown): string | null {
   if (!(err instanceof ApiError)) return null;
@@ -37,6 +36,15 @@ export function parseApiErrorDetail(err: unknown): string | null {
     const parsed = JSON.parse(err.body) as { detail?: unknown };
     if (typeof parsed.detail === "string" && parsed.detail.length > 0) {
       return parsed.detail;
+    }
+    if (
+      typeof parsed.detail === "object" &&
+      parsed.detail !== null &&
+      "message" in parsed.detail &&
+      typeof parsed.detail.message === "string" &&
+      parsed.detail.message.length > 0
+    ) {
+      return parsed.detail.message;
     }
   } catch {
     // Non-JSON body (proxy error page, plain text) — no structured detail.

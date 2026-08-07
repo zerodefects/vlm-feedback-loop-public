@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import socket
@@ -53,8 +54,12 @@ from vlm_feedback_loop.services.http_client import resilient_request
 from vlm_feedback_loop.services.image_cap_resolver import (
     resolve_max_images_per_request,
 )
-from vlm_feedback_loop.services.nim_client import NIM_DEFAULT_HEADERS
-from vlm_feedback_loop.services.nim_endpoint_service import create_nim_endpoint
+from vlm_feedback_loop.services.nim_client import NIM_DEFAULT_HEADERS, create_embeddings
+from vlm_feedback_loop.services.nim_endpoint_service import (
+    NimEndpointConfigurationError,
+    create_nim_endpoint,
+    normalize_self_hosted_base_url,
+)
 from vlm_feedback_loop.services.project_service import (
     get_project_engine,
     projects_root,
@@ -62,6 +67,17 @@ from vlm_feedback_loop.services.project_service import (
 from vlm_feedback_loop.services.runtime_secrets import get_effective_secret
 
 logger = logging.getLogger("vlm_feedback_loop.services.local_nim_service")
+
+
+def release_version_from_image(image: str | None) -> str | None:
+    """Return a registry image tag without mistaking a port for a tag."""
+    if not image or "@" in image:
+        return None
+    final_component = image.rsplit("/", 1)[-1]
+    if ":" not in final_component:
+        return None
+    return final_component.rsplit(":", 1)[-1] or None
+
 
 # Upper bound for the preflight ``list-model-profiles`` probe (check 7). On
 # current VLM NIM images the command performs a full engine init rather than a
@@ -153,6 +169,7 @@ RESERVED_CONTAINER_ENV_KEYS = frozenset(
         "NIM_MODEL_NAME",
         "NIM_MODEL_PATH",
         "NIM_PRECISION",
+        "NIM_ENABLE_KV_CACHE_REUSE",
     }
 )
 
@@ -319,7 +336,11 @@ def _build_docker_run_command(
         "--ulimit",
         "stack=67108864",
         "-p",
-        f"{host_port}:8000",
+        # System-managed NIMs are private implementation services consumed
+        # through the loopback endpoint persisted below. Publishing on every
+        # host interface would expose an unauthenticated model server even
+        # when the Blueprint itself keeps its safe loopback bind default.
+        f"127.0.0.1:{host_port}:8000",
         "-e",
         "NGC_API_KEY",
         "-v",
@@ -384,7 +405,14 @@ def _build_docker_run_command(
     #     its cached default weights).
     if nim_model_size:
         args.extend(["-e", f"NIM_MODEL_SIZE={nim_model_size}"])
-    if nim_model_profile:
+    # A base profile selects the image's bundled weights and must never be
+    # combined with a custom Student checkpoint. Keep this guard here as a
+    # final serialization invariant even though deploy/preflight resolution
+    # already clears the incompatible profile.
+    custom_student_checkpoint = bool(
+        role == "student" and checkpoint_mount and nim_model_name_path
+    )
+    if nim_model_profile and not custom_student_checkpoint:
         args.extend(["-e", f"NIM_MODEL_PROFILE={nim_model_profile}"])
     # ``nim_served_model_name`` is the requested catalog model name for
     # teacher (shared-image) deploys and the custom ``student-<id>`` name for
@@ -394,6 +422,10 @@ def _build_docker_run_command(
         args.extend(["-e", f"NIM_SERVED_MODEL_NAME={nim_served_model_name}"])
 
     if role == "student":
+        # Canonical serving comparison policy. The benchmark replays the same
+        # frozen Test Pool at multiple concurrencies; prefix-cache hits would
+        # otherwise make later cells incomparable to the first.
+        args.extend(["-e", "NIM_ENABLE_KV_CACHE_REUSE=0"])
         if checkpoint_mount and nim_model_name_path:
             # Mount host checkpoint dir at the in-container path.
             args.extend(["-v", f"{checkpoint_mount}:{nim_model_name_path}:ro"])
@@ -509,13 +541,13 @@ def _resolve_deployment_compute_capability_floor(
 def _resolve_shared_image_deploy_env(
     engine: Any, model_config_id: str
 ) -> tuple[str | None, str | None, str | None]:
-    """Resolve the shared-image deploy selectors for a Teacher ModelConfig.
+    """Resolve shared-image deploy selectors for a base ModelConfig.
 
     Returns ``(nim_model_size, nim_model_profile, nim_served_model_name)`` for
     a model that ships in a multi-size shared NIM image (cosmos3-reasoner
     nano/super). ``nim_model_size`` comes from
     ``local_deploy_metadata.nim_model_size``; when it is absent (every
-    single-image teacher, e.g. cosmos-reason2-{2b,8b}) ALL THREE values are
+    single-image model, e.g. cosmos-reason2-{2b,8b}) ALL THREE values are
     ``None`` so the docker command for those models is byte-for-byte unchanged.
 
     For a shared-image model:
@@ -555,40 +587,65 @@ def _resolve_shared_image_deploy_env(
         return (str(model_size), str(profile) if profile else None, served_name)
 
 
+def _resolve_runtime_deploy_env(
+    engine: Any,
+    model_config_id: str,
+    *,
+    role: str,
+    custom_checkpoint: bool,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve selectors for the workload the container will actually serve.
+
+    A base-model profile selects the weights bundled with the NIM image. That
+    pin is required for a shared-image Teacher, but it is incompatible with a
+    Student's read-only custom checkpoint mount: the profile selector wins
+    before ``NIM_MODEL_NAME`` can generate/select a checkpoint-compatible
+    runtime profile. Custom Students therefore retain the base model's size
+    selector while allowing NIM to auto-select against the mounted weights.
+    """
+
+    model_size, model_profile, served_name = _resolve_shared_image_deploy_env(
+        engine, model_config_id
+    )
+    if role == "student" and custom_checkpoint:
+        model_profile = None
+    return model_size, model_profile, served_name
+
+
 def resolve_shared_image_preflight_env(
     project_id: str,
     model_config_id: str,
     workspace_root: str,
 ) -> tuple[str | None, str | None, str | None]:
-    """Resolve the model selectors a Teacher profile probe must receive."""
+    """Resolve the model selectors a Teacher or Student probe must receive."""
     engine = get_project_engine(project_id, workspace_root)
     return _resolve_shared_image_deploy_env(engine, model_config_id)
 
 
-def _resolve_extra_container_env(engine: Any, model_config_id: str) -> dict[str, str]:
-    """Operator-supplied container env from ``local_deploy_metadata.extra_container_env``.
+def resolve_student_checkpoint_preflight_env(
+    project_id: str,
+    model_config_id: str,
+    workspace_root: str,
+) -> tuple[str | None, None, str | None]:
+    """Resolve size/name selectors for a custom Student checkpoint probe."""
 
-    The in-product vehicle for live-validated NIM remediations that must
-    ride a system-managed deploy (e.g. ``NIM_DISABLE_CUDA_GRAPH=1`` for the
-    CR2 Hopper XID-31 crash, ``NIM_MAX_MODEL_LEN`` context clamps) —
-    PATCHed onto the ModelConfig's metadata instead of bypassing the
-    Blueprint with a manual ``docker run``. Student deploys reference the
-    base ModelConfig, so they inherit the base model's env: the remediation
-    targets the shared container image, not the checkpoint.
+    engine = get_project_engine(project_id, workspace_root)
+    model_size, _model_profile, served_name = _resolve_runtime_deploy_env(
+        engine,
+        model_config_id,
+        role="student",
+        custom_checkpoint=True,
+    )
+    return model_size, None, served_name
 
-    Keys must be ``UPPER_SNAKE_CASE`` and may not shadow the builder-owned
-    env (``RESERVED_CONTAINER_ENV_KEYS``); offenders are skipped with a
-    warning naming only the key. Values are rendered verbatim into the
-    docker command and its operator-visible display/handoff forms — never
-    put secrets here.
+
+def normalize_extra_container_env(raw: object) -> dict[str, str]:
+    """Return only metadata entries the Docker builder will pass to NIM.
+
+    Keys must be ``UPPER_SNAKE_CASE`` and may not shadow builder-owned
+    environment. Values are rendered verbatim into the launch command and
+    operator-visible handoffs, so this metadata must never contain secrets.
     """
-    if engine is None or not model_config_id:
-        return {}
-    with Session(engine) as session:
-        mc = session.get(ModelConfig, model_config_id)
-        if mc is None:
-            return {}
-        raw: Any = (mc.local_deploy_metadata or {}).get("extra_container_env")
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -616,6 +673,28 @@ def _resolve_extra_container_env(engine: Any, model_config_id: str) -> dict[str,
             continue
         resolved[key] = str(value)
     return resolved
+
+
+def _resolve_extra_container_env(engine: Any, model_config_id: str) -> dict[str, str]:
+    """Load and validate a model config's operator-supplied NIM environment."""
+    if engine is None or not model_config_id:
+        return {}
+    with Session(engine) as session:
+        mc = session.get(ModelConfig, model_config_id)
+        if mc is None:
+            return {}
+        raw: Any = (mc.local_deploy_metadata or {}).get("extra_container_env")
+    return normalize_extra_container_env(raw)
+
+
+def resolve_extra_container_env(
+    project_id: str,
+    model_config_id: str,
+    workspace_root: str,
+) -> dict[str, str]:
+    """Return validated non-secret deploy env for handoffs and bundles."""
+    engine = get_project_engine(project_id, workspace_root)
+    return _resolve_extra_container_env(engine, model_config_id)
 
 
 # ── Served-model verification (anti-silent-fallback) ───────────────────────────
@@ -1029,16 +1108,13 @@ def list_active_nim_residents(workspace_root: str) -> list[ActiveNimResident]:
                 for dep in session.execute(stmt).scalars().all():
                     mc = session.get(ModelConfig, dep.model_config_id)
                     metadata = dict(mc.local_deploy_metadata or {}) if mc else {}
-                    extra_env = metadata.get("extra_container_env")
-                    normalized_env: tuple[tuple[str, str], ...] = ()
-                    if isinstance(extra_env, dict):
-                        env_values = cast("dict[object, object]", extra_env)
-                        normalized_env = tuple(
-                            sorted(
-                                (str(key), str(value))
-                                for key, value in env_values.items()
-                            )
+                    normalized_env = tuple(
+                        sorted(
+                            normalize_extra_container_env(
+                                metadata.get("extra_container_env")
+                            ).items()
                         )
+                    )
                     model_name = mc.model_name if mc is not None else None
                     if model_name is None and dep.role == "student":
                         model_name = dep.nim_served_model_name
@@ -1105,13 +1181,13 @@ def _requested_teacher_identity(
         if mc is None or mc.project_id != project_id:
             return None
         metadata = dict(mc.local_deploy_metadata or {})
-        extra_env = metadata.get("extra_container_env")
-        normalized_env: tuple[tuple[str, str], ...] = ()
-        if isinstance(extra_env, dict):
-            env_values = cast("dict[object, object]", extra_env)
-            normalized_env = tuple(
-                sorted((str(key), str(value)) for key, value in env_values.items())
+        normalized_env = tuple(
+            sorted(
+                normalize_extra_container_env(
+                    metadata.get("extra_container_env")
+                ).items()
             )
+        )
         return (
             str(mc.model_name).casefold(),
             nim_container_image,
@@ -1312,6 +1388,120 @@ def reuse_compatible_running_teacher(
     return resident
 
 
+def reattach_selected_teacher_consumers(
+    workspace_root: str,
+    deployment_id: str,
+) -> int:
+    """Repair former consumers when an exact Teacher resident returns.
+
+    A shared resident stop correctly disables every project-local attachment.
+    The same exact runtime may later be restored under a new deployment row,
+    often on the same host port.  Projects whose *selected* Teacher still
+    points at a disabled Blueprint-managed local attachment should follow that
+    replacement resident automatically; otherwise the picker says unavailable
+    while the stale URL may accidentally reach the new process.
+
+    This deliberately does not adopt hosted configs, self-hosted endpoints, or
+    a different model selection. Exact runtime identity is checked with the
+    same model/image/size/profile/environment contract as explicit reuse.
+    """
+
+    resident = next(
+        (
+            candidate
+            for candidate in list_active_nim_residents(workspace_root)
+            if candidate.deployment_id == deployment_id
+            and candidate.role == "teacher"
+            and candidate.status == "running"
+        ),
+        None,
+    )
+    if resident is None:
+        return 0
+
+    candidates: list[tuple[str, str, str]] = []
+    root = projects_root(workspace_root)
+    if not root.exists():
+        return 0
+
+    for entry in sorted(root.iterdir()):
+        if (
+            not entry.is_dir()
+            or (entry / ".archived").exists()
+            or not (entry / "project.db").exists()
+        ):
+            continue
+        try:
+            engine = get_project_engine(entry.name, workspace_root)
+            if engine is None:
+                continue
+            with Session(engine) as session:
+                project = session.get(Project, entry.name)
+                if project is None or not project.teacher_model_config_id:
+                    continue
+                model_config = session.get(ModelConfig, project.teacher_model_config_id)
+                if (
+                    model_config is None
+                    or model_config.project_id != entry.name
+                    or "teacher" not in (model_config.eligible_roles or [])
+                    or not model_config.supports_image_input
+                ):
+                    continue
+                endpoint = session.get(NimEndpoint, model_config.endpoint_id)
+                if (
+                    endpoint is None
+                    or endpoint.endpoint_mode != "local_system_managed"
+                    or endpoint.source_kind != "auto_registered_local"
+                    or (
+                        endpoint.is_enabled
+                        and endpoint.last_probe_status
+                        not in {"unhealthy", "auth_failed", "unreachable"}
+                    )
+                ):
+                    continue
+                metadata = dict(model_config.local_deploy_metadata or {})
+                image = metadata.get("nim_container_image")
+                if not image:
+                    continue
+                candidates.append(
+                    (entry.name, str(model_config.model_config_id), str(image))
+                )
+        except Exception as exc:
+            logger.warning(
+                "Skipping former Teacher consumer %s during resident repair (%s: %s)",
+                entry.name,
+                type(exc).__name__,
+                str(exc) or "(no message)",
+            )
+
+    reattached = 0
+    for project_id, model_config_id, image in candidates:
+        if not teacher_resident_matches_request(
+            resident,
+            project_id=project_id,
+            model_config_id=model_config_id,
+            nim_container_image=image,
+            workspace_root=workspace_root,
+        ):
+            continue
+        reused = reuse_compatible_running_teacher(
+            project_id=project_id,
+            model_config_id=model_config_id,
+            nim_container_image=image,
+            workspace_root=workspace_root,
+        )
+        if reused is not None:
+            reattached += 1
+
+    if reattached:
+        logger.info(
+            "Reattached %d selected Teacher consumer(s) to restored resident %s",
+            reattached,
+            deployment_id,
+        )
+    return reattached
+
+
 def reuse_first_compatible_running_teacher_for_project(
     *,
     project_id: str,
@@ -1397,7 +1587,15 @@ def disable_teacher_resident_endpoints(
     if not root.exists():
         return disabled
     for entry in sorted(root.iterdir()):
-        if not entry.is_dir() or not (entry / "project.db").exists():
+        # Archived projects cannot own a live resident (the archive busy gate
+        # rejects active deployments) and are not active endpoint consumers.
+        # Skip them before opening SQLite so a retained pre-v1 database cannot
+        # flood an otherwise successful stop with irrelevant migration errors.
+        if (
+            not entry.is_dir()
+            or (entry / ".archived").exists()
+            or not (entry / "project.db").exists()
+        ):
             continue
         try:
             engine = get_project_engine(entry.name, workspace_root)
@@ -1608,6 +1806,166 @@ def update_embedding_deployment_config(
         session.commit()
         session.refresh(config)
         return config
+
+
+async def probe_embedding_endpoint(
+    base_url: str,
+    auth_headers: dict[str, str],
+    settings: Settings,
+) -> EmbeddingDeploymentConfig:
+    """Verify one embedding endpoint without mutating deployment state.
+
+    A generic ``GET /models`` probe can go green against a Teacher-only NIM.
+    The embedding configuration path therefore sends the real NeMo Retriever
+    request and requires one finite vector at the deployment's exact seeded
+    dimension before the URL is eligible for Save.
+    """
+    engine = init_deployment_db(settings.WORKSPACE_ROOT)
+    with Session(engine) as session:
+        config = session.execute(select(EmbeddingDeploymentConfig)).scalar_one_or_none()
+        if config is None:
+            raise NimEndpointConfigurationError(
+                500,
+                "embedding_config_missing",
+                "Embedding deployment configuration is unavailable.",
+            )
+        session.expunge(config)
+
+    result = await create_embeddings(
+        base_url=base_url,
+        auth_headers=auth_headers,
+        model=config.model_name,
+        input_items=["VLM Feedback Loop embedding connection test"],
+        deadline_s=float(settings.HTTP_DEADLINE_INTERACTIVE_S),
+        max_retries=1,
+        input_type=settings.EMBEDDING_INPUT_TYPE,
+    )
+    if not result.success or not result.embeddings:
+        message = (
+            result.error or "Could not obtain an embedding from this NIM endpoint."
+        )
+        if result.status_code == 404:
+            message = (
+                "This endpoint does not expose the required /embeddings operation "
+                "for the configured NeMo Retriever model."
+            )
+        raise NimEndpointConfigurationError(
+            400,
+            "embedding_probe_failed",
+            message,
+        )
+    if len(result.embeddings) != 1:
+        raise NimEndpointConfigurationError(
+            400,
+            "embedding_response_invalid",
+            "The endpoint returned an unexpected number of embedding vectors.",
+        )
+    vector = result.embeddings[0]
+    if len(vector) != config.embedding_dim or not all(
+        math.isfinite(value) for value in vector
+    ):
+        raise NimEndpointConfigurationError(
+            400,
+            "embedding_response_invalid",
+            f"The endpoint must return one finite {config.embedding_dim}-dimensional vector.",
+        )
+    return config
+
+
+async def probe_self_hosted_embedding(
+    base_url: str,
+    settings: Settings,
+) -> tuple[str, EmbeddingDeploymentConfig]:
+    """Normalize and verify one credential-free embedding NIM."""
+    normalized_url = normalize_self_hosted_base_url(base_url)
+    config = await probe_embedding_endpoint(normalized_url, {}, settings)
+    return normalized_url, config
+
+
+async def configure_self_hosted_embedding(
+    base_url: str,
+    settings: Settings,
+) -> EmbeddingDeploymentConfig:
+    """Live-verify and durably select one external embedding NIM.
+
+    The network call completes before any write. A concurrent or already
+    active Blueprint-managed embedding resident blocks the switch so a Save
+    cannot orphan a GPU-consuming container behind an external URL.
+    """
+    if settings.EMBEDDING_PROVIDER not in (
+        "auto",
+        "self_hosted_nvclip",
+        "local_nvclip",
+    ):
+        raise NimEndpointConfigurationError(
+            409,
+            "embedding_provider_pinned",
+            "The operator-pinned EMBEDDING_PROVIDER setting does not allow a self-hosted endpoint.",
+        )
+
+    normalized_url, _config = await probe_self_hosted_embedding(base_url, settings)
+
+    async with _GPU_DEPLOY_LOCK:
+        active_embedding_placements = [
+            (project_id, deployment_id)
+            for (
+                _device,
+                role,
+                project_id,
+                deployment_id,
+                _host_port,
+            ) in _scan_active_deployment_placements(settings.WORKSPACE_ROOT)
+            if role == "embedding"
+        ]
+        exact_managed_gpu: str | None = None
+        for owner_project_id, deployment_id in active_embedding_placements:
+            owner_engine = get_project_engine(owner_project_id, settings.WORKSPACE_ROOT)
+            if owner_engine is None:
+                continue
+            with Session(owner_engine) as session:
+                deployment = session.get(LocalNimDeployment, deployment_id)
+                if (
+                    deployment is not None
+                    and deployment.status in ("starting", "running")
+                    and deployment.endpoint_url == normalized_url
+                ):
+                    exact_managed_gpu = deployment.gpu_assignment
+                    break
+        current_engine = init_deployment_db(settings.WORKSPACE_ROOT)
+        with Session(current_engine) as session:
+            current = session.execute(
+                select(EmbeddingDeploymentConfig)
+            ).scalar_one_or_none()
+            current_endpoint_url = current.endpoint_url if current is not None else None
+        if active_embedding_placements and (
+            current_endpoint_url != normalized_url or exact_managed_gpu is None
+        ):
+            raise NimEndpointConfigurationError(
+                409,
+                "local_embedding_active",
+                "Stop the Blueprint-managed local embedding NIM before switching to a different self-hosted endpoint.",
+            )
+        updates: dict[str, Any] = {
+            "provider": "self_hosted_nvclip",
+            "endpoint_url": normalized_url,
+        }
+        # Re-saving the exact active managed endpoint is a harmless live
+        # verification and must preserve its placement identity. A genuinely
+        # external endpoint has no Blueprint GPU assignment.
+        updates["gpu_assignment"] = exact_managed_gpu
+        updated = update_embedding_deployment_config(
+            settings.WORKSPACE_ROOT,
+            updates,
+        )
+
+    if updated is None:
+        raise NimEndpointConfigurationError(
+            500,
+            "embedding_config_missing",
+            "Embedding deployment configuration is unavailable.",
+        )
+    await resweep_embedding_tasks(settings)
+    return updated
 
 
 def _reset_embedding_deployment_config(
@@ -2182,11 +2540,9 @@ async def run_preflight_checks(
     # Image is now cached, so list-model-profiles runs without a pull.
     #
     # Embedding NIMs (legacy NV-CLIP, current NeMo Retriever VL) do not
-    # support list-model-profiles as a standalone probe — the command
-    # triggers the full server startup pipeline which tries to download model
-    # artifacts. For embedding containers we skip this check; the GPU memory
-    # gate (check 3) is sufficient. Some current VLM Teacher NIMs also perform a
-    # full engine init, handled below with a bounded, host-cache-backed probe.
+    # support list-model-profiles as a standalone probe. For embedding
+    # containers we skip this check; the GPU memory gate (check 3) is
+    # sufficient.
     if role == "embedding":
         checks.append(
             PreflightCheckResult(
@@ -2196,11 +2552,12 @@ async def run_preflight_checks(
             )
         )
     else:
-        # ``list-model-profiles`` on current VLM NIM images (verified on
-        # cosmos-reason2-*:1.7.0, RTX PRO 6000 Blackwell) does NOT do a cheap
-        # manifest lookup — it triggers the FULL engine init (loads weights,
-        # captures CUDA graphs), running for many minutes. Treating a probe
-        # timeout as fatal causes two bugs this handling guards against:
+        # NIM images commonly use a shell-form entrypoint such as
+        # ``/bin/bash -c $SERVER_START_SCRIPT_PATH``. Appending
+        # ``list-model-profiles`` after the image makes it bash's ``$0`` and
+        # the wrapper ignores it, starting the full inference server instead.
+        # Override the entrypoint so the standalone probe binary is actually
+        # invoked. Keep the bounded timeout and cleanup as defense in depth:
         #   1. False FAILURE — a GPU where the model serves fine is rejected
         #      with "No compatible model profile ... Command timed out after
         #      120.0s", because the probe simply hasn't finished initialising.
@@ -2238,13 +2595,14 @@ async def run_preflight_checks(
             "--rm",
             "--name",
             preflight_name,
+            "--entrypoint",
+            "/usr/local/bin/list-model-profiles",
             "--runtime=nvidia",
             "--gpus",
             f'"device={device_index}"',
             *profile_runtime,
             *profile_env,
             nim_container_image,
-            "list-model-profiles",
             timeout_s=PROFILE_PROBE_TIMEOUT_S,
             secret_env={
                 "NGC_API_KEY": get_effective_secret("NGC_API_KEY", settings) or ""
@@ -2254,6 +2612,21 @@ async def run_preflight_checks(
         # holding the GPU (see note above); --rm only fires on clean exit.
         await run_subprocess("docker", "rm", "-f", preflight_name, timeout_s=30.0)
         timed_out = profile_rc == -1 and "timed out" in (profile_stderr or "")
+        probe_output = f"{profile_stderr or ''}\n{profile_stdout or ''}"
+        # Some published single-model NIMs (live-confirmed with Cosmos
+        # Reason2 8B 1.6.0) do not ship the optional standalone probe binary.
+        # That says nothing about whether their one model can serve on this
+        # GPU. Keep shared-image selection strict: Nano/Super must retain the
+        # probe because otherwise the image can validate its default sibling.
+        probe_unavailable_for_single_image = (
+            nim_model_size is None
+            and re.search(
+                r"/usr/local/bin/list-model-profiles.*(?:no such file|not found)",
+                probe_output,
+                re.IGNORECASE,
+            )
+            is not None
+        )
         if profile_rc == 0:
             profile_ok = True
             profile_diagnostic = f"Compatible model profile found on GPU {device_index}"
@@ -2262,9 +2635,16 @@ async def run_preflight_checks(
             profile_diagnostic = (
                 f"Profile probe inconclusive on GPU {device_index}: "
                 f"list-model-profiles did not return within "
-                f"{int(PROFILE_PROBE_TIMEOUT_S)}s (this NIM image performs a "
-                f"full engine init for the probe). Proceeding — the serve "
+                f"{int(PROFILE_PROBE_TIMEOUT_S)}s. Proceeding — the serve "
                 f"health check is the authoritative profile gate."
+            )
+        elif probe_unavailable_for_single_image:
+            profile_ok = True
+            profile_diagnostic = (
+                f"Profile probe unavailable for this single-model image on GPU "
+                f"{device_index}: the image does not ship list-model-profiles. "
+                f"Proceeding — the serve health and served-model checks are the "
+                f"authoritative compatibility gates."
             )
         else:
             profile_ok = False
@@ -2469,12 +2849,17 @@ async def _queue_local_nim_deploy(
     nim_model_size: str | None = None
     nim_model_profile: str | None = None
     shared_image_served_name: str | None = None
-    if role == "teacher":
+    if role in ("teacher", "student"):
         (
             nim_model_size,
             nim_model_profile,
             shared_image_served_name,
-        ) = _resolve_shared_image_deploy_env(engine, model_config_id)
+        ) = _resolve_runtime_deploy_env(
+            engine,
+            model_config_id,
+            role=role,
+            custom_checkpoint=bool(checkpoint_mount and nim_model_name_path),
+        )
     queued_preflight = PreflightResult(
         all_passed=True,
         checks=[
@@ -2495,7 +2880,9 @@ async def _queue_local_nim_deploy(
             role=role,
             checkpoint_mount=checkpoint_mount,
             nim_model_name_path=nim_model_name_path,
-            nim_served_model_name=shared_image_served_name or nim_served_model_name,
+            nim_served_model_name=(
+                shared_image_served_name if role == "teacher" else nim_served_model_name
+            ),
             max_images_per_request=(
                 _resolve_deployment_image_cap(engine, model_config_id)
                 if role in ("teacher", "student")
@@ -2811,12 +3198,17 @@ async def _deploy_local_nim_impl(
     nim_model_size: str | None = None
     nim_model_profile: str | None = None
     shared_image_served_name: str | None = None
-    if role == "teacher":
+    if role in ("teacher", "student"):
         (
             nim_model_size,
             nim_model_profile,
             shared_image_served_name,
-        ) = _resolve_shared_image_deploy_env(engine, model_config_id)
+        ) = _resolve_runtime_deploy_env(
+            engine,
+            model_config_id,
+            role=role,
+            custom_checkpoint=bool(checkpoint_mount and nim_model_name_path),
+        )
 
     # Run preflight
     preflight = await run_preflight_checks(
@@ -2827,7 +3219,7 @@ async def _deploy_local_nim_impl(
         settings=settings,
         gpu_compute_capability_minimum=(
             _resolve_deployment_compute_capability_floor(engine, model_config_id)
-            if role == "teacher"
+            if role in ("teacher", "student")
             else None
         ),
         nim_model_size=nim_model_size,
@@ -2950,7 +3342,9 @@ async def _deploy_local_nim_impl(
         nim_model_name_path=nim_model_name_path,
         # Teacher shared-image deploys serve under the requested catalog name;
         # student deploys keep their custom ``student-<id>`` served name.
-        nim_served_model_name=shared_image_served_name or nim_served_model_name,
+        nim_served_model_name=(
+            shared_image_served_name if role == "teacher" else nim_served_model_name
+        ),
         max_images_per_request=image_cap,
         nim_model_size=nim_model_size,
         nim_model_profile=nim_model_profile,
@@ -3115,8 +3509,8 @@ async def _container_startup_liveness(
 
     Returns ``(state, exit_code, log_tail)``. ``state`` is ``"running"``
     (keep polling), ``"exited"`` (dead — exit code available), or
-    ``"missing"`` (removed out-of-band). ``log_tail`` carries the last few
-    container log lines for the failure reason on dead containers; empty
+    ``"missing"`` (removed out-of-band). ``log_tail`` carries an actionable
+    root-cause line plus the last few shutdown lines for dead containers; empty
     when running. Inspect errors other than not-found are treated as
     ``"running"`` — a transient docker CLI hiccup must not fail a healthy
     startup.
@@ -3142,10 +3536,26 @@ async def _container_startup_liveness(
         int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else None
     )
     _, logs_out, logs_err = await run_subprocess(
-        "docker", "logs", "--tail", "5", container_name, timeout_s=10.0
+        "docker", "logs", "--tail", "200", container_name, timeout_s=10.0
     )
     tail_lines = ((logs_err or "") + "\n" + (logs_out or "")).strip().splitlines()
-    log_tail = " | ".join(line.strip() for line in tail_lines[-3:] if line.strip())
+    normalized = [line.strip() for line in tail_lines if line.strip()]
+    root_cause = next(
+        (
+            line
+            for line in reversed(normalized)
+            if re.search(
+                r"(?:ValueError:|CUDA out of memory|out of memory|NIM_MODEL_|No compatible profile)",
+                line,
+                re.IGNORECASE,
+            )
+        ),
+        None,
+    )
+    final_lines = normalized[-3:]
+    if root_cause is not None and root_cause not in final_lines:
+        final_lines.insert(0, root_cause)
+    log_tail = " | ".join(final_lines)
     return "exited", exit_code, log_tail[:600]
 
 
@@ -3470,13 +3880,18 @@ async def _on_healthy(
     endpoint_url: str,
     workspace_root: str,
     settings: Settings,
+    *,
+    rebind_running: bool = False,
 ) -> None:
     """Handle a newly healthy local NIM deployment.
 
     Verifies the requested model is genuinely the one being served
     (anti-silent-fallback) and that the inference path actually answers
     (anti-dead-engine), then marks the deployment ``running`` and
-    auto-registers the endpoint. A verification or probe failure marks
+    auto-registers the endpoint. Restart recovery may explicitly rebind an
+    already-``running`` deployment after re-verifying its surviving container;
+    normal health polling may only promote ``starting`` deployments. A
+    verification or probe failure marks
     the deployment ``failed`` with a specific reason, stops the container,
     and does NOT auto-register — the operator is never silently handed a
     wrong or dead model.
@@ -3569,10 +3984,10 @@ async def _on_healthy(
             )
             return
 
-    promoted = False
+    ready_to_bind = False
 
-    def _promote_to_running() -> None:
-        nonlocal promoted
+    def _promote_or_adopt_running() -> None:
+        nonlocal ready_to_bind
         with Session(engine) as session:
             dep = session.get(LocalNimDeployment, deployment_id)
             if dep is None:
@@ -3583,43 +3998,76 @@ async def _on_healthy(
             # health poll is mid-flight; a late "healthy" must not resurrect
             # it into "running" and re-register a dead endpoint. See
             # _poll_health's wall-clock note.
-            if dep.status != "starting":
+            if dep.status == "starting":
+                dep.status = "running"
+                dep.deployed_at = utc_now()
+                session.commit()
+                ready_to_bind = True
+                return
+            if rebind_running and dep.status == "running":
+                # Backend restart recovery has already health-checked,
+                # identity-verified, and inference-probed the surviving
+                # container. Keep the original deployment timestamp and
+                # continue into the idempotent endpoint repair below.
+                ready_to_bind = True
+                return
+            else:
                 logger.info(
                     "Local NIM %s became healthy but is now %s — not "
-                    "promoting to running (deployment was torn down "
-                    "concurrently)",
+                    "binding it (deployment was torn down concurrently)",
                     deployment_id,
                     dep.status,
                 )
                 return
-            dep.status = "running"
-            dep.deployed_at = utc_now()
-            session.commit()
-            promoted = True
 
     # Retry lock contention — a healthy NIM must not be lost to a
     # transient snapshot-upgrade conflict with a concurrent writer.
     await _commit_with_lock_retry(
-        _promote_to_running, what=f"deployment {deployment_id} promote-to-running"
+        _promote_or_adopt_running,
+        what=f"deployment {deployment_id} promote-or-adopt-running",
     )
-    if not promoted:
+    if not ready_to_bind:
         return
 
-    # Auto-register endpoint
+    # Auto-register endpoint. Recovery is idempotent: reuse and repair the
+    # endpoint already stamped with this deployment identity instead of
+    # appending one duplicate endpoint per backend restart.
     if role == "teacher":
         activate_requested = False
-        nim_endpoint = await create_nim_endpoint(
-            project_id=project_id,
-            data={
-                "display_name": f"Local Teacher ({endpoint_url})",
-                "endpoint_mode": "local_system_managed",
-                "base_url": endpoint_url,
-                "auth_mode": "none",
-                "source_kind": "auto_registered_local",
-            },
-            workspace_root=workspace_root,
-            settings=settings,
-        )
+        nim_endpoint: NimEndpoint | None = None
+        if rebind_running:
+            with Session(engine) as session:
+                stmt = (
+                    select(NimEndpoint)
+                    .where(
+                        NimEndpoint.local_nim_deployment_id == deployment_id,
+                        NimEndpoint.base_url == endpoint_url,
+                    )
+                    .order_by(NimEndpoint.created_at.desc())
+                )
+                existing_endpoint = session.execute(stmt).scalars().first()
+                if existing_endpoint is not None:
+                    existing_endpoint.is_enabled = True
+                    existing_endpoint.last_probe_at = utc_now()
+                    existing_endpoint.last_probe_status = "healthy"
+                    existing_endpoint.last_probe_error_ref = None
+                    session.commit()
+                    session.refresh(existing_endpoint)
+                    session.expunge(existing_endpoint)
+                    nim_endpoint = existing_endpoint
+        if nim_endpoint is None:
+            nim_endpoint = await create_nim_endpoint(
+                project_id=project_id,
+                data={
+                    "display_name": f"Local Teacher ({endpoint_url})",
+                    "endpoint_mode": "local_system_managed",
+                    "base_url": endpoint_url,
+                    "auth_mode": "none",
+                    "source_kind": "auto_registered_local",
+                },
+                workspace_root=workspace_root,
+                settings=settings,
+            )
         if nim_endpoint:
             with Session(engine) as session:
                 # Re-verify the deployment is still running before repointing
@@ -3665,6 +4113,12 @@ async def _on_healthy(
                 model_config_id=model_config_id,
             )
 
+            # A prior generation of this exact shared Teacher may have been
+            # displaced and disabled across consumer projects. Once the new
+            # resident has passed health, served-model verification, and a
+            # real inference probe, repair those still-selected attachments.
+            reattach_selected_teacher_consumers(workspace_root, deployment_id)
+
             # NIM Configuration's model-change intent becomes active only
             # after every adoption gate above passed and the ModelConfig now
             # points at the verified local endpoint. FTUE hybrid deploys leave
@@ -3683,6 +4137,15 @@ async def _on_healthy(
 
     elif role == "embedding":
         # Update EmbeddingDeploymentConfig
+        with Session(engine) as session:
+            deployment = session.get(LocalNimDeployment, deployment_id)
+            if deployment is None or deployment.status != "running":
+                logger.info(
+                    "Embedding NIM %s is no longer running — not stamping deployment config",
+                    deployment_id,
+                )
+                return
+            embedding_gpu_assignment = deployment.gpu_assignment
         deploy_engine = init_deployment_db(Path(workspace_root))
         with Session(deploy_engine) as session:
             stmt = select(EmbeddingDeploymentConfig).limit(1)
@@ -3690,6 +4153,7 @@ async def _on_healthy(
             if config:
                 config.provider = "self_hosted_nvclip"
                 config.endpoint_url = endpoint_url
+                config.gpu_assignment = embedding_gpu_assignment
                 config.updated_at = utc_now()
                 session.commit()
 
@@ -4077,6 +4541,7 @@ async def _recover_single_deployment(
                 endpoint_url=dep.endpoint_url,
                 workspace_root=workspace_root,
                 settings=settings,
+                rebind_running=True,
             )
         elif dep.status == "starting":
             # The deploy's in-process health watcher disappears with the
@@ -4284,6 +4749,14 @@ def build_student_docker_run_args(
     # ``deploy_local_nim`` actually executed.
     engine = get_project_engine(deployment.project_id, settings.WORKSPACE_ROOT)
     image_cap = _resolve_deployment_image_cap(engine, deployment.model_config_id)
+    nim_model_size, nim_model_profile, _base_served_name = _resolve_runtime_deploy_env(
+        engine,
+        deployment.model_config_id,
+        role=deployment.role,
+        custom_checkpoint=bool(
+            deployment.checkpoint_mount_path and deployment.nim_model_name_path
+        ),
+    )
     return _build_docker_run_command(
         nim_container_image=deployment.nim_container_image,
         container_name=deployment.container_name,
@@ -4294,6 +4767,8 @@ def build_student_docker_run_args(
         nim_model_name_path=deployment.nim_model_name_path,
         nim_served_model_name=deployment.nim_served_model_name,
         max_images_per_request=image_cap,
+        nim_model_size=nim_model_size,
+        nim_model_profile=nim_model_profile,
         extra_env=_resolve_extra_container_env(engine, deployment.model_config_id),
     )
 
@@ -4307,6 +4782,14 @@ def build_student_docker_run_display(
     """
     engine = get_project_engine(deployment.project_id, settings.WORKSPACE_ROOT)
     image_cap = _resolve_deployment_image_cap(engine, deployment.model_config_id)
+    nim_model_size, nim_model_profile, _base_served_name = _resolve_runtime_deploy_env(
+        engine,
+        deployment.model_config_id,
+        role=deployment.role,
+        custom_checkpoint=bool(
+            deployment.checkpoint_mount_path and deployment.nim_model_name_path
+        ),
+    )
     return docker_run_command_display(
         nim_container_image=deployment.nim_container_image,
         container_name=deployment.container_name,
@@ -4317,5 +4800,7 @@ def build_student_docker_run_display(
         nim_model_name_path=deployment.nim_model_name_path,
         nim_served_model_name=deployment.nim_served_model_name,
         max_images_per_request=image_cap,
+        nim_model_size=nim_model_size,
+        nim_model_profile=nim_model_profile,
         extra_env=_resolve_extra_container_env(engine, deployment.model_config_id),
     )

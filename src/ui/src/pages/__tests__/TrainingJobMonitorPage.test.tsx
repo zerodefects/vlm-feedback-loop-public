@@ -27,6 +27,7 @@ import { TrainingJobMonitorPage } from "../TrainingJobMonitorPage";
 // ── Mocks ──────────────────────────────────────────────────────────────────
 
 vi.mock("@/api/training", () => ({
+  createTrainingSuite: vi.fn(),
   getTrainingSuite: vi.fn(),
   getTAOJob: vi.fn(),
   cancelTAOJob: vi.fn(),
@@ -38,7 +39,7 @@ vi.mock("@/api/nim", () => ({
   logActionRequestCopy: vi.fn(),
 }));
 
-vi.mock("@/pages/ProjectSetupLayout", () => ({
+vi.mock("@/pages/setup-context", () => ({
   useSetupContext: vi.fn(),
 }));
 
@@ -49,17 +50,19 @@ vi.mock("@/hooks/useProjectSSE", () => ({
 import {
   cancelTAOJob,
   cancelTrainingSuite,
+  createTrainingSuite,
   getTAOJob,
   getTrainingSuite,
 } from "@/api/training";
 import { generateActionRequest } from "@/api/nim";
 import { useProjectSSE } from "@/hooks/useProjectSSE";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useSetupContext } from "@/pages/setup-context";
 
 const mockGetSuite = getTrainingSuite as ReturnType<typeof vi.fn>;
 const mockGetJob = getTAOJob as ReturnType<typeof vi.fn>;
 const mockCancelJob = cancelTAOJob as ReturnType<typeof vi.fn>;
 const mockCancelSuite = cancelTrainingSuite as ReturnType<typeof vi.fn>;
+const mockCreateSuite = createTrainingSuite as ReturnType<typeof vi.fn>;
 const mockGenerateActionRequest = generateActionRequest as ReturnType<typeof vi.fn>;
 const mockSetup = useSetupContext as ReturnType<typeof vi.fn>;
 const mockUseSSE = useProjectSSE as ReturnType<typeof vi.fn>;
@@ -88,6 +91,8 @@ function makeJob(
     tao_external_job_id: "ext",
     progress: null,
     outputs: null,
+    outputs_fetch_status: status === "succeeded" ? "completed" : "pending",
+    outputs_fetch_error_ref: null,
     parent_tao_job_id: null,
     chain_id: "chain-8b",
     chain_sequence,
@@ -119,9 +124,13 @@ function makeSuite(
     training_preset: "standard",
     export_field_mode: "all",
     include_auto_labeled: true,
+    enable_lora: true,
     quantization_schemes: ["FP8_DYNAMIC", "W4A16"],
     training_dataset_export_id: "de-train",
     evaluation_dataset_export_id: "de-eval",
+    training_example_count: 100,
+    evaluation_example_count: 20,
+    evaluation_dataset_checksum_sha256: "sha256:test",
     selected_student_base_model_config_ids: chains.map((c) => c.modelConfigId),
     chain_ids_ordered: chains.map((c) => c.chain_id),
     chains: chains.map((c) => ({
@@ -135,11 +144,15 @@ function makeSuite(
         status,
         tao_external_job_id: status === "not_started" ? null : `ext-${id}`,
         chain_halted_reason: haltedReason,
+        outputs_fetch_status: status === "succeeded" ? "completed" : "pending",
+        outputs_fetch_error_ref: null,
       })),
     })),
+    student_model_ids: [],
     provisioning_run_id: null,
     provisioning_model_names: [],
     setup_error_ref: null,
+    setup_retryable: false,
     status: "running",
     created_at: "2026-04-17T00:00:00Z",
     started_at: null,
@@ -186,6 +199,10 @@ function renderPage() {
               path="training/:trainingSuiteId"
               element={<TrainingJobMonitorPage />}
             />
+            <Route
+              path="compare"
+              element={<div data-testid="compare-page">Compare</div>}
+            />
           </Route>
         </Routes>
       </MemoryRouter>
@@ -198,6 +215,40 @@ function renderPage() {
 // ══════════════════════════════════════════════════════════════════════════
 
 describe("TrainingJobMonitorPage", () => {
+  it("explains the post-success artifact handoff that blocks the next job", async () => {
+    const suite = makeSuite([
+      {
+        chain_id: "chain-super",
+        baseModelName: "nvidia/cosmos3-super-reasoner",
+        modelConfigId: "mc-super",
+        jobs: [
+          ["train-super", "train", 1, "succeeded", null],
+          ["eval-super", "evaluate", 2, "not_started", null],
+        ],
+      },
+    ]);
+    suite.chains[0].jobs[0].outputs_fetch_status = "in_progress";
+    mockGetSuite.mockResolvedValue(suite);
+    mockGetJob.mockImplementation((_pid: string, jobId: string) =>
+      Promise.resolve(
+        jobId === "train-super"
+          ? makeJob(jobId, "train", 1, "succeeded", {
+              outputs_fetch_status: "in_progress",
+            })
+          : makeJob(jobId, "evaluate", 2, "not_started"),
+      ),
+    );
+
+    renderPage();
+
+    expect(await screen.findByText("Finalizing")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Waiting for the previous job's artifacts to finish processing.",
+      ),
+    ).toBeTruthy();
+  });
+
   it("shows selected missing bases as one green provisioning step", async () => {
     const suite = {
       ...makeSuite([]),
@@ -256,6 +307,59 @@ describe("TrainingJobMonitorPage", () => {
     expect(await screen.findByTestId("training-provisioning-status")).toHaveTextContent(
       "Canceled",
     );
+  });
+
+  it("retries a failed frozen-dataset upload with the original request", async () => {
+    const failedSuite = {
+      ...makeSuite([]),
+      selected_student_base_model_config_ids: ["mc-8b"],
+      enable_lora: false,
+      status: "failed" as const,
+      setup_retryable: true,
+      setup_error_ref:
+        "tao_dataset_upload_failed: evaluation export upload timed out; retry with the same idempotency key",
+    };
+    const retryingSuite = { ...failedSuite, status: "preparing" as const };
+    mockGetSuite.mockResolvedValue(failedSuite);
+    mockCreateSuite.mockResolvedValue(retryingSuite);
+
+    renderPage();
+
+    expect(await screen.findByTestId("training-setup-error")).toHaveTextContent(
+      "Training Jobs setup failed.",
+    );
+    expect(screen.getByTestId("training-setup-error")).not.toHaveTextContent(
+      "tao_dataset_upload_failed:",
+    );
+    fireEvent.click(screen.getByTestId("training-retry-dataset-upload"));
+
+    await waitFor(() =>
+      expect(mockCreateSuite).toHaveBeenCalledWith("pid-1", {
+        student_base_model_config_ids: ["mc-8b"],
+        training_preset: "standard",
+        include_auto_labeled: true,
+        enable_lora: false,
+        export_field_mode: "all",
+        quantization_schemes: ["FP8_DYNAMIC", "W4A16"],
+        idempotency_key: "idem",
+      }),
+    );
+  });
+
+  it("does not offer retry when frozen export integrity has failed", async () => {
+    mockGetSuite.mockResolvedValue({
+      ...makeSuite([]),
+      selected_student_base_model_config_ids: ["mc-8b"],
+      status: "failed",
+      setup_retryable: false,
+      setup_error_ref:
+        "tao_dataset_upload_failed: Dataset export integrity check failed: annotations.json no longer matches the frozen archive",
+    });
+
+    renderPage();
+
+    expect(await screen.findByTestId("training-setup-error")).toBeInTheDocument();
+    expect(screen.queryByTestId("training-retry-dataset-upload")).toBeNull();
   });
 
   // ── Status rendering — each canonical status goes through the product
@@ -350,6 +454,29 @@ describe("TrainingJobMonitorPage", () => {
     ).toContain("Chain halted: evaluate failed.");
   });
 
+  it("describes a cancellation halt truthfully without its internal job ID", async () => {
+    const reason =
+      "Chain halted: evaluate (seq 2, id=09de3bac-42e5-41c7-b384-045954fe3f17) canceled by SME";
+    const suite = makeSuite([
+      {
+        chain_id: "chain-8b",
+        baseModelName: "nvidia/cosmos-reason2-8b",
+        modelConfigId: "mc-8b",
+        jobs: [
+          ["train-1", "train", 1, "succeeded", null],
+          ["eval-1", "evaluate", 2, "canceled", null],
+          ["quant-1", "quantize", 3, "failed", reason],
+        ],
+      },
+    ]);
+    mockGetSuite.mockResolvedValue(suite);
+
+    renderPage();
+    const banner = await screen.findByTestId("chain-halted-banner-chain-8b");
+    expect(banner).toHaveTextContent("Chain halted: evaluate canceled by SME.");
+    expect(banner).not.toHaveTextContent("09de3bac");
+  });
+
   it("treats an auto-skipped baseline evaluation as progress, not a halted chain", async () => {
     const autoSkipReason =
       "auto-skip: action=evaluate auto-skipped; trained checkpoint is adapter-only";
@@ -408,6 +535,42 @@ describe("TrainingJobMonitorPage", () => {
     expect(screen.getByTestId("monitor-compare-students")).toBeEnabled();
   });
 
+  it("enables Compare for finalized Students after an independent chain fails", async () => {
+    const autoSkipReason =
+      "auto-skip: action=evaluate auto-skipped; quality uses local NIM";
+    const suite = {
+      ...makeSuite([
+        {
+          chain_id: "chain-nano",
+          baseModelName: "nvidia/cosmos3-nano-reasoner",
+          modelConfigId: "mc-nano",
+          jobs: [
+            ["nano-train", "train", 1, "succeeded", null],
+            ["nano-eval", "evaluate", 2, "succeeded", null],
+            ["nano-quant", "quantize", 3, "succeeded", null],
+            ["nano-qeval", "evaluate", 4, "canceled", autoSkipReason],
+          ],
+        },
+        {
+          chain_id: "chain-super",
+          baseModelName: "nvidia/cosmos3-super-reasoner",
+          modelConfigId: "mc-super",
+          jobs: [
+            ["super-train", "train", 1, "failed", null],
+            ["super-eval", "evaluate", 2, "failed", "Chain halted: train failed"],
+          ],
+        },
+      ]),
+      status: "failed" as const,
+    };
+    mockGetSuite.mockResolvedValue(suite);
+
+    renderPage();
+    await screen.findByTestId("training-job-monitor-page");
+
+    expect(screen.getByTestId("monitor-compare-students")).toBeEnabled();
+  });
+
   // ── Running card shows epoch progress + ETA + metrics ──
   it("running card renders epoch progress bar, ETA, and metrics", async () => {
     const suite = makeSuite([
@@ -447,8 +610,7 @@ describe("TrainingJobMonitorPage", () => {
     ).toBe(true);
   });
 
-  // ── Completed card shows outputs ──
-  it("completed card lists outputs under friendly labels, not raw TAO keys", async () => {
+  it("completed card keeps internal artifact references out of the UI", async () => {
     const suite = makeSuite([
       {
         chain_id: "chain-8b",
@@ -485,17 +647,9 @@ describe("TrainingJobMonitorPage", () => {
     );
     renderPage();
     await screen.findByTestId("training-job-monitor-page");
-    const outputs = await screen.findByTestId("training-job-outputs");
-    expect(outputs.textContent).toContain("Best model");
-    expect(outputs.textContent).toContain("Latest model");
-    expect(outputs.textContent).toContain("Training config");
-    expect(outputs.textContent).toContain("evaluate_results.tar.gz");
-    // Raw snake_case keys never surface as user-facing labels.
-    expect(outputs.textContent).not.toContain("best_model");
-    expect(outputs.textContent).not.toContain("latest_model");
-    expect(outputs.textContent).not.toContain("training_config");
-    // The refs themselves still render.
-    expect(outputs.textContent).toContain("/art/best.pth");
+    await screen.findByText(/^Completed:/);
+    expect(screen.queryByText("/art/best.pth")).toBeNull();
+    expect(screen.queryByText("evaluate_results.tar.gz")).toBeNull();
   });
 
   // ── Failed card surfaces [Report TAO Issue] → Action Request ──
@@ -529,6 +683,32 @@ describe("TrainingJobMonitorPage", () => {
         }),
       ),
     );
+  });
+
+  it("local Student NIM failure opens Compare without generating a TAO issue", async () => {
+    const suite = makeSuite([
+      {
+        chain_id: "chain-8b",
+        baseModelName: "nvidia/cosmos-reason2-8b",
+        modelConfigId: "mc-8b",
+        jobs: [["nim-eval-1", "evaluate", 2, "failed", null]],
+      },
+    ]);
+    mockGetSuite.mockResolvedValue(suite);
+    mockGetJob.mockResolvedValue(
+      makeJob("nim-eval-1", "evaluate", 2, "failed", {
+        training_backend: "student_nim_local",
+        error_ref: "student_nim_evaluation_failed",
+        outputs: { student_model_id: "student-8b" },
+      }),
+    );
+
+    renderPage();
+    const openCompare = await screen.findByTestId("training-job-open-compare");
+    expect(screen.queryByText("Report TAO Issue")).toBeNull();
+    fireEvent.click(openCompare);
+    expect(await screen.findByTestId("compare-page")).toBeInTheDocument();
+    expect(mockGenerateActionRequest).not.toHaveBeenCalled();
   });
 
   // ── Paused card's [Cancel Job] calls cancelTAOJob ──
@@ -672,6 +852,10 @@ describe("TrainingJobMonitorPage", () => {
     expect(overall.textContent).toContain("8B: done");
     expect(overall.textContent).toContain("2B: 4 of 6");
 
+    // Product copy humanizes the canonical Cosmos-RL enum retained by the API.
+    expect(within(chain8b).getByText("Quantize (FP8 Dynamic)")).toBeInTheDocument();
+    expect(within(chain8b).getByText("Evaluate (W4A16)")).toBeInTheDocument();
+
     // Cards inside the 8B chain are sorted by chain_sequence.
     const cards = within(chain8b).getAllByTestId(/^training-job-card-j-8b-\d$/);
     const seqs = cards.map((el) => Number(el.getAttribute("data-chain-sequence")));
@@ -680,6 +864,31 @@ describe("TrainingJobMonitorPage", () => {
     // Compare Students stays disabled until every chain completes.
     const compare = screen.getByTestId("monitor-compare-students") as HTMLButtonElement;
     expect(compare.disabled).toBe(true);
+  });
+
+  it("uses compact Cosmos 3 names in overall progress", async () => {
+    const suite = makeSuite([
+      {
+        chain_id: "chain-nano",
+        baseModelName: "nvidia/cosmos3-nano-reasoner",
+        modelConfigId: "mc-nano",
+        jobs: [["j-nano-1", "train", 1, "succeeded", null]],
+      },
+      {
+        chain_id: "chain-super",
+        baseModelName: "nvidia/cosmos3-super-reasoner",
+        modelConfigId: "mc-super",
+        jobs: [["j-super-1", "train", 1, "running", null]],
+      },
+    ]);
+    mockGetSuite.mockResolvedValue(suite);
+
+    renderPage();
+    await screen.findByTestId("training-job-monitor-page");
+
+    const overall = screen.getByTestId("monitor-overall-progress");
+    expect(overall).toHaveTextContent("Nano: done");
+    expect(overall).toHaveTextContent("Super: 0 of 1");
   });
 
   // SSE terminal event → invalidates caches

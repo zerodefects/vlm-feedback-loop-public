@@ -41,6 +41,7 @@ from vlm_feedback_loop.services.invocation_outcome import (
     classify_invocation_status,
     write_invocation_artifacts,
 )
+from vlm_feedback_loop.services.model_config_service import endpoint_is_operational
 from vlm_feedback_loop.services.nim_client import build_endpoint_auth_headers
 from vlm_feedback_loop.services.project_service import get_project_engine
 from vlm_feedback_loop.services.prompt_service import (
@@ -282,6 +283,21 @@ async def create_proposal(
                     used_existing_label=True,
                 )
 
+        # A disabled shared-Teacher attachment is authoritative even when its
+        # old URL happens to answer again. Host ports are reused as residents
+        # are displaced/restored; dispatching through stale endpoint state can
+        # therefore reach a different deployment (or even a different model)
+        # while the catalog correctly reports the selected Teacher unavailable.
+        # Fail closed before any capability probe or inference. The local NIM
+        # lifecycle repairs exact compatible former-consumer attachments when
+        # a replacement resident becomes healthy.
+        if not endpoint_is_operational(endpoint):
+            return (
+                "nim_unreachable: The selected Teacher endpoint is disabled or "
+                "unhealthy. Choose an available Teacher or restore its NIM "
+                "deployment before requesting a proposal."
+            )
+
         # Snapshot data before closing session
         project_dir = project.project_dir
         effective_preset = (
@@ -452,6 +468,10 @@ async def create_proposal(
             deadline_s=float(settings.HTTP_DEADLINE_INTERACTIVE_S),
             max_retries=settings.HTTP_MAX_RETRIES,
             query_storage_ref=storage_ref,
+            image_transport_max_longest_edge=(
+                settings.IMAGE_TRANSPORT_MAX_LONGEST_EDGE
+            ),
+            settings=settings,
         )
 
     teacher_result = await _invoke_with(mc_input, thinking_on)

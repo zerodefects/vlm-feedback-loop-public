@@ -8,10 +8,9 @@
  */
 
 import { useEffect, useState } from "react";
-import { Select, Text, Tooltip } from "@kui/react";
+import { Select, Text } from "@kui/react";
 import {
   GripVertical,
-  Lock,
   ChevronUp,
   ChevronDown,
   ArrowRightLeft,
@@ -34,7 +33,6 @@ import { InlineErrors } from "./InlineErrors";
 /** Props for {@link FieldRow}. */
 export interface FieldRowProps {
   field: ClientField;
-  isLocked: boolean;
   isFirst: boolean;
   isLast: boolean;
   issues: SchemaIssueResponse[];
@@ -54,7 +52,6 @@ export interface FieldRowProps {
 
 export function FieldRow({
   field,
-  isLocked,
   isFirst,
   isLast,
   issues,
@@ -103,151 +100,107 @@ export function FieldRow({
       }}
       data-testid={`field-row-${field.field_name}`}
     >
-      <div className="flex items-center gap-2" style={{ opacity: isLocked ? 0.6 : 1 }}>
-        {isLocked ? (
-          <Tooltip slotContent="Reserved field. Cannot be removed, renamed, or moved.">
-            <span style={{ display: "inline-flex" }}>
-              <Lock
-                size={14}
-                style={{ color: "var(--text-faint)" }}
-                aria-label="Locked field"
-              />
-            </span>
-          </Tooltip>
-        ) : (
-          <GripVertical
-            size={14}
-            style={{ color: "var(--text-faint)", cursor: "grab" }}
-            aria-hidden
-          />
-        )}
+      <div className="flex items-center gap-2">
+        <GripVertical
+          size={14}
+          style={{ color: "var(--text-faint)", cursor: "grab" }}
+          aria-hidden
+        />
 
-        {isLocked ? (
-          <span
-            className="text-sm font-medium"
-            style={{ color: "var(--text-primary)", minWidth: 100 }}
-          >
-            {field.field_name}
-          </span>
-        ) : (
-          <input
-            type="text"
-            value={field.field_name}
-            onChange={(e) => onRename(e.target.value)}
-            placeholder="field_name"
-            className="glass-input rounded px-2 py-1 text-sm font-medium"
-            style={{ minWidth: 200, width: 220 }}
-            aria-invalid={hasNameError ? "true" : undefined}
-            data-testid={`field-name-input-${field._clientId}`}
-          />
-        )}
+        <input
+          type="text"
+          aria-label={`Field name: ${field.field_name || "new field"}`}
+          value={field.field_name}
+          onChange={(e) => onRename(e.target.value)}
+          placeholder="field_name"
+          className="glass-input rounded px-2 py-1 text-sm font-medium"
+          style={{ minWidth: 200, width: 220 }}
+          aria-invalid={hasNameError ? "true" : undefined}
+          data-testid={`field-name-input-${field._clientId}`}
+        />
 
-        {isLocked ? (
-          <span
-            className="rounded-full px-2 py-0.5 text-xs"
-            style={{
-              background: "var(--block-bg-elevated)",
-              color: "var(--text-muted)",
-            }}
-          >
-            {FIELD_TYPE_OPTIONS.find((o) => o.value === field.type)?.label ??
-              field.type}
-          </span>
-        ) : (
-          <span className="relative inline-flex items-center">
-            {showMarkers && <MarkerIcon overlay tooltip={markerTooltip} />}
-            <Select
-              items={FIELD_TYPE_OPTIONS.map((opt) => ({
-                value: opt.value,
-                children: opt.label,
-              }))}
-              value={field.type}
-              onValueChange={(val) => onChangeType(val as FieldType)}
-              size="small"
-              data-testid={`type-select-${field._clientId}`}
-            />
-          </span>
-        )}
+        <span className="relative inline-flex items-center">
+          {showMarkers && <MarkerIcon overlay tooltip={markerTooltip} />}
+          <Select
+            aria-label={`Field type for ${field.field_name || "new field"}`}
+            items={FIELD_TYPE_OPTIONS.map((opt) => ({
+              value: opt.value,
+              children: opt.label,
+            }))}
+            value={field.type}
+            onValueChange={(val) => onChangeType(val as FieldType)}
+            size="small"
+            data-testid={`type-select-${field._clientId}`}
+          />
+        </span>
 
         <span
           className={`glass-pill uppercase tracking-wide ${field.role === "core" ? "green" : ""}`}
         >
-          {field.role}
+          <Text kind="label/regular/xs">{field.role}</Text>
         </span>
 
         <div className="flex-1" />
 
-        {!isLocked && (
-          <div className="flex items-center gap-0.5">
+        <div className="flex items-center gap-0.5">
+          <IconBtn
+            onClick={() => onReorder("up")}
+            disabled={isFirst}
+            label="Move field up"
+            testId={`move-up-${field._clientId}`}
+          >
+            <ChevronUp size={14} style={{ color: "var(--text-muted)" }} />
+          </IconBtn>
+          <IconBtn
+            onClick={() => onReorder("down")}
+            disabled={isLast}
+            label="Move field down"
+            testId={`move-down-${field._clientId}`}
+          >
+            <ChevronDown size={14} style={{ color: "var(--text-muted)" }} />
+          </IconBtn>
+          <span className="relative inline-flex items-center">
+            {showMarkers && <MarkerIcon overlay tooltip={markerTooltip} />}
             <IconBtn
-              onClick={() => onReorder("up")}
-              disabled={isFirst}
-              label="Move field up"
-              testId={`move-up-${field._clientId}`}
+              onClick={onMoveSection}
+              label={field.role === "core" ? "Move to Aux" : "Move to Core"}
+              testId={`move-section-${field._clientId}`}
             >
-              <ChevronUp size={14} style={{ color: "var(--text-muted)" }} />
+              <ArrowRightLeft size={14} style={{ color: "var(--text-muted)" }} />
             </IconBtn>
+          </span>
+          <span className="relative inline-flex items-center">
+            {showMarkers && <MarkerIcon overlay tooltip={markerTooltip} />}
             <IconBtn
-              onClick={() => onReorder("down")}
-              disabled={isLast}
-              label="Move field down"
-              testId={`move-down-${field._clientId}`}
+              onClick={onDelete}
+              label="Delete field"
+              testId={`delete-field-${field._clientId}`}
             >
-              <ChevronDown size={14} style={{ color: "var(--text-muted)" }} />
+              <Trash2 size={14} style={{ color: "var(--text-muted)" }} />
             </IconBtn>
-            <span className="relative inline-flex items-center">
-              {showMarkers && <MarkerIcon overlay tooltip={markerTooltip} />}
-              <IconBtn
-                onClick={onMoveSection}
-                label={field.role === "core" ? "Move to Aux" : "Move to Core"}
-                testId={`move-section-${field._clientId}`}
-              >
-                <ArrowRightLeft size={14} style={{ color: "var(--text-muted)" }} />
-              </IconBtn>
-            </span>
-            <span className="relative inline-flex items-center">
-              {showMarkers && <MarkerIcon overlay tooltip={markerTooltip} />}
-              <IconBtn
-                onClick={onDelete}
-                label="Delete field"
-                testId={`delete-field-${field._clientId}`}
-              >
-                <Trash2 size={14} style={{ color: "var(--text-muted)" }} />
-              </IconBtn>
-            </span>
-          </div>
+          </span>
+        </div>
+      </div>
+
+      <div className="mt-1 pl-6">
+        <InlineErrors
+          issues={issues}
+          fieldPath={`${pathPrefix}.name`}
+          onFix={onFixit}
+        />
+        {!hasInvalidNameError && (
+          <Text
+            kind="label/regular/xs"
+            style={{ color: "var(--text-faint)", display: "block" }}
+            data-testid={`field-name-helper-${field._clientId}`}
+          >
+            Letters, numbers, and underscores only. Must not start with a number.
+          </Text>
         )}
       </div>
 
-      {!isLocked && (
-        <div className="mt-1 pl-6">
-          <InlineErrors
-            issues={issues}
-            fieldPath={`${pathPrefix}.name`}
-            onFix={onFixit}
-          />
-          {!hasInvalidNameError && (
-            <Text
-              kind="label/regular/xs"
-              style={{ color: "var(--text-faint)", display: "block" }}
-              data-testid={`field-name-helper-${field._clientId}`}
-            >
-              Letters, numbers, and underscores only. Must not start with a number.
-            </Text>
-          )}
-        </div>
-      )}
-
       <div className="mt-1.5 pl-6">
-        {isLocked ? (
-          <Text
-            kind="body/regular/xs"
-            style={{ color: "var(--text-faint)", display: "block" }}
-          >
-            Always generated by the model. You can edit it during review. Never affects
-            evaluation.
-          </Text>
-        ) : field.type === "enum" || field.type === "enum_set" ? (
+        {field.type === "enum" || field.type === "enum_set" ? (
           <>
             <EnumValueEditor
               values={field.allowed_values ?? []}
@@ -270,7 +223,7 @@ export function FieldRow({
                 className="flex items-center gap-1"
                 style={{ color: "var(--text-muted)" }}
               >
-                Min:
+                <Text kind="label/regular/xs">Min:</Text>
                 <input
                   type="number"
                   value={field.minimum ?? ""}
@@ -287,7 +240,7 @@ export function FieldRow({
                 className="flex items-center gap-1"
                 style={{ color: "var(--text-muted)" }}
               >
-                Max:
+                <Text kind="label/regular/xs">Max:</Text>
                 <input
                   type="number"
                   value={field.maximum ?? ""}
@@ -328,7 +281,7 @@ export function FieldRow({
                     className="flex items-center gap-1"
                     style={{ color: "var(--text-muted)" }}
                   >
-                    minLength:
+                    <Text kind="label/regular/xs">minLength:</Text>
                     <input
                       type="number"
                       min={0}
@@ -348,7 +301,7 @@ export function FieldRow({
                     className="flex items-center gap-1"
                     style={{ color: "var(--text-muted)" }}
                   >
-                    maxLength:
+                    <Text kind="label/regular/xs">maxLength:</Text>
                     <input
                       type="number"
                       min={0}

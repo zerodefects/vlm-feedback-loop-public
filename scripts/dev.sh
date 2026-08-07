@@ -23,6 +23,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BACKEND_DIR="$REPO_ROOT/src/backend"
 FRONTEND_DIR="$REPO_ROOT/src/ui"
+# Keep stale-process cleanup scoped to this source checkout. A Compose backend
+# has the same Python module name but a different cwd (normally /app) and must
+# never be treated as a prior source-mode dev process.
+source "$REPO_ROOT/scripts/dev-processes.sh"
 
 # Colors for log prefixes
 CYAN='\033[0;36m'
@@ -54,9 +58,9 @@ fi
 # project-list query. Avoid all of it by forcibly reaping every
 # previous instance before binding anything new.
 #
-# Patterns are specific enough to avoid reaping unrelated processes:
-# the backend entry point is `vlm_feedback_loop.main`; the frontend
-# vite node process runs inside `src/ui/node_modules`.
+# Child selection is scoped to this source checkout: backend candidates must
+# have a cwd under REPO_ROOT, and the Vite argv must name this repo's
+# src/ui/node_modules. This excludes the Compose backend running from /app.
 
 # Print the PIDs of prior dev.sh supervisor shells for THIS repo,
 # regardless of launch form. argv preserves the invocation-relative
@@ -89,16 +93,11 @@ _prior_dev_supervisor_pids() {
 }
 
 _reap_prior_dev_stack() {
-    local repo_pattern="${REPO_ROOT//\//\\/}"  # escape slashes for grep
     local found=0
 
-    for pattern in \
-        "vlm_feedback_loop\\.main" \
-        "node .*${repo_pattern}/src/ui/node_modules/.*vite" ; do
-        if pgrep -f "$pattern" >/dev/null 2>&1; then
-            found=1
-        fi
-    done
+    if [ -n "$(_vlm_dev_child_pids)" ]; then
+        found=1
+    fi
     if [ -n "$(_prior_dev_supervisor_pids)" ]; then
         found=1
     fi
@@ -110,7 +109,7 @@ _reap_prior_dev_stack() {
         echo -e "${YELLOW}[dev.sh]${NC} Previous dev stack detected — reaping before starting."
         # The prior dev.sh supervisor shell must die by SIGKILL, and
         # FIRST: SIGTERM would fire its cleanup() trap, whose safety-net
-        # `pkill -KILL -f vlm_feedback_loop.main` / vite patterns run 3 s
+        # broad module-name / vite patterns run 3 s
         # later — long enough for THIS run to have started its own
         # backend and vite, which the dying trap then kills. SIGKILL
         # skips the trap entirely; its orphaned children are reaped by
@@ -118,13 +117,9 @@ _reap_prior_dev_stack() {
         for p in $(_prior_dev_supervisor_pids); do
             kill -KILL "$p" 2>/dev/null || true
         done
-        for pattern in \
-            "vlm_feedback_loop\\.main" \
-            "node .*${repo_pattern}/src/ui/node_modules/.*vite" ; do
-            for p in $(pgrep -f "$pattern" 2>/dev/null); do
-                case " $self_pids " in *" $p "*) continue;; esac
-                kill -TERM "$p" 2>/dev/null || true
-            done
+        for p in $(_vlm_dev_child_pids); do
+            case " $self_pids " in *" $p "*) continue;; esac
+            kill -TERM "$p" 2>/dev/null || true
         done
 
         # Graceful wait — up to 5 s — for processes to exit on SIGTERM.
@@ -133,25 +128,16 @@ _reap_prior_dev_stack() {
             sleep 1
             waited=$((waited + 1))
             local still=0
-            for pattern in \
-                "vlm_feedback_loop\\.main" \
-                "node .*${repo_pattern}/src/ui/node_modules/.*vite" ; do
-                if pgrep -f "$pattern" >/dev/null 2>&1; then
-                    still=1
-                    break
-                fi
-            done
+            if [ -n "$(_vlm_dev_child_pids)" ]; then
+                still=1
+            fi
             [ "$still" -eq 0 ] && break
         done
 
         # Force-kill anything still alive.
-        for pattern in \
-            "vlm_feedback_loop\\.main" \
-            "node .*${repo_pattern}/src/ui/node_modules/.*vite" ; do
-            for p in $(pgrep -f "$pattern" 2>/dev/null); do
-                case " $self_pids " in *" $p "*) continue;; esac
-                kill -KILL "$p" 2>/dev/null || true
-            done
+        for p in $(_vlm_dev_child_pids); do
+            case " $self_pids " in *" $p "*) continue;; esac
+            kill -KILL "$p" 2>/dev/null || true
         done
         for p in $(_prior_dev_supervisor_pids); do
             kill -KILL "$p" 2>/dev/null || true
@@ -186,10 +172,13 @@ cleanup() {
     # Give them 3 s to exit cleanly, then SIGKILL survivors.
     sleep 3
     pkill -KILL -P $$ 2>/dev/null || true
-    # Safety net: anything matching our entry-point patterns that is
-    # still alive (e.g., a process that re-parented to init).
-    pkill -KILL -f "vlm_feedback_loop\\.main" 2>/dev/null || true
-    pkill -KILL -f "node .*${REPO_ROOT}/src/ui/node_modules/.*vite" 2>/dev/null || true
+    # Safety net: kill only re-parented children selected as belonging to this
+    # checkout. Never target a Compose backend merely because it runs the same
+    # Python module.
+    local p
+    for p in $(_vlm_dev_child_pids); do
+        kill -KILL "$p" 2>/dev/null || true
+    done
     wait 2>/dev/null || true
     echo "Done."
     exit $ec
@@ -212,7 +201,16 @@ if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
     (cd "$FRONTEND_DIR" && pnpm install)
 fi
 
-echo -e "${GREEN}Starting backend (FastAPI) on :8000 and frontend (Vite) on :5173${NC}"
+# Resolve the backend target through the same parser and Settings loader that
+# starts Uvicorn. This keeps Vite aligned with BIND_PORT, --port, and an
+# explicit --env-file without duplicating configuration parsing in shell.
+DEV_BACKEND_URL="$(
+    cd "$REPO_ROOT"
+    PYTHONPATH="$BACKEND_DIR:${PYTHONPATH:-}" \
+        uv run python -m vlm_feedback_loop.main --print-backend-url "$@"
+)"
+
+echo -e "${GREEN}Starting backend (FastAPI) at ${DEV_BACKEND_URL} and frontend (Vite) on :5173${NC}"
 echo ""
 
 # Start backend
@@ -227,10 +225,11 @@ BACKEND_PID=$!
 # Start frontend (Vite dev server proxies /v1/ to backend)
 (
     cd "$FRONTEND_DIR"
-    pnpm dev 2>&1 | \
+    VITE_BACKEND_URL="$DEV_BACKEND_URL" pnpm dev 2>&1 | \
         while IFS= read -r line; do echo -e "${GREEN}[frontend]${NC} $line"; done
 ) &
 FRONTEND_PID=$!
 
-# Wait for both
-wait
+# Either service exiting makes the combined launcher stop the survivor. The
+# EXIT trap preserves the first child's status and performs bounded cleanup.
+wait -n "$BACKEND_PID" "$FRONTEND_PID"

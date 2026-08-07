@@ -108,7 +108,7 @@ async def test_three_edits_feed_ico_loop_into_fourth_proposal(
 ) -> None:
     """3 Edits → 4th proposal carries all 3 in ICL with images attached."""
 
-    project_service.clear_engine_cache()
+    project_service.close_project_resources()
     workspace = tmp_path / "workspace"
 
     engine, pid = _seed_project(workspace, n_examples=5)
@@ -283,4 +283,4 @@ async def test_three_edits_feed_ico_loop_into_fourth_proposal(
             ]
     finally:
         app.dependency_overrides.clear()
-        project_service.clear_engine_cache()
+        project_service.close_project_resources()

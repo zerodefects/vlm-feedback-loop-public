@@ -74,11 +74,9 @@ def _bearer_endpoint_data(**overrides: Any) -> dict[str, Any]:
 
 
 @pytest.fixture(autouse=True)
-def _clean_runtime_secrets():
+def _clean_runtime_secrets(monkeypatch):
     """Keep UI-applied secret overrides from bleeding into credential tests."""
-    runtime_secrets.reset_overrides_for_testing()
-    yield
-    runtime_secrets.reset_overrides_for_testing()
+    monkeypatch.setattr(runtime_secrets, "_runtime_overrides", {})
 
 
 @pytest.fixture

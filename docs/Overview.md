@@ -36,16 +36,16 @@ To reduce wasted SME effort, the blueprint includes an ingestion and scheduling 
 
 ### From Labeling to Scale-Up
 
-The Interactive Loop gets you high-quality **Verified** labels quickly, and helps you converge on a trusted **Teacher + Guidance + ICL** setup. While you label, the system continuously measures quality; tracking evaluation accuracy, Accept rate, and Test Pool coverage. The **Scale-Up Readiness Gate** determines when the trusted Teacher setup may begin Batch Labeling. Student Training is a separate path: server-side start validation verifies TAO, training data, and the selected Student bases when the SME starts it.
+The Interactive Loop gets you high-quality **Verified** labels quickly, and helps you converge on a trusted **Teacher + Guidance + ICL** setup. While you label, the system continuously measures quality; tracking evaluation accuracy, Accept rate, and Test Pool coverage. The **Scale-Up Readiness Gate** determines when the trusted Teacher setup may begin Batch Labeling. Student Training is a separate path: server-side start validation requires at least one non-pool Verified training example, the project-configured minimum Test Pool for held-out comparison, TAO readiness, and valid Student bases.
 
 - **Batch labeling:** After the gate passes, run the Teacher over large volumes of Unlabeled images to generate **Auto-Labeled** fully synthetic labels without per-image human review.
-- **Fine-tune a Student:** Open Student Training independently of the Batch Labeling gate. Export datasets and use **Cosmos-RL / TAO VLM fine-tuning** (NVIDIA TAO Toolkit) to fine-tune one or more Student models to support lower latency and higher concurrency, then export and deploy behind **NIM** and compare accuracy/latency results.
+- **Fine-tune a Student:** Open Student Training independently of the Teacher-quality gate. Start remains data-gated until the Verified training and held-out evaluation splits are ready. The system then exports datasets and uses **Cosmos-RL / TAO VLM fine-tuning** (NVIDIA TAO Toolkit) to fine-tune one or more Student models to support lower latency and higher concurrency, then export and deploy behind **NIM** and compare accuracy/latency results.
 
 *Future direction:* deploying the Teacher + ICL setup directly (without fine-tuning) was removed in v1.0 — a static export cannot reproduce the loop's per-query ICL example selection — but a runtime-ICL deployment service may return in a future release.
 
 ### Minimal Setup
 
-The Teacher is served behind an **NVIDIA NIM** OpenAI-compatible endpoint. A minimal Interactive Labeling setup needs only a **build.nvidia.com API key**. The system pre-fills the hosted NIM endpoint URL, seeds a model catalog with defaults, and computes embeddings automatically. Self-hosted NIM is also supported.
+The Teacher is served behind an **NVIDIA NIM** OpenAI-compatible endpoint. A minimal development or evaluation setup needs only a **build.nvidia.com API key**. The system pre-fills the hosted NIM endpoint URL, seeds a commercially permitted model catalog with defaults, and computes embeddings automatically. Production use requires an operator-managed subscribed endpoint or an appropriately entitled self-hosted NIM.
 
 ---
 
@@ -67,7 +67,7 @@ Core terms for the Interactive Labeling workflow, evaluation, and data managemen
 
 **Teacher** - Model served via NVIDIA NIM used to propose labels. During interactive review, proposals confirmed by SMEs become Verified ground truth. Also used in Batch Labeling (§5).
 
-**Model catalog** - A configured list of model entries for the project. Each entry declares its **eligible roles** (`teacher`, `student_base`), which determine where it can be used. See Engineering Specification §4.8 for seeded defaults.
+**Model catalog** - A configured list of model entries for the project. Each entry declares its **eligible roles** (`teacher`, `student_base`), which determine where it can be used. Fresh projects preseed only models whose published model terms permit commercial use; non-commercial or unknown-term models may still be added deliberately by an operator. On upgrade, a pre-change MiniMax selection moves to Step only if the project has no labels; its catalog and invocation history remain available. See Engineering Specification §4.8 for seeded defaults.
 
 **Rationale note** - An opt-in auxiliary explanation of visible evidence, controlled by a toggle in Guidance and disabled by default. When enabled, the Teacher requests it last and the SME reviews it after editing a label. When disabled, the model is not asked for it and the SME never enters a rationale-correction flow. It never affects Core validity or evaluation and is excluded from production Teacher ICL. The toggle follows the ordinary Aux-field edit rule, so it can change freely without invalidating labels (Spec §4.4, §6.3.2).
 
@@ -76,7 +76,7 @@ disables, and later re-enables the feature, its corpus may contain a mix of
 examples with and without notes; this is an accepted tradeoff for avoiding
 mandatory SME explanation work.
 
-**Test Pool** - A reserved subset of Verified examples used for evaluation and excluded from ICL. Pool management is automatic: the system assigns examples to the Test Pool based on a configured fraction and CLIP-embedding diversity.
+**Test Pool** - A reserved subset of Verified examples used for evaluation and excluded from ICL. Pool management is automatic: a configured fraction sets the target, the next Verified example fills an immediate shortfall, and rebalancing uses CLIP diversity when enough embeddings exist or pHash diversity otherwise.
 
 **Exact Match (Core Fields)** - Deterministic routine comparing model output to the Verified label on **Core fields** only, after schema-defined normalization.
 
@@ -84,7 +84,9 @@ mandatory SME explanation work.
 
 **CLIP embedding** - A vector representation of an image computed automatically at ingest by NVIDIA NeMo Retriever VL 1B v2 (hosted with the same API key as Teacher, or the system-managed local NIM). "CLIP" names the contrastive image-text embedding class, not the retired legacy Blueprint NV-CLIP path. Used by the review selector to present semantically diverse images. See Spec §5.5 for provider options and consistency rules.
 
-**pHash (perceptual hash)** - A compact image fingerprint computed inline at ingest (CPU-only). Baseline diversity signal for the review selector before CLIP embeddings are available. See Spec §5.6.
+**pHash (perceptual hash)** - A compact image fingerprint computed by a
+restartable CPU-only background sweep after ingest. It is the baseline
+diversity signal before CLIP embeddings are available. See Spec §5.6.
 
 **Generation Controls** - Two user-facing toggles that govern model invocation behavior: **Output Stability** (Precise [default] / Explore, mapping to `temperature`/`top_p`) and **Thinking** (ON [default] / OFF per model, controlling reasoning). See Spec §6.7.
 
@@ -103,7 +105,11 @@ already on screen; after the setting finishes saving, the next proposal
 
 ### Step 1: Ingest Images and Create Guidance (SME)
 
-The SME first ingests **images** to be worked through in the review loop (ingestion persists a storage reference plus source metadata). At ingest the system **computes a pHash for each image inline** (CPU-only, immediate) and **begins computing CLIP embeddings in the background** via the configured embedding provider (Spec §5.5).
+The SME first ingests **images** to be worked through in the review loop
+(ingestion persists a storage reference plus source metadata). The endpoint
+returns after creating those skeleton records; restartable background workers
+then compute the CPU-only **pHash** and optional CLIP embeddings via the
+configured embedding provider (Spec §§5.5–5.6).
 
 While embeddings compute, the SME defines the **Guidance**:
 
@@ -111,7 +117,9 @@ While embeddings compute, the SME defines the **Guidance**:
 - **Schema:** the JSON label fields (types, allowed values, and roles **Core/Aux**).
 - **Rules:** edge cases and policy text.
 
-Labeling may begin immediately using pHash-diverse selection; the review selector upgrades to CLIP-diverse mode as embeddings become available.
+Labeling may begin immediately. Until a pHash is ready the selector uses its
+deterministic no-signal fallback; it then uses pHash diversity and upgrades to
+CLIP diversity as those signals become available.
 
 ### Step 2: Select the Next Image for Review (system)
 
@@ -122,7 +130,11 @@ To choose the next item to present, the system uses the best available diversity
 - **CLIP-diverse mode** (preferred):
 When CLIP embeddings are available, the system selects the next item using those embeddings to maximize semantic diversity.
 - **pHash-diverse mode** (baseline):
-When CLIP embeddings are not yet available, the system selects the next item using pHash hamming distance to maximize perceptual diversity. pHash is always available because it is computed inline at ingest.
+When CLIP embeddings are not yet available, the system selects the next item
+using available pHash values and hamming distance to maximize perceptual
+diversity. If the background pHash sweep has not populated any candidate yet,
+selection falls back deterministically to `example_key` order rather than
+blocking labeling.
 
 ### Step 3: Propose a Label via Teacher + ICL (system)
 
@@ -156,9 +168,9 @@ Once an example becomes Verified via Edit, it becomes eligible for ICL selection
 
 ## 4. Evaluation
 
-During Interactive Labeling, the system evaluates by re-running the current Teacher+Guidance+ICL setup against a held-out Test Pool to check that accuracy has not degraded as new images are introduced and Guidance is refined. The system recommends evaluations at key moments (first pool threshold, configuration changes, ICL growth); the SME decides when to run them. Evaluations always run in the background.
+During Interactive Labeling, the system evaluates by re-running the current Teacher+Guidance+ICL setup against a held-out Test Pool to check that accuracy has not degraded as new images are introduced and Guidance is refined. With Auto-Evaluate off (the default), the system recommends evaluations at key moments (first pool threshold, configuration changes, ICL growth) and the SME decides when to run them. With Auto-Evaluate on, those triggers start evaluations automatically. Evaluations always run in the background.
 
-The Test Pool is a **reserved subset of Verified** used for evaluation, excluded from ICL selection. Pool management is fully automatic: the system assigns Verified examples (both Accepts and Edits) based on a configured fraction and CLIP-embedding diversity. No user action is required (see Engineering Specification §4.3). Reviewing images in CLIP-diverse order — the default review selector behavior — interleaves classes as you label, which keeps the Test Pool and the ICL (non-pool) set class-representative so evaluation metrics reflect true accuracy across all classes.
+The Test Pool is a **reserved subset of Verified** used for evaluation, excluded from ICL selection. Pool management is fully automatic: a configured fraction sets the target, the next Verified example fills an immediate shortfall, and rebalancing uses the review selector's CLIP/pHash switchover. Both Accepts and Edits are eligible; no user action is required (see Engineering Specification §4.3). Once enough CLIP embeddings are available, semantically diverse review order tends to interleave classes. Before then, pHash supplies visual diversity but cannot guarantee class coverage, so the backend logs a diagnostic warning when an ICL run encounters a class-disjoint split.
 
 **Returning vs New metrics.** Because the Test Pool grows over time, a naive overall accuracy number can be misleading: accuracy may drop not because the model degraded, but because a hard example joined the pool. To separate these signals, each evaluation reports metrics in two buckets:
 
@@ -179,6 +191,8 @@ The evaluation pipeline also applies to **Student** variants (after fine-tuning,
 ### 5.1 Key Concepts for Batch Labeling and Student Training
 
 **Scale-Up Readiness Gate** - System-evaluated, configurable gate that determines whether the Teacher+Guidance+ICL setup meets quality criteria for Batch Labeling. The system automatically evaluates evaluation metrics, Accept rate, and Test Pool size against configurable thresholds and presents a plain-language verdict. See §7 and Engineering Specification §7.3.
+
+**Student Training data readiness** - Independent of Teacher quality. Start Training requires at least one Verified example outside the Test Pool and a Test Pool at or above the project's configured minimum (default: 60; an explicit zero still requires one because the automatic evaluation export cannot be empty). This provides both a trainable split and a held-out population for baseline and quantized Student comparison.
 
 **Auto-Labeled** - A model-generated label produced by Batch Labeling without SME validation. Not ground truth; used for training scale.
 
@@ -210,9 +224,11 @@ Auto-Labeled outputs are **not** ground truth. Verified remains the source of tr
 
 ### 5.3 Student Training: Fine-tuning Student Model(s) (Optional)
 
-If enabled:
+If enabled, Student Training remains independent of the Scale-Up Teacher-quality
+criteria but does not start from token data. The backend first enforces the
+Student Training data-readiness requirements described above, then:
 
-1. The system exports versioned training artifacts (Verified excluding Test Pool, plus optional Auto-Labeled) with manifests and checksums. The Test Pool is exported separately as a Verified-only TAO evaluation dataset; Auto-Labeled predictions are never used as its answer key.
+1. The system exports versioned training artifacts (Verified excluding Test Pool, plus optional Auto-Labeled) with manifests and checksums. The Test Pool is exported separately as a Verified-only TAO evaluation dataset; Auto-Labeled predictions are never used as its answer key. Before workspace upload, the backend opens each completed archive and sidecar under the project's export directory, verifies the recorded archive checksum, and confirms that both copies of `annotations.json` are semantically identical.
 2. The system triggers a **Cosmos-RL / TAO VLM** supervised fine-tuning job (external execution) and persists lineage from exports → TAO job → registered Student.
 3. When training succeeds, the system automatically runs a **TAO evaluate** job against the Test Pool export to establish baseline quality. Default quantization (**FP8_DYNAMIC**) is then applied, followed by another TAO evaluate on the quantized checkpoint. This chain runs without SME intervention.
 4. TAO per-sample predictions are re-scored by the system's canonical
@@ -230,6 +246,13 @@ small base: a full-precision baseline and `FP8_DYNAMIC`. It uses the Quick
 preset and expands to four jobs (train, baseline evaluate, quantize, FP8
 evaluate). Multiple bases and additional quantization schemes are available
 only through the explicit production-candidate comparison workflow.
+
+The Training UI currently offers the qualified LoRA matrix only: Cosmos
+Reason2 2B/8B and Cosmos 3 Nano. Cosmos 3 Super remains represented in the
+backend catalog and historical run records, but is not selectable for a new UI
+training run. Its only qualified path requires Full-weight training, and
+Full-weight has not yet been qualified across the Student bases offered by the
+Training UI.
 
 Quality comparison (from TAO evaluation, always available after training):
 
@@ -260,15 +283,15 @@ The onboarding / first-time user experience should be optimized around one goal:
 
 2. **Configure NIM endpoints**
 
-   The system probes the environment at startup (Engineering Specification §1.5 Mode C, environment assessment) and presents a **recommended per-service configuration** for Teacher inference and embeddings. Teacher and embeddings are configured independently — the system recommends the best mode for each based on available credentials and hardware.
+   The application warms one deployment-scoped environment assessment at startup (Engineering Specification §1.5 Mode C) and presents a **recommended per-service configuration** for Teacher inference and embeddings. Stable Docker/toolkit/GPU capabilities are reused across projects; current credentials and active NIM residents remain fresh. Teacher and embeddings are configured independently — the system recommends the best mode for each based on available credentials and hardware.
 
    **Auto-configure (skip) when fully configured:** if enough credentials and capabilities are detected to configure both services without user input, skip this step entirely and proceed to step 3 with a non-blocking banner showing the auto-selected configuration (e.g., *”Teacher: hosted NIM. Embeddings: deploying locally.”*). A healthy exact Blueprint-managed Teacher resident is auto-reused when it matches the current quality recommendation: project creation attaches its endpoint, selects its matching model configuration, and skips the deploy/key choice even when `NVIDIA_API_KEY` is also configured. A different resident remains an explicit keep/replace decision.
 
-   **Show recommendation screen when decisions are needed:** the system presents two rows (Teacher, Embeddings), each showing the recommended mode and a **[Configure]** override. Only missing credentials are prompted inline, labeled with why each is needed. Recommendation logic is quality-first, then hardware-gated: Omni on supported ≥80 GB / compute-capability ≥9.0 GPUs; CR3-Nano on ≥56 GB when Omni is ineligible; Cosmos Reason2 2B on 36–55 GB. Super and Cosmos Reason2 8B remain selectable. With an API key and no preferred resident, a fitting local Teacher is recommended for faster response times. Labeling starts immediately on the hosted default while the local NIM downloads, then the project switches atomically to local after health, served-model, and inference verification pass. Hosted-only remains available. A 10–35 GB GPU runs the local NeMo Retriever VL embedding NIM with a hosted Teacher; below 10 GB, embeddings are hosted or pHash.
+   **Show recommendation screen when decisions are needed:** the system presents two rows (Teacher, Embeddings), each showing the recommended mode and a **[Configure]** override. Only missing credentials are prompted inline, labeled with why each is needed. Recommendation logic is quality-first, then hardware-gated: Omni on supported ≥80 GB / compute-capability ≥9.0 GPUs; CR3-Nano on ≥56 GB when Omni is ineligible; Cosmos Reason2 2B on 36–55 GB. Super and Cosmos Reason2 8B remain selectable. With an API key and no preferred resident, a fitting local Teacher is recommended for faster response times. Labeling starts immediately on the hosted default while the local NIM downloads, then the project switches atomically to local after health, served-model, and inference verification pass. Hosted-only remains available. A supported 24–35 GB GPU runs the local NeMo Retriever VL embedding NIM with a hosted Teacher; below 24 GB, embeddings are hosted or pHash.
 
    **Path-aware Screen 2A (FTU Phase I + NIM-FTU-Local-Peer):** when a GPU is detected, the single-purpose key-paste page renders one of three layouts based on the recommendation:
    - **Resident reuse — recommended Teacher already running:** project creation has already attached and selected it, so Screen 2A queues no Teacher deploy. It auto-skips when embeddings are already usable (the normal single-GPU case); if another GPU is free and local embeddings are recommended, setup continues only for that embedding NIM. No Teacher model reload is needed.
-   - **Case A — no key + GPU + local Teacher fits:** primary card invites running the named recommended Teacher locally with [Deploy locally →]; a peer card below offers the hosted default Teacher (MiniMax-M3) via an inline API-key paste.
+   - **Case A — no key + GPU + local Teacher fits:** primary card invites running the named recommended Teacher locally with [Deploy locally →]; a peer card below offers the hosted default Teacher (Step 3.7 Flash) via an inline API-key paste.
    - **Case B — key set + GPU + local Teacher fits (hosted bridge):** the primary card recommends the named local Teacher for faster responses. The SME starts labeling immediately with the configured hosted default while the local NIM downloads in the background; after verification succeeds, the backend switches the project to local atomically. A peer card keeps **Hosted only** available for SMEs who do not want a download or GPU change.
    - **Case C — no key + no GPU:** today's hosted CTA, unchanged. Case D (key + no GPU) auto-skips.
 
@@ -276,17 +299,17 @@ The onboarding / first-time user experience should be optimized around one goal:
 
    - **NVIDIA API Key** field: shown when hosted NIM is part of the recommendation and the key is not yet configured. **”Get NVIDIA API Key”** links to `https://build.nvidia.com/settings/api-keys`. Test connection via `GET /v1/models`.
    - **NGC API Key** field: shown when local deployment is part of the recommendation and the key is not yet configured. **”Get NGC API Key”** links to `https://org.ngc.nvidia.com/setup/api-key`. Helper text: *”Required for pulling NIM container images.”*
-   - **[Configure]** per service: opens inline override to switch between hosted NIM, self-hosted URL, or deploy locally. Self-hosted URL entry covers any remote NIM (LAN, cloud). If no endpoint is available, a **”Request NIM Setup”** Action Request (Spec §10.3) provides the handoff.
-   - **Post-onboarding local model changes:** NIM Configuration lists every Blueprint-supported Teacher compatible with the currently detected GPU, marks the quality recommendation and running resident, and deploys only the model the SME selects. The first deploy request is always non-destructive. If every compatible GPU is occupied, the screen names the exact resident model, GPU, and owning project and requires **Keep current** or **Replace NIM** confirmation. A confirmed replacement activates the new Teacher only after health, served-model, and inference verification pass; a failed replacement best-effort restores the displaced resident.
+   - **[Configure]** per service: opens inline override to switch between hosted NIM, self-hosted URL, or deploy locally. Self-hosted URL entry covers any remote NIM (LAN, cloud). For a Teacher, a green connection test must report an exact vision model present in the project catalog; **Save** re-verifies that identity, durably binds the endpoint, and refreshes capability controls. For embeddings, both Test and Save obtain a real finite 2,048-dimensional vector from the configured NeMo Retriever model; Save then switches the deployment-scoped provider and re-resolves every project. A different external URL is rejected while a Blueprint-managed embedding container is active, so configuration cannot orphan a GPU resident. If no endpoint is available, a **”Request NIM Setup”** Action Request (Spec §10.3) provides the handoff.
+   - **Post-onboarding local model changes:** NIM Configuration lists every Blueprint-supported Teacher compatible with the currently detected GPU, marks the quality recommendation and running resident, and deploys only the model the SME selects. The same screen can deploy or stop the local NeMo Retriever VL embedding NIM. The first deploy request is always non-destructive. If every compatible GPU is occupied, the screen names the exact resident model, GPU, and owning project and requires **Keep current** or **Replace NIM** confirmation. A confirmed Teacher replacement activates the new Teacher only after health, served-model, and inference verification pass; a failed replacement best-effort restores the displaced resident. On a single-GPU host, replacing a Teacher with embeddings intentionally leaves interactive labeling without that local Teacher until the SME restores it or configures another Teacher endpoint.
    - **Missing prerequisites screen:** when local deployment is recommended but Docker or NVIDIA Container Toolkit is missing, the system shows copy-ready install commands and a reference to the `setup-local.sh` prerequisite script (Engineering Specification §1.8.1). The SME (or admin) runs the script, then restarts the application.
-   - Local embedding NIM deployment starts in the background on confirmation, paralleling how CLIP-style embeddings compute in the background after ingestion. NeMo Retriever VL NIM 2.0.0 uses a 10 GB eligibility floor, so 10–35 GB single-GPU hosts take the embedding-only path automatically.
+   - Local embedding NIM deployment starts in the background on confirmation, paralleling how CLIP-style embeddings compute in the background after ingestion. The smallest GPU SKUs in the NeMo Retriever VL NIM 2.0.0 support matrix have 24 GB, so supported 24–35 GB single-GPU hosts take the embedding-only path automatically. Memory alone does not establish compatibility: automatic setup requires the detected GPU name to match the pinned matrix; an operator may still deliberately test NVIDIA's unverified fallback path through post-onboarding NIM Configuration.
    - **Single-GPU + local Teacher (Engineering Spec §1.5 one-NIM-per-GPU invariant, F49 amendment 2026-05-19; empirical motivation re-confirmed on Cosmos 3 nano / H100 NVL, 2026-07-13):** on a host with exactly one GPU, the FTUE deploys the Teacher only; image embedding falls back to pHash diversity (Spec §5.6) and CLIP-diverse review selection is unavailable until the SME either adds a second GPU or configures an `NVIDIA_API_KEY` for hosted embeddings. Student NIM benchmarking on a single-GPU host displaces the resident Teacher for the duration of the benchmark and best-effort auto-restores it afterward (Engineering Spec §9.5.2 steps 0 and 9).
 
 3. **Confirm seeded defaults (fast-path by default)**
 
-   **Skip** when the selected Teacher is valid and its endpoint is connected. The selection is the exact reused local Teacher when one was adopted during project creation; otherwise it is the effective hosted default (`minimaxai/minimax-m3` by default). Proceed directly to step 4 with a non-blocking banner naming the actual selection.
+   **Skip** when the selected Teacher is valid and its endpoint is connected. The selection is the exact reused local Teacher when one was adopted during project creation; otherwise it is the effective hosted default (`stepfun-ai/step-3.7-flash` by default). Proceed directly to step 4 with a non-blocking banner naming the actual selection. There is no separate model-terms stop in onboarding because every fresh seed is commercially permitted.
 
-   **Show confirm screen** when the default is missing, invalid, or the user connected a custom endpoint where seeded models may not exist. Preselect the effective `DEFAULT_TEACHER_MODEL` (`minimaxai/minimax-m3` by default, read from `EnvironmentResponse.default_teacher_model_name`) as the Teacher.
+   **Show confirm screen** when the default is missing, invalid, or the user connected a custom endpoint where seeded models may not exist. Preselect the effective `DEFAULT_TEACHER_MODEL` (`stepfun-ai/step-3.7-flash` by default, read from `EnvironmentResponse.default_teacher_model_name`) as the Teacher.
 
 4. **Ingest images (before Guidance; gives CLIP time to compute)**
 
@@ -296,14 +319,17 @@ The onboarding / first-time user experience should be optimized around one goal:
 
    Accepts JPEG, PNG, WebP, BMP, and single-page TIFF; animated GIFs and multi-page TIFFs are rejected. The SME can add additional folders at any time; ingestion is cumulative, not one-shot.
 
-   - During ingestion, show a progress indicator with running counts: images accepted, images skipped (unsupported format or duplicate `example_key`), and errors. Partial success is acceptable: successfully ingested images become `state=”Unlabeled”` immediately; failures are reported inline without blocking the rest of the batch.
-   - pHash is computed inline during ingestion (no wait). CLIP embeddings compute in the background while the SME creates Guidance (step 5), so most are ready by the time labeling starts.
+   - During ingestion, show a progress indicator with running counts: images accepted, images skipped (unsupported format or an already-ingested key/path), and errors. Suggested keys use a scan-root-independent canonical path, and the backend also rejects the same `storage_ref` under a second key, so selecting a class folder and later its dataset root cannot duplicate images. Partial success is acceptable: successfully ingested images become `state=”Unlabeled”` immediately; failures are reported inline without blocking the rest of the batch.
+   - pHash and CLIP embeddings compute in restartable background workers after
+     the 202 ingest response. The SME may create Guidance or start labeling
+     while they populate; selection remains deterministic when a signal is
+     still pending.
    - After ingestion completes, show a summary: total Unlabeled count, any skipped/failed items.
    - **Low image count notice:** if fewer than 150 images were ingested, show a non-blocking warning: *“We recommend at least 150 images so the default 40% allocation can fill the 60-image Test Pool. All 150 must become Verified to meet that mathematical minimum; model-quality needs may be higher.”* **[Add more images]** · **[Continue]**. This is a recommendation, not a gate. The bundled 15-image sample receives additional copy identifying it as a walkthrough that cannot pass the default Scale-Up gate.
 
 5. **Create Guidance**
 
-   The SME builds the blueprint that tells the model what to do. A **”Start from:” dropdown** (Blank, Classification, Multi-label, Attribute extraction, Damage severity, Recycling classification, Coarse grocery classification) appears at the top of the screen. It defaults to Blank. Selecting a template pre-fills Description and proposes a starter schema so the SME has something to react to instead of starting from nothing. Once the SME edits anything, the dropdown has no further effect.
+   The SME builds the blueprint that tells the model what to do. A **”Start from:” dropdown** (Blank, Classification, Rock, paper, scissors, Multi-label classification, Presence and count, Packaging information audit, Industrial anomaly inspection) appears at the top of the screen. It defaults to Blank. Selecting a template pre-fills Description, proposes a starter schema, and supplies useful Rules so the SME has a complete example to react to instead of starting from nothing. A short explanation appears below the selection; dataset-referenced choices also identify their dataset scope and license. Only the rock-paper-scissors walkthrough is bundled—the packaging and VisA templates point to external public datasets without shipping additional images. Choosing another template after editing asks for confirmation before replacing the current Description, Schema, and Rules.
 
    Below the template selector, three cards appear in the order the SME thinks about the task:
 
@@ -356,6 +382,8 @@ The onboarding / first-time user experience should be optimized around one goal:
   - Hidden when the active Teacher does not support visual token controls (Spec §6.9).
 - **Adding more images:**
   - An **Add Images** action is always available from the labeling screen (same file browser / path entry as onboarding step 4). Newly ingested images enter as Unlabeled and appear in the review selector immediately. No interruption to the current labeling session.
+- **Returning to trained Students:**
+  - Once a project has at least one Student model, **Models & Results** appears beside **Scale-Up** in the labeling footer. It opens comparison, benchmarks, serving validation, and the portable NIM deployment bundle directly; Scale-Up remains the path for Batch Labeling or training another Student.
 - **Schema refinement reminders:**
   - Two reminders nudge early schema review: at 10 Verified labels (fewer labels to re-label) and at 35 (last call before re-labeling becomes expensive). Each fires at most once per project. Frame positively: adjusting the schema is easier now than later. See Spec §6.8.
 - **Evaluation:**
@@ -368,7 +396,7 @@ The onboarding / first-time user experience should be optimized around one goal:
   - Evaluation metrics and Accept rate feed the Scale-Up Readiness Gate (§7). The labeling screen shows a non-blocking gate progress indicator so the SME can track readiness naturally during labeling.
 ## 7. Onboarding / First time user experience (Scale-Up Quickstart: Batch Labeling + Student Training)
 
-This second-stage onboarding is **optional** and is available after the user has begun the Interactive Loop. The **Scale-Up Readiness Gate** governs Batch Labeling only; Student Training remains navigable and applies its own server-side TAO/data checks on submission. The goal is to help a first-time user safely scale from high-quality Verified labels to (a) large volumes of **Auto-Labeled** data and (b) one or more deployable **Student** models.
+This second-stage onboarding is **optional** and is available after the user has begun the Interactive Loop. The **Scale-Up Readiness Gate** governs Batch Labeling only; Student Training remains navigable and applies its own server-side TAO and dataset checks on submission, including the configured Test Pool minimum. The goal is to help a first-time user safely scale from high-quality Verified labels to (a) large volumes of **Auto-Labeled** data and (b) one or more deployable **Student** models.
 
 
 ### How infrastructure dependencies are handled
@@ -382,7 +410,11 @@ Two Action Request types surface inline on the screen where the blocker occurs, 
 - **Request NIM Setup**: self-hosted NIM endpoint needed (onboarding step 2)
 - **Request TAO Setup**: TAO endpoint not configured or unreachable
 
-Deployment handoff is an Action Request type (`deployment_handoff`) with richer content (checkpoint reference, NIM configuration, evaluation summary, training lineage), but the interaction is the same: read-only formatted content with Copy to Clipboard.
+Deployment handoff is an Action Request type (`deployment_handoff`) with richer content (checkpoint reference, NIM configuration, evaluation summary, training lineage). Its panel offers **Download portable NIM deployment bundle** as the primary action and retains **Copy to Clipboard** for infrastructure-team handoff. This is the only trained-model delivery download: individual TAO outputs and raw checkpoints stay internal. The bundle preserves a shared runtime image's exact Nano/Super model-size selector, pinned profile, and validated runtime overrides—including Cosmos 3 Super's 65,536-token single-GPU context clamp—so a downloaded Student runs under the same contract the Blueprint validated. The evaluation snapshot carries the held-out dataset export checksum separately from the Student's training-only export lineage so the receiving team can reproduce exactly what was measured.
+
+Portable bundles include only NIM-loadable checkpoint content; TAO's
+completion-only `status.json` and `microservices_log.txt` are omitted because
+they are operational diagnostics rather than model inputs.
 
 Action Requests are not a ticketing system. The system produces a message; where it goes is the organization's choice. See Engineering Specification §10.3 for the full contract.
 
@@ -398,7 +430,7 @@ The system automatically evaluates readiness for Batch Labeling against configur
 
 Gate criteria (all must pass for system readiness; all thresholds are configurable per project):
 
-- **Evaluation quality:** Latest evaluation overall Exact Match meets the configured threshold (default: 80%). Every Core field individually meets the per-core-field match rate threshold (default: 80%). Every value of every categorical Core field (enum, enum set, boolean) meets the minimum per-value F1 threshold (default: 80%). If no evaluation has completed, this criterion fails with: *"Run an evaluation to measure quality."*
+- **Evaluation quality:** Latest evaluation overall Exact Match meets the configured threshold (default: 80%). Every Core field individually meets the per-core-field match rate threshold (default: 80%). Every value of every categorical Core field (enum, enum set, boolean) meets the minimum per-value F1 threshold (default: 60%). If no evaluation has completed, this criterion fails with: *"Run an evaluation to measure quality."*
 - **Accept rate:** Rolling Accept rate over the most recent N verified labels (default: 80% over last 50) meets the configured threshold.
 - **Minimum Test Pool size:** The Test Pool contains at least the configured minimum number of members (default: 60). Below this, the sample is too small for reliable evaluation.
 
@@ -420,9 +452,12 @@ Gate UI presentation:
   - Batch Labeling availability (feature flag / deployment capability).
   - Student Training readiness comes from the backend training preflight,
     including TAO reachability and timeout support, workspace, credentials,
-    selected Student-base roles, and usable data. The card shows checking,
-    ready, data-not-ready, or infrastructure-required. The last state includes
-    a **Request TAO setup** Action Request (Spec §10.3).
+    selected Student-base roles, a non-empty Verified Training Pool, and a Test
+    Pool at the project-configured minimum. The card shows checking, ready,
+    ready-to-configure for a model-specific method mismatch, data-not-ready,
+    or infrastructure-required. Only the last state includes a **Request TAO
+    setup** Action Request (Spec §10.3); dataset shortfalls direct the SME back
+    to labeling instead.
 
 **Primary CTAs (only two):**
 
@@ -437,11 +472,13 @@ If the gate has not passed, show a banner:
 
 The Teacher, Guidance, ICL, and images are already configured from Interactive Labeling. Batch Labeling is a single screen. New images can be added at any time from the labeling screen (see "Adding more images" in §6).
 
-The screen shows the active Teacher, Guidance version, ICL edit count, Visual Budget preset, and input count so the SME can verify the configuration before running. A **Run Batch Labeling** button launches the run.
+The screen shows the active Teacher, endpoint-use policy, Guidance version, ICL edit count, generation controls, Visual Budget preset, and input count so the SME can verify the configuration before running. Its collapsed **Advanced filters** section can include existing Auto-Labeled images, cap this run to a whole-number limit, restrict input by its UTC ingestion-time range, force prompt-only structured generation, or disable ICL for a Teacher known to perform better zero-shot. These choices are fixed for the entire run and visible in the run monitor. A **Run Batch Labeling** button launches the run.
+
+When the selected Teacher uses the seeded NVIDIA API Catalog endpoint, Run opens a final **Confirm evaluation use** dialog. It names the planned image count and explains that Catalog credits — including additional trial credits — do not authorize production use. The SME can continue for development/evaluation, cancel, or go configure a production endpoint. Operator-managed subscribed or self-hosted endpoints do not show this trial confirmation; the operator remains responsible for their entitlement.
 
 > **Teacher:** `<active Teacher model>` · **Guidance:** `<active Guidance version>` · **ICL:** `N` edits · **Visual Budget:** `<active preset>` (shown only when Teacher supports it) · **Input:** All Unlabeled (excluding Omitted)
 
-Optional filters (collapsed "Advanced"): ingestion date range. Core-invalid outputs are discarded; valid outputs (including Aux fields) are stored and exported.
+Optional controls (collapsed "Advanced"): include existing Auto-Labeled images, run limit, UTC ingestion-date bounds, run-wide structured-generation mode, and run-wide ICL mode. Core-invalid outputs are discarded; valid outputs (including Aux fields) are stored and exported. The public API additionally supports a provider-aware concurrency override for operator automation.
 
 > "Batch Labeling generates **Auto-Labeled** outputs. These are **not** ground truth until reviewed."
 
@@ -449,14 +486,16 @@ Optional filters (collapsed "Advanced"): ingestion date range. Core-invalid outp
 
 - Progress: processed / total.
 - Live schema-valid Core rate vs schema-invalid Core rate, with common error types and a downloadable manifest of schema-invalid examples.
-- A single **Export dataset** CTA when the run completes.
+- A single **Export dataset** CTA when the run completes, followed by a
+  **Download archive** action after the background export succeeds.
 
 #### 3) Student Training quickstart (Cosmos-RL / TAO VLM)
 
-Student Training should feel like "review the validation plan, confirm its
-cost, then start" rather than "configure TAO." After explicit confirmation,
-the system handles training, quality evaluation, quantization, and quantized
-evaluation with no further SME interaction until results are ready.
+Student Training should feel like "review the validation plan, understand its
+remote-resource cost boundary, then start" rather than "configure TAO." After
+explicit confirmation, the system handles training, quality evaluation,
+quantization, and quantized evaluation with no further SME interaction until
+results are ready.
 
 **Screen layout:**
 
@@ -479,6 +518,13 @@ advanced workflow for selecting multiple bases.
 
 Raw hyperparameters are hidden by default. An "Advanced" expander shows the resolved patch JSON read-only (Spec §9.7.3.1).
 
+**Training method**
+
+The Training UI uses **LoRA**, the qualified parameter-efficient path. The
+backend retains its `enable_lora=false` Full-weight contract for future
+qualification and API compatibility, but the UI does not expose that choice
+until Full-weight has been tested across the supported UI model matrix.
+
 **Training data sources**
 
 - **Verified (train):** always included (Verified excluding Test Pool). Not deselectable.
@@ -486,7 +532,9 @@ Raw hyperparameters are hidden by default. An "Advanced" expander shows the reso
 
 The backend-authoritative summary separates Verified Training Pool, held-out
 Test Pool, eligible Auto-Labeled, excluded examples and reasons, and the final
-usable training total. Start remains disabled when that usable total is zero.
+usable training total. It also returns the effective required Test Pool count.
+Start remains disabled when the Verified training selection is empty or the
+held-out Test Pool is below that requirement.
 
 **Quantization**
 
@@ -507,7 +555,11 @@ when the SME submits. It fails closed before launching work unless:
 - TAO accepts the configured safe stale-job timeout.
 - The recorded TAO workspace is bootstrapped and reachable.
 - Each selected base model has the `student_base` role.
+- The selected training method is compatible with every selected base and the
+  configured Cosmos-RL runtime.
 - At least one Verified training example remains after excluding the Test Pool.
+- The active-Guidance Test Pool reaches the project's configured minimum
+  (`scaleup_min_test_pool_size`, default: 60; effective floor: one).
 
 A selected base whose TAO experiment is missing is not an error. Its
 provisioning appears as the first Training Jobs step. If every selected base
@@ -515,7 +567,8 @@ is ready, that step is not displayed.
 
 Before submission, a mandatory confirmation dialog shows the selected bases,
 resolved preset, generated variants, exact expanded job count, usable training
-and Test Pool counts, and a warning that the remote workflow is long-running.
+and Test Pool counts, and a warning that the long-running remote workflow may
+incur TAO compute, storage, and egress charges.
 Usable data below 150 is explicitly described as wiring validation rather than
 production-quality model evidence.
 
@@ -523,7 +576,7 @@ production-quality model evidence.
 
 On click, the system:
 
-1. Creates the Training Jobs record and navigates to its monitor.
+1. Creates the durable Training Jobs record and navigates to its monitor.
 2. If needed, provisions all selected missing bases together under **Provision Student Bases**. This step is omitted for an already-ready selection.
 3. Creates versioned dataset export artifacts (manifests, checksums, DatasetExport records per Spec §13.5) from the selected data sources. Exports the Test Pool as a separate Cosmos-RL evaluation dataset.
 4. For each selected base model, creates and chains TAO jobs automatically:
@@ -533,9 +586,23 @@ On click, the system:
    - **Evaluate quantized** per scheme (TAOJob, `action: "evaluate"`)
 5. Jobs within each model's chain run sequentially. Chains for different models also run sequentially (one model at a time).
 
+Each completed export is linked to the Training Jobs record before workspace
+upload. If a transfer fails before jobs are created, retrying the identical
+request reuses those frozen exports and repairs only the incomplete object
+pair. An export-integrity failure requires corrected fresh exports so training
+cannot silently proceed from changed evidence. The Training Jobs monitor offers
+the safe same-request upload retry directly when it applies.
+Retry eligibility comes from the backend's durable suite state rather than
+client-side interpretation of the error message.
+
 The Training Jobs monitor remains the project entry point while this work is
-active. **Cancel Jobs** asks for confirmation, then best-effort cancels every
-remaining setup and TAO job while preserving completed work. The project is
+active. When TAO finishes a job, the monitor shows **Finalizing** while the
+Blueprint downloads and processes its artifacts; the next job explains that it
+is waiting for that artifact handoff. **Completed** appears only after both TAO
+and Blueprint-side result processing finish. A failed artifact handoff is shown
+as **Artifact Failed** with its sanitized diagnostic instead of looking like a
+stalled chain. **Cancel Jobs** asks for confirmation, then best-effort cancels
+every remaining setup and TAO job while preserving completed work. The project is
 released from Training Jobs immediately after local cancellation; if TAO does
 not confirm a remote cancellation, the monitor warns that the remote work may
 still be running. The canceled state offers **Back to Projects** as its exit.
@@ -557,11 +624,22 @@ TAO evaluation results are re-scored by the system's canonical Core-field evalua
 - Accuracy metrics: overall Exact Match rate, per-core-field match rate, per-value precision/recall/F1 for categorical Core fields.
 - A metric selector and optional chart let the SME drill into per-value breakdowns and visually compare variants.
 
+Models & Results is one project-wide history rather than a latest-run-only
+view. It groups every retained Student under its immutable Training Run,
+newest first, and shows the run's date, preset, Guidance version, selected
+bases, and training/Test Pool counts. Repeated model/precision combinations
+carry the run timestamp in the chart legend. When two runs used different or
+unverifiable Guidance, output contracts, or evaluation sets, the UI keeps both
+results visible but labels the comparison directional. A Student-vs-Teacher
+delta appears only when their Guidance, frozen Test Pool, and effective output
+contract match. Older models remain available for serving benchmarks,
+production handoff, and portable NIM deployment bundle download.
+
 The SME can use quality results alone to make directional decisions: discard underperforming variants, identify which are worth benchmarking on NIM.
 
 **Phase 2: Serving Benchmark (NIM-backed, user-scoped)**
 
-TAO provides the quality comparison; NIM provides the serving performance characterization. The NIM phase is a targeted **Serving Benchmark** whose primary outputs are latency and concurrency behavior across configured load levels, not a second quality gate.
+TAO provides the quality comparison; NIM provides the serving performance characterization. The NIM phase is a targeted **Serving Benchmark** whose primary outputs are latency, throughput, and reliability across configured load levels. Quality remains an independent gate, but serving validation requires the load test itself to pass.
 
 The SME selects which variants to benchmark rather than benchmarking all automatically. Scope options: **Benchmark all**, **Benchmark selected** (checkbox per variant card), or **Benchmark this variant** (per-card action). This avoids wasting time benchmarking variants that are already poor on TAO-backed quality. Selected variants run sequentially (one container at a time, GPU resources shared). Results are shown **progressively** as each variant completes — the SME does not wait for all benchmarks to finish.
 
@@ -575,25 +653,52 @@ For each selected variant, the system orchestrates the NIM lifecycle:
   temporary endpoint, and runs the serving benchmark. This label is distinct
   from **Request production deployment**.
 
-After a variant's benchmark completes, its card immediately shows: latency p50/p90/p99 (client boundary), TTFT/ITL when available, request throughput/RPS across concurrency levels, and NIM profile metadata.
+The workload is not a control prompt: it uses up to 200 real frozen Test Pool images, the active Guidance-derived Student prompt/schema and Inference Contract, native visual handling, no ICL, and no output-token cap. Pinned AIPerf replays the same deterministic image set once at every configured concurrency with KV-cache reuse disabled. External endpoints must confirm the same cache policy and run the same benchmark.
+
+After a variant's benchmark completes, its card immediately shows integer-millisecond latency p50/p90/p99, achieved RPS, and failure percentage at every concurrency. **Workload details** expands the Test Pool count, Guidance/contract provenance, uncapped-output/cache policy, driver version, and workload hash. Every concurrency must return the full request count with zero failures for serving validation; partial/failed measurements remain visible as evidence.
+
+When an upgraded workspace contains an older synthetic serving sweep, Models &
+Results keeps those historical numbers visible but labels the Student **AIPerf
+revalidation required**. **Revalidate with AIPerf** runs the same Student NIM
+lifecycle against real Test Pool images. Historical evidence cannot expose the
+production handoff or portable bundle.
 
 No global workflow timeout is required in v1. Per-variant timeouts independently bound each benchmark. Failed or timed-out variants do not invalidate completed results.
 
 **Deployment handoff:**
 
-Each Student variant card with both quality and serving validation has a
+Each Student variant card with quality validation and current AIPerf serving
+validation has a
 **Request production deployment** button that generates a
 `deployment_handoff` Action Request (Eng Spec §10.3). It contains checkpoint
 and checksum references, NIM configuration, model metadata, benchmark and
 evaluation summaries, frozen Test Pool context, and complete training/dataset
-provenance. The external infrastructure team owns the permanent service,
+provenance. The same panel downloads a portable tar containing the validated
+checkpoint, manifest/checksums, pinned NIM launch script, the schema-aware
+request contract proven by serving evaluation, a real-image structured-label
+verification helper, and lineage. The licensed NIM image and credentials are
+not redistributed; the operator supplies an NGC key and the script pulls the
+pinned image. The external infrastructure team owns the permanent service,
 access controls, scaling, monitoring, and operations. If no variant meets
 quality expectations, the user returns to Interactive Labeling and retrains.
 
-The Teacher is unaffected; it continues to serve the Interactive Labeling loop.
+Hosted Teachers and local Teachers on another free GPU continue serving the
+Interactive Labeling loop. On a single-GPU host, Student benchmarking
+temporarily displaces the resident local Teacher and restores it best-effort
+afterward; the NIM Configuration page can redeploy it if restoration fails.
+
+**Returning to a mature project:** reopening a project with any Student-training
+history first resumes non-terminal work (Training Jobs or an active serving
+validation). Otherwise it opens Project Overview with separate destinations for
+the Interactive Loop, Models & Results, and Training Runs. Models & Results owns
+quality comparison, serving benchmarks, production handoff, and the portable
+NIM deployment bundle. Training Runs owns operational history, metrics, lineage,
+and logs without exposing a second model-download path. Project Overview and
+Models & Results stay available from the project header, with Training Runs one
+choice away on the overview.
 
 ---
 
-*For algorithms, data contracts, configuration defaults, and API-level behavior, see: **Interactive VLM Feedback Loop - Engineering Specification (v1.10.0)**.*
+*For algorithms, data contracts, configuration defaults, and API-level behavior, see: **Interactive VLM Feedback Loop - Engineering Specification (v1.10.1)**.*
 
 ---

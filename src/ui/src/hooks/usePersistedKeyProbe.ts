@@ -24,6 +24,13 @@ import { useEffect, useRef } from "react";
 
 import type { ConnectionTestResponse } from "@/types/nim";
 
+// Persisted-key validation is a best-effort setup guard, not a reason to hold
+// the SME on an automatic transition for the full backend inference deadline.
+// Healthy credential probes normally settle in 0.2-2 seconds. If the provider
+// is degraded, continue with the configured key and let the ordinary
+// click-time / first-use error surfaces provide the backstop.
+export const PERSISTED_KEY_PROBE_TIMEOUT_MS = 8_000;
+
 interface UsePersistedKeyProbeOptions {
   /**
    * Caller-side gate (e.g. "only probe NVIDIA on render cases B/D").
@@ -38,7 +45,7 @@ interface UsePersistedKeyProbeOptions {
    * body so the backend pulls from runtime secrets (e.g.
    * ``testNgcCredential`` / ``testNvidiaCredential``).
    */
-  probe: () => Promise<ConnectionTestResponse>;
+  probe: (signal?: AbortSignal) => Promise<ConnectionTestResponse>;
   /** Message used when the probe fails without an error string. */
   fallbackError: string;
   /** Fired when the probe reports the persisted key is bad. */
@@ -74,21 +81,47 @@ export function usePersistedKeyProbe({
       return;
     }
     let cancelled = false;
-    void (async () => {
-      try {
-        const result = await latest.current.probe();
-        if (cancelled) return;
-        if (!result.success) {
-          latest.current.onRejected(result.error ?? latest.current.fallbackError);
+    let settled = false;
+    let probeTimeoutId: number | undefined;
+    const controller = new AbortController();
+
+    const settle = () => {
+      if (cancelled || settled) return;
+      settled = true;
+      if (probeTimeoutId !== undefined) window.clearTimeout(probeTimeoutId);
+      latest.current.onSettled?.();
+    };
+    // React StrictMode replays mount effects in development. Defer the
+    // outbound probe one task so the simulated first mount cancels before
+    // dispatch; the retained mount then sends exactly one request. This is
+    // the same single-dispatch pattern used by ActionRequestPanel.
+    const timerId = window.setTimeout(() => {
+      probeTimeoutId = window.setTimeout(() => {
+        // A slow provider check must not make an auto-configured setup route
+        // look permanently stuck. Aborting also releases the browser-side
+        // request; the configured credential is re-checked at first use.
+        controller.abort();
+        settle();
+      }, PERSISTED_KEY_PROBE_TIMEOUT_MS);
+      void (async () => {
+        try {
+          const result = await latest.current.probe(controller.signal);
+          if (cancelled) return;
+          if (!result.success) {
+            latest.current.onRejected(result.error ?? latest.current.fallbackError);
+          }
+        } catch {
+          // Quiet: backstops still apply.
+        } finally {
+          settle();
         }
-      } catch {
-        // Quiet: backstops still apply.
-      } finally {
-        if (!cancelled) latest.current.onSettled?.();
-      }
-    })();
+      })();
+    }, 0);
     return () => {
       cancelled = true;
+      window.clearTimeout(timerId);
+      if (probeTimeoutId !== undefined) window.clearTimeout(probeTimeoutId);
+      controller.abort();
     };
   }, [enabled, configured]);
 }

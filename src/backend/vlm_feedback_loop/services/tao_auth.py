@@ -236,8 +236,3 @@ async def retry_once_on_401(
         json_body=json_body,
         _transport=_transport,
     )
-
-
-def reset_tao_bearer_cache() -> None:
-    """Clear every cached JWT. For testing only."""
-    _token_cache.clear()

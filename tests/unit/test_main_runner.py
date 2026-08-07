@@ -12,9 +12,15 @@ from typing import Any
 import pytest
 import uvicorn
 
-from vlm_feedback_loop import config
+from vlm_feedback_loop import __version__, config
 from vlm_feedback_loop import main as main_module
 from vlm_feedback_loop.services.filesystem_service import check_path_allowed
+
+
+def test_openapi_advertises_the_package_release_version() -> None:
+    """Public API metadata must identify the same release as the package."""
+
+    assert main_module.app.openapi()["info"]["version"] == __version__
 
 
 def _capture_run(
@@ -127,3 +133,67 @@ def test_no_cli_host_preserves_configured_host(
 
     assert captured["host"] == "192.0.2.10"
     assert captured["settings_host"] == captured["host"]
+
+
+@pytest.mark.parametrize(
+    ("bind_host", "expected_host"),
+    [
+        ("127.0.0.1", "127.0.0.1"),
+        ("0.0.0.0", "127.0.0.1"),
+        ("::", "127.0.0.1"),
+        ("::1", "[::1]"),
+    ],
+)
+def test_print_backend_url_uses_effective_bind_configuration(
+    patch_config_paths,
+    write_config,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    bind_host: str,
+    expected_host: str,
+) -> None:
+    """The Vite handshake follows configured ports and reachable host syntax."""
+    write_config(
+        overrides={
+            "BIND_HOST": bind_host,
+            "BIND_PORT": 8123,
+            "IMAGE_ROOT": "/images",
+        }
+    )
+    monkeypatch.delenv("BIND_HOST", raising=False)
+    monkeypatch.delenv("BIND_PORT", raising=False)
+    monkeypatch.setattr(
+        uvicorn,
+        "run",
+        lambda *args, **kwargs: pytest.fail("URL query must not start Uvicorn"),
+    )
+
+    try:
+        main_module.run_server(["--print-backend-url"])
+    finally:
+        config.reset_settings()
+
+    assert capsys.readouterr().out.strip() == f"http://{expected_host}:8123"
+
+
+def test_print_backend_url_honors_cli_port_override(
+    patch_config_paths,
+    write_config,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An explicit runner port is also the Vite proxy port."""
+    write_config(overrides={"BIND_PORT": 8000})
+    monkeypatch.delenv("BIND_PORT", raising=False)
+    monkeypatch.setattr(
+        uvicorn,
+        "run",
+        lambda *args, **kwargs: pytest.fail("URL query must not start Uvicorn"),
+    )
+
+    try:
+        main_module.run_server(["--port", "8124", "--print-backend-url"])
+    finally:
+        config.reset_settings()
+
+    assert capsys.readouterr().out.strip() == "http://127.0.0.1:8124"

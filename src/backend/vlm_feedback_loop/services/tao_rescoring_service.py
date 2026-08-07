@@ -51,7 +51,7 @@ import json
 import logging
 import tarfile
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, BinaryIO, cast
 
 from sqlalchemy.orm import Session
 
@@ -64,6 +64,7 @@ from vlm_feedback_loop.db.models.run import RunRecord
 from vlm_feedback_loop.db.models.student_model import StudentModel
 from vlm_feedback_loop.db.models.tao_job import TAOJob
 from vlm_feedback_loop.services import evaluation_service, student_model_service
+from vlm_feedback_loop.services.authorized_file import open_regular_file_beneath
 from vlm_feedback_loop.services.exact_match_evaluator import (
     compute_aggregate_metrics,
     match_fields,
@@ -71,8 +72,11 @@ from vlm_feedback_loop.services.exact_match_evaluator import (
     normalize_ground_truth,
     strip_code_fence,
 )
-from vlm_feedback_loop.services.hashing import sha256_file
-from vlm_feedback_loop.services.project_service import get_project_engine
+from vlm_feedback_loop.services.hashing import sha256_stream
+from vlm_feedback_loop.services.project_service import (
+    get_project_engine,
+    project_dir_path,
+)
 
 logger = logging.getLogger("vlm_feedback_loop.services.tao_rescoring_service")
 _MISSING = object()
@@ -82,6 +86,7 @@ _MISSING = object()
 
 
 def _load_ground_truth_from_archive(
+    archive_stream: BinaryIO,
     archive_path: Path,
 ) -> tuple[dict[str, dict[str, Any]], frozenset[str]]:
     """Stream-read ``annotations.json`` out of a DatasetExport archive.
@@ -97,12 +102,8 @@ def _load_ground_truth_from_archive(
     ground_truth: dict[str, dict[str, Any]] = {}
     seen_keys: set[str] = set()
     duplicate_keys: set[str] = set()
-    if not archive_path.is_file():
-        logger.warning("ground_truth: archive missing at %s", archive_path)
-        return ground_truth, frozenset()
-
     try:
-        with tarfile.open(str(archive_path), "r:gz") as tf:
+        with tarfile.open(fileobj=archive_stream, mode="r:gz") as tf:
             member = tf.getmember("annotations.json")
             extracted = tf.extractfile(member)
             if extracted is None:
@@ -516,21 +517,35 @@ async def rescore_evaluate_job(
         )
         return None
     archive_path = Path(archive_path_str)
+    export_root = project_dir_path(settings.WORKSPACE_ROOT, project_id) / "exports"
     try:
-        actual_archive_checksum = await asyncio.to_thread(sha256_file, archive_path)
-    except OSError as exc:
-        logger.warning("rescore: cannot hash frozen archive %s: %s", archive_path, exc)
-        return None
-    if actual_archive_checksum.lower() != archive_checksum.lower():
+        with (
+            open_regular_file_beneath(archive_path, export_root) as opened_archive,
+            opened_archive.open_binary() as archive_stream,
+        ):
+            actual_archive_checksum = await asyncio.to_thread(
+                sha256_stream, archive_stream
+            )
+            if actual_archive_checksum.lower() != archive_checksum.lower():
+                logger.warning(
+                    "rescore: frozen archive checksum does not match "
+                    "DatasetExport for %s",
+                    evaluate_tao_job_id,
+                )
+                return None
+            archive_stream.seek(0)
+            ground_truth, duplicate_ground_truth_keys = await asyncio.to_thread(
+                _load_ground_truth_from_archive,
+                archive_stream,
+                archive_path,
+            )
+    except (OSError, PermissionError) as exc:
         logger.warning(
-            "rescore: frozen archive checksum does not match DatasetExport for %s",
-            evaluate_tao_job_id,
+            "rescore: cannot read authorized frozen archive %s: %s",
+            archive_path,
+            exc,
         )
         return None
-
-    ground_truth, duplicate_ground_truth_keys = await asyncio.to_thread(
-        _load_ground_truth_from_archive, archive_path
-    )
     if not ground_truth:
         logger.warning("rescore: no ground truth extracted from %s", archive_path_str)
         return None

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 import sqlite3
 import threading
@@ -14,9 +15,10 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import text
+from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -24,6 +26,7 @@ from vlm_feedback_loop.db.base import ProjectBase, generate_uuid4, utc_now
 from vlm_feedback_loop.db.engine import (
     DatabaseCorruptionError,
     DatabaseMigrationError,
+    _get_alembic_config,
     open_project_db,
 )
 from vlm_feedback_loop.model_catalog_constants import (
@@ -35,6 +38,12 @@ UUID4_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 ISO8601_Z_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+CANONICAL_ALEMBIC_VERSION_DDL = """
+CREATE TABLE alembic_version (
+    version_num VARCHAR(32) NOT NULL,
+    CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)
+)
+"""
 
 EXPECTED_PROJECT_TABLES = {
     "alembic_version",
@@ -105,12 +114,32 @@ class TestDatabasePragmas:
         cursor = RefusingCursor()
 
         class RefusingConnection:
+            closed = False
+
             def cursor(self):
                 return cursor
 
+            def close(self):
+                self.closed = True
+
+        connection = RefusingConnection()
         with pytest.raises(sqlite3.DatabaseError, match="refused"):
-            _enable_sqlite_foreign_keys(RefusingConnection(), None)
+            _enable_sqlite_foreign_keys(connection, None)
         assert cursor.closed is True
+        assert connection.closed is True
+
+    def test_pragma_hook_closes_connection_when_setup_fails(self, tmp_path):
+        """A rejected DBAPI connection is closed before SQLAlchemy can lose it."""
+        from vlm_feedback_loop.db.engine import _set_sqlite_pragmas
+
+        db_path = tmp_path / "corrupt.db"
+        db_path.write_bytes(b"not a sqlite database")
+        connection = sqlite3.connect(db_path)
+
+        with pytest.raises(sqlite3.DatabaseError, match="not a database"):
+            _set_sqlite_pragmas(connection, None)
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            connection.execute("SELECT 1")
 
     def test_embedding_foreign_key_rejects_mismatch_and_cascades(self, project_engine):
         """Embedding ownership is exact and deleting its Example removes it."""
@@ -187,7 +216,7 @@ class TestQuickCheck:
         engine.dispose()
 
         db_path = tmp_project_dir / "project.db"
-        with sqlite3.connect(db_path) as conn:
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
             conn.execute(
                 "INSERT INTO clip_embeddings "
                 "(project_id, example_key, embedding_provider, "
@@ -218,14 +247,14 @@ class TestAlembicMigrations:
             )
         assert EXPECTED_PROJECT_TABLES.issubset(tables)
 
-    def test_fresh_database_starts_at_public_v1(self, project_engine):
-        """A fresh project database is stamped at the public v1 baseline."""
+    def test_fresh_database_starts_at_current_public_revision(self, project_engine):
+        """A fresh project database is stamped at the current public head."""
         with project_engine.connect() as conn:
             rev = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        assert rev == "v1_0001"
+        assert rev == "v1_0004"
 
-    def test_public_v1_schema_matches_orm_metadata(self, project_engine):
-        """Model schema changes require a corresponding post-v1 migration."""
+    def test_public_schema_head_matches_orm_metadata(self, project_engine):
+        """The public migration head matches the ORM schema exactly."""
         with project_engine.connect() as conn:
             context = MigrationContext.configure(
                 conn,
@@ -234,6 +263,283 @@ class TestAlembicMigrations:
             differences = compare_metadata(context, ProjectBase.metadata)
 
         assert differences == []
+
+    def test_enable_lora_migration_backfills_existing_suite_lineage(
+        self, tmp_path: Path
+    ):
+        """Upgrade preserves job lineage and defaults pre-chain suites to LoRA."""
+        engine = create_engine(f"sqlite:///{tmp_path / 'project.db'}")
+        with engine.connect() as conn:
+            cfg = _get_alembic_config(conn)
+            command.upgrade(cfg, "v1_0001")
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO training_suites (
+                        training_suite_id, project_id, idempotency_key,
+                        guidance_id, training_preset, export_field_mode,
+                        include_auto_labeled,
+                        selected_student_base_model_config_ids,
+                        quantization_schemes, chain_ids_ordered, status,
+                        created_at
+                    ) VALUES (
+                        'suite-full', 'project-1', 'request-1', 'guidance-1',
+                        'quick', 'all', 0, '["model-1"]', '[]',
+                        '["chain-1"]', 'running', '2026-08-05T00:00:00Z'
+                    ), (
+                        'suite-preparing', 'project-1', 'request-2', 'guidance-1',
+                        'quick', 'all', 0, '["model-1"]', '[]',
+                        '[]', 'preparing', '2026-08-05T00:00:01Z'
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO tao_jobs (
+                        tao_job_id, project_id,
+                        student_base_model_config_id, dataset_export_ids,
+                        action, job_config, tao_create_job_request,
+                        created_at, chain_id, chain_sequence
+                    ) VALUES (
+                        'job-1', 'project-1', 'model-1', '[]', 'train',
+                        :job_config, '{}',
+                        '2026-08-05T00:00:00Z', 'chain-1', 1
+                    )
+                    """
+                ),
+                {"job_config": '{"lora_config":{"enable_lora":false}}'},
+            )
+            conn.commit()
+
+            command.upgrade(cfg, "head")
+            conn.commit()
+
+            modes = dict(
+                conn.execute(
+                    text(
+                        "SELECT training_suite_id, enable_lora "
+                        "FROM training_suites ORDER BY training_suite_id"
+                    )
+                ).all()
+            )
+            revision = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+
+        assert modes == {"suite-full": 0, "suite-preparing": 1}
+        assert revision == "v1_0004"
+
+    def test_open_upgrades_supported_prior_public_revision(self, tmp_project_dir):
+        """The revision preflight preserves the supported public upgrade path."""
+        db_path = tmp_project_dir / "project.db"
+        bootstrap_engine = create_engine(f"sqlite:///{db_path}")
+        with bootstrap_engine.connect() as conn:
+            command.upgrade(_get_alembic_config(conn), "v1_0001")
+            conn.commit()
+        bootstrap_engine.dispose()
+
+        engine = open_project_db(tmp_project_dir)
+        with engine.connect() as conn:
+            revision = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+            suite_columns = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(training_suites)"))
+            }
+            run_columns = {
+                row[1] for row in conn.execute(text("PRAGMA table_info(run_records)"))
+            }
+        engine.dispose()
+
+        assert revision == "v1_0004"
+        assert "enable_lora" in suite_columns
+        assert "runtime_config_snapshot" in run_columns
+
+    def test_runtime_snapshot_migration_preserves_existing_run(self, tmp_path: Path):
+        """v1_0002 paused work freezes its current runtime inputs at upgrade."""
+        engine = create_engine(f"sqlite:///{tmp_path / 'project.db'}")
+        with engine.connect() as conn:
+            cfg = _get_alembic_config(conn)
+            command.upgrade(cfg, "v1_0002")
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO nim_endpoints (
+                        endpoint_id, project_id, display_name, endpoint_mode,
+                        base_url, auth_mode, source_kind, created_at, updated_at,
+                        max_images_per_request
+                    ) VALUES (
+                        'endpoint-1', 'project-1', 'Hosted', 'hosted',
+                        'https://frozen.example/v1', 'bearer', 'seeded_hosted',
+                        '2026-08-05T00:00:00Z', '2026-08-05T00:00:00Z', 3
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO model_configs (
+                        model_config_id, project_id, endpoint_id, model_name,
+                        context_window_tokens, eligible_roles,
+                        supports_image_input, created_at,
+                        max_images_per_request, default_icl_max_examples
+                    ) VALUES (
+                        'model-1', 'project-1', 'endpoint-1', 'teacher-model',
+                        8192, '["teacher"]', 1, '2026-08-05T00:00:00Z', 8, 4
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO run_records (
+                        run_id, project_id, run_type, status, created_at,
+                        model_config_id
+                    ) VALUES (
+                        'legacy-batch', 'project-1', 'batch_label_run',
+                        'paused', '2026-08-05T00:00:00Z', 'model-1'
+                    )
+                    """
+                )
+            )
+            conn.commit()
+
+            command.upgrade(cfg, "head")
+            conn.commit()
+            status, raw_snapshot = conn.execute(
+                text(
+                    "SELECT status, runtime_config_snapshot FROM run_records "
+                    "WHERE run_id = 'legacy-batch'"
+                )
+            ).one()
+            revision = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+
+        engine.dispose()
+
+        assert status == "paused"
+        assert json.loads(raw_snapshot) == {
+            "version": 1,
+            "project_id": "project-1",
+            "model_config_id": "model-1",
+            "model_name": "teacher-model",
+            "endpoint_id": "endpoint-1",
+            "endpoint_base_url": "https://frozen.example/v1",
+            "endpoint_mode": "hosted",
+            "endpoint_auth_mode": "bearer",
+            "context_window_tokens": 8192,
+            "thinking_toggle_mode": "none",
+            "thinking_toggle_support": "unknown",
+            "visual_budget_mode": "none",
+            "visual_budget_support": "unknown",
+            "structured_generation_support": "unknown",
+            "max_images_per_request": 3,
+            "default_icl_max_examples": 4,
+        }
+        assert revision == "v1_0004"
+
+    def test_commercial_default_migration_only_reseats_projects_without_labels(
+        self, tmp_path: Path
+    ):
+        """An untouched MiniMax default moves to Step without rewriting provenance."""
+        engine = create_engine(f"sqlite:///{tmp_path / 'project.db'}")
+        with engine.connect() as conn:
+            cfg = _get_alembic_config(conn)
+            command.upgrade(cfg, "v1_0003")
+            for project_id in ("unlabeled", "labeled", "step-missing"):
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO projects (
+                            project_id, name, project_dir,
+                            teacher_model_config_id, created_at, updated_at
+                        ) VALUES (
+                            :project_id, :project_id, :project_dir,
+                            :teacher_id, '2026-08-06T00:00:00Z',
+                            '2026-08-06T00:00:00Z'
+                        )
+                        """
+                    ),
+                    {
+                        "project_id": project_id,
+                        "project_dir": f"/workspace/{project_id}",
+                        "teacher_id": f"{project_id}-minimax",
+                    },
+                )
+                model_rows = [
+                    {
+                        "model_config_id": f"{project_id}-minimax",
+                        "model_name": "minimaxai/minimax-m3",
+                    }
+                ]
+                if project_id != "step-missing":
+                    model_rows.append(
+                        {
+                            "model_config_id": f"{project_id}-step",
+                            "model_name": "stepfun-ai/step-3.7-flash",
+                        }
+                    )
+                for model_row in model_rows:
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO model_configs (
+                                model_config_id, project_id, endpoint_id,
+                                model_name, context_window_tokens,
+                                eligible_roles, supports_image_input, created_at
+                            ) VALUES (
+                                :model_config_id, :project_id, 'endpoint-1',
+                                :model_name, 8192, '["teacher"]', 1,
+                                '2026-08-06T00:00:00Z'
+                            )
+                            """
+                        ),
+                        {"project_id": project_id, **model_row},
+                    )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO labels (
+                        label_id, project_id, example_key, label_status,
+                        guidance_id, inference_invocation_id, label_json,
+                        labeled_at
+                    ) VALUES (
+                        'label-1', 'labeled', 'example-1', 'verified',
+                        'guidance-1', 'invocation-1', '{}',
+                        '2026-08-06T00:00:00Z'
+                    )
+                    """
+                )
+            )
+            conn.commit()
+
+            command.upgrade(cfg, "head")
+            conn.commit()
+
+            selections = dict(
+                conn.execute(
+                    text(
+                        "SELECT project_id, teacher_model_config_id "
+                        "FROM projects ORDER BY project_id"
+                    )
+                ).all()
+            )
+            revision = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+
+        assert selections == {
+            "labeled": "labeled-minimax",
+            "step-missing": "step-missing-minimax",
+            "unlabeled": "unlabeled-step",
+        }
+        assert revision == "v1_0004"
 
     def test_tao_chain_columns_present(self, project_engine):
         """The TAO chain columns exist on model_configs and dataset_exports."""
@@ -249,6 +555,15 @@ class TestAlembicMigrations:
         assert "tao_base_experiment_pull_status" in mc_cols
         assert "dataset_upload_ref" in de_cols
         assert "dataset_upload_uri" in de_cols
+
+    def test_student_training_suite_lineage_column_present(self, project_engine):
+        """Registered Students can identify their immutable Training Suite."""
+        with project_engine.connect() as conn:
+            student_columns = {
+                row[1]
+                for row in conn.execute(text("PRAGMA table_info(student_models)"))
+            }
+        assert "training_suite_id" in student_columns
 
     def test_tao_chain_columns_nullable_and_default_null(self, project_engine):
         """Fresh DB has all four new columns nullable with no default."""
@@ -462,11 +777,217 @@ class TestMigrationBackup:
         assert not list(tmp_project_dir.glob("project.db.backup.*"))
         assert not list(tmp_project_dir.glob(".project.db.backup.*"))
 
-    def test_no_backup_on_fresh_db(self, tmp_project_dir):
-        """Fresh database (no prior revision) does not create a backup."""
-        open_project_db(tmp_project_dir)
+    @pytest.mark.parametrize(
+        "initial_state",
+        ["missing", "zero_byte", "empty_alembic_version"],
+    )
+    def test_no_backup_on_fresh_db(self, tmp_project_dir, initial_state):
+        """Only empty unstamped states initialize without a recovery copy."""
+        db_path = tmp_project_dir / "project.db"
+        if initial_state == "zero_byte":
+            db_path.touch()
+        elif initial_state == "empty_alembic_version":
+            with contextlib.closing(sqlite3.connect(db_path)) as conn:
+                conn.execute(CANONICAL_ALEMBIC_VERSION_DDL)
+                conn.commit()
+
+        engine = open_project_db(tmp_project_dir)
+        with engine.connect() as conn:
+            revision = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar()
+        engine.dispose()
+
+        assert revision == "v1_0004"
+        assert not list(tmp_project_dir.glob("project.db.backup.*"))
+
+    @pytest.mark.parametrize("with_empty_version_table", [False, True])
+    def test_unstamped_user_schema_is_backed_up_and_refused_before_alembic(
+        self,
+        tmp_project_dir,
+        monkeypatch,
+        with_empty_version_table,
+    ):
+        """Unknown schema is preserved and never adopted as a fresh project."""
+        import vlm_feedback_loop.db.engine as engine_module
+
+        db_path = tmp_project_dir / "project.db"
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            if with_empty_version_table:
+                conn.execute(CANONICAL_ALEMBIC_VERSION_DDL)
+            conn.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+            conn.execute("INSERT INTO sentinel VALUES ('preserve-me')")
+            conn.commit()
+
+        upgrade_called = False
+
+        def _unexpected_upgrade(*_args, **_kwargs):
+            nonlocal upgrade_called
+            upgrade_called = True
+
+        monkeypatch.setattr(engine_module.command, "upgrade", _unexpected_upgrade)
+
+        with pytest.raises(
+            DatabaseMigrationError,
+            match="missing or invalid Alembic revision",
+        ) as error:
+            open_project_db(tmp_project_dir)
+
+        assert not upgrade_called
         backups = list(tmp_project_dir.glob("project.db.backup.*"))
-        assert len(backups) == 0
+        assert len(backups) == 1
+        assert str(backups[0]) in str(error.value)
+        assert "No migrations were applied" in str(error.value)
+        for candidate in (db_path, backups[0]):
+            with contextlib.closing(sqlite3.connect(candidate)) as conn:
+                assert conn.execute("SELECT value FROM sentinel").fetchone() == (
+                    "preserve-me",
+                )
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            version_exists = conn.execute(
+                "SELECT count(*) FROM sqlite_schema "
+                "WHERE type = 'table' AND name = 'alembic_version'"
+            ).fetchone()
+            assert version_exists == ((1,) if with_empty_version_table else (0,))
+
+    @pytest.mark.parametrize(
+        "statements",
+        [
+            ("CREATE VIEW projects AS SELECT 'operator-row' AS project_id",),
+            (
+                "CREATE TABLE alembic_version "
+                "(version_num VARCHAR(32) NOT NULL, blocker TEXT NOT NULL)",
+            ),
+            ("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)",),
+            (
+                "CREATE TABLE alembic_version "
+                "(revision VARCHAR(32) NOT NULL PRIMARY KEY)",
+            ),
+            ("CREATE TABLE alembic_version (version_num TEXT NOT NULL PRIMARY KEY)",),
+            ("CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)",),
+            (
+                "CREATE TABLE alembic_version "
+                "(version_num VARCHAR(32) NOT NULL "
+                "DEFAULT 'v1_0001' PRIMARY KEY)",
+            ),
+            (
+                "CREATE TABLE alembic_version "
+                "(version_num VARCHAR(32) NOT NULL PRIMARY KEY, "
+                "hidden_extra TEXT GENERATED ALWAYS AS "
+                "(version_num || '-extra') VIRTUAL)",
+            ),
+            (
+                "CREATE TABLE alembic_version "
+                "(version_num VARCHAR(32) NOT NULL PRIMARY KEY "
+                "CHECK (version_num = 'blocked'))",
+            ),
+            (
+                CANONICAL_ALEMBIC_VERSION_DDL,
+                "INSERT INTO alembic_version VALUES ('v1_0001')",
+                "INSERT INTO alembic_version VALUES ('v1_0002')",
+            ),
+            (
+                CANONICAL_ALEMBIC_VERSION_DDL,
+                "INSERT INTO alembic_version VALUES ('')",
+            ),
+        ],
+        ids=[
+            "view-only",
+            "extra-column",
+            "missing-primary-key",
+            "wrong-column",
+            "wrong-type",
+            "nullable",
+            "default",
+            "generated-column",
+            "check-constraint",
+            "multiple-revisions",
+            "empty-revision",
+        ],
+    )
+    def test_invalid_version_state_is_backed_up_before_revision_discovery(
+        self,
+        tmp_project_dir,
+        monkeypatch,
+        statements,
+    ):
+        """Malformed or ambiguous revision state never reaches Alembic."""
+        import vlm_feedback_loop.db.engine as engine_module
+
+        db_path = tmp_project_dir / "project.db"
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            for statement in statements:
+                conn.execute(statement)
+            conn.commit()
+            expected_schema = conn.execute(
+                "SELECT type, name, sql FROM sqlite_schema "
+                "WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name"
+            ).fetchall()
+
+        monkeypatch.setattr(
+            engine_module.command,
+            "upgrade",
+            lambda *_args, **_kwargs: pytest.fail("Alembic must not run"),
+        )
+
+        with pytest.raises(
+            DatabaseMigrationError,
+            match="missing or invalid Alembic revision",
+        ):
+            open_project_db(tmp_project_dir)
+
+        backups = list(tmp_project_dir.glob("project.db.backup.*"))
+        assert len(backups) == 1
+        for candidate in (db_path, backups[0]):
+            with contextlib.closing(sqlite3.connect(candidate)) as conn:
+                assert (
+                    conn.execute(
+                        "SELECT type, name, sql FROM sqlite_schema "
+                        "WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name"
+                    ).fetchall()
+                    == expected_schema
+                )
+
+    @pytest.mark.parametrize(
+        "discovery_api",
+        ["migration_context", "script_directory"],
+    )
+    def test_unknown_schema_is_refused_before_revision_discovery(
+        self,
+        tmp_project_dir,
+        monkeypatch,
+        discovery_api,
+    ):
+        """Revision discovery cannot inspect a schema of unknown provenance."""
+        import vlm_feedback_loop.db.engine as engine_module
+
+        db_path = tmp_project_dir / "project.db"
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+            conn.commit()
+
+        if discovery_api == "migration_context":
+            monkeypatch.setattr(
+                engine_module.MigrationContext,
+                "configure",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "MigrationContext must not inspect unknown schema"
+                ),
+            )
+        else:
+            monkeypatch.setattr(
+                engine_module.ScriptDirectory,
+                "from_config",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "ScriptDirectory must not inspect unknown schema"
+                ),
+            )
+
+        with pytest.raises(
+            DatabaseMigrationError,
+            match="missing or invalid Alembic revision",
+        ):
+            open_project_db(tmp_project_dir)
 
 
 # ── Migration failure halts with backup path ──────────────────────────
@@ -495,7 +1016,7 @@ class TestMigrationFailure:
         monkeypatch.setattr(
             engine_module.ScriptDirectory,
             "get_current_head",
-            lambda _script: "v1_0002",
+            lambda _script: "v1_0005",
         )
 
         # Monkeypatch alembic upgrade to raise
@@ -557,9 +1078,7 @@ class TestMigrationFailure:
 
         db_path = tmp_project_dir / "project.db"
         with contextlib.closing(sqlite3.connect(db_path)) as conn:
-            conn.execute(
-                "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)"
-            )
+            conn.execute(CANONICAL_ALEMBIC_VERSION_DDL)
             conn.execute("INSERT INTO alembic_version VALUES ('061')")
             conn.execute("CREATE TABLE recovery_probe (value TEXT NOT NULL)")
             conn.execute("INSERT INTO recovery_probe VALUES ('unchanged')")
@@ -664,11 +1183,97 @@ class TestEmbeddingDeploymentConfig:
         from vlm_feedback_loop.db.deployment_models import EmbeddingDeploymentConfig
         from vlm_feedback_loop.db.engine import init_deployment_db
 
-        init_deployment_db(tmp_workspace)
+        first_engine = init_deployment_db(tmp_workspace)
         engine = init_deployment_db(tmp_workspace)
+
+        assert engine is first_engine
 
         with Session(engine) as session:
             assert session.query(EmbeddingDeploymentConfig).count() == 1
+
+    def test_path_aliases_and_concurrent_callers_share_one_engine(self, tmp_workspace):
+        """Canonical path ownership prevents duplicate pools and singleton races."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from vlm_feedback_loop.db.deployment_models import (
+            EmbeddingDeploymentConfig,
+            TAODeploymentConfig,
+        )
+        from vlm_feedback_loop.db.engine import init_deployment_db
+
+        alias = tmp_workspace / "nested" / ".."
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            engines = list(
+                executor.map(
+                    init_deployment_db,
+                    [tmp_workspace, alias] * 4,
+                )
+            )
+
+        assert all(engine is engines[0] for engine in engines)
+        with Session(engines[0]) as session:
+            assert session.query(EmbeddingDeploymentConfig).count() == 1
+            assert session.query(TAODeploymentConfig).count() == 1
+
+    def test_close_disposes_cache_and_next_init_creates_a_new_engine(
+        self, tmp_workspace
+    ):
+        from vlm_feedback_loop.db.engine import (
+            close_deployment_db_resources,
+            init_deployment_db,
+        )
+
+        first = init_deployment_db(tmp_workspace)
+        closed_connections = 0
+
+        def record_close(_dbapi_connection, _connection_record):
+            nonlocal closed_connections
+            closed_connections += 1
+
+        event.listen(first, "close", record_close)
+        with first.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+        close_deployment_db_resources()
+        close_deployment_db_resources()
+        second = init_deployment_db(tmp_workspace)
+
+        assert closed_connections >= 1
+        assert second is not first
+
+    def test_failed_first_init_is_disposed_and_retry_is_clean(
+        self, tmp_workspace, monkeypatch
+    ):
+        from vlm_feedback_loop.db import engine as engine_module
+
+        real_ensure_wal_mode = engine_module._ensure_wal_mode
+        created: list[tuple[Engine, object]] = []
+        current_factory = engine_module._create_engine
+
+        def recording_factory(*args, **kwargs):
+            engine = current_factory(*args, **kwargs)
+            created.append((engine, engine.pool))
+            return engine
+
+        calls = 0
+
+        def fail_once(engine):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("WAL setup failed")
+            real_ensure_wal_mode(engine)
+
+        monkeypatch.setattr(engine_module, "_create_engine", recording_factory)
+        monkeypatch.setattr(engine_module, "_ensure_wal_mode", fail_once)
+
+        with pytest.raises(RuntimeError, match="WAL setup failed"):
+            engine_module.init_deployment_db(tmp_workspace)
+
+        failed_engine, original_pool = created[0]
+        assert failed_engine.pool is not original_pool
+        recovered = engine_module.init_deployment_db(tmp_workspace)
+        assert recovered is created[1][0]
 
     def test_init_upgrades_shipped_embedding_runtime(self, tmp_workspace):
         """A deployed 1.x default moves to the tested 2.0 runtime and floor."""
@@ -689,6 +1294,23 @@ class TestEmbeddingDeploymentConfig:
         with Session(upgraded) as session:
             config = session.query(EmbeddingDeploymentConfig).one()
             assert config.nim_container_image == EMBEDDING_NIM_IMAGE
+            assert config.gpu_memory_minimum_gb == EMBEDDING_NIM_GPU_MIN_GB
+
+    def test_init_raises_stale_embedding_gpu_floor(self, tmp_workspace):
+        """The shipped 10 GB floor is raised to the supported 24 GB tier."""
+        from vlm_feedback_loop.db.deployment_models import EmbeddingDeploymentConfig
+        from vlm_feedback_loop.db.engine import init_deployment_db
+
+        engine = init_deployment_db(tmp_workspace)
+        with Session(engine) as session:
+            config = session.query(EmbeddingDeploymentConfig).one()
+            config.gpu_memory_minimum_gb = 10
+            session.commit()
+        engine.dispose()
+
+        upgraded = init_deployment_db(tmp_workspace)
+        with Session(upgraded) as session:
+            config = session.query(EmbeddingDeploymentConfig).one()
             assert config.gpu_memory_minimum_gb == EMBEDDING_NIM_GPU_MIN_GB
 
 

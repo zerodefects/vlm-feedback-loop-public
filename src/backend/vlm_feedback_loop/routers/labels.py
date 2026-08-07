@@ -19,7 +19,11 @@ from vlm_feedback_loop.schemas.label import (
     RestoreOmittedResponse,
     SkipResponse,
 )
-from vlm_feedback_loop.services import label_service, rationale_service
+from vlm_feedback_loop.services import (
+    evaluation_service,
+    label_service,
+    rationale_service,
+)
 from vlm_feedback_loop.services.errors import map_service_error
 from vlm_feedback_loop.services.priority import priority_dispatch
 from vlm_feedback_loop.services.project_db_locks import get_project_write_lock
@@ -55,6 +59,11 @@ async def save_label_endpoint(
             rationale_regeneration_invocation_id=body.rationale_regeneration_invocation_id,
             workspace_root=settings.WORKSPACE_ROOT,
         )
+        if not isinstance(result, str):
+            await evaluation_service.maybe_start_auto_evaluation(
+                project_id,
+                settings,
+            )
 
     if isinstance(result, str):
         raise map_service_error(result)

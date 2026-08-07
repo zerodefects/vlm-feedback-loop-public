@@ -213,6 +213,12 @@ class TestDeployEndpoint:
         client = test_app_client
         pid = _create_project(client)
 
+        # The allocator may move away from the catalog's preferred port.
+        # Both response sections must expose the port actually reserved.
+        deployment = self._mock_deploy.return_value["deployment"]
+        deployment.host_port = 49500
+        deployment.endpoint_url = "http://localhost:49500/v1"
+
         configs = client.get(f"/v1/projects/{pid}/model_configs").json()["items"]
         teacher_mc = next(
             c
@@ -232,6 +238,8 @@ class TestDeployEndpoint:
         assert "deployment" in body
         assert "preflight" in body
         assert body["deployment"]["role"] == "teacher"
+        assert body["deployment"]["host_port"] == 49500
+        assert body["preflight"]["resolved_port"] == 49500
         assert self._mock_deploy.await_args.kwargs["background"] is True
 
     def test_teacher_activation_intent_is_durable_deploy_input(self, test_app_client):

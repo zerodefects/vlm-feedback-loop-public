@@ -141,8 +141,26 @@ class TestCollectFailureEvidence:
         )
         job = self._job(outputs={"tao_logs_text": filler + "\n" + signature})
         evidence = tfc.collect_failure_evidence(job)
-        assert len(evidence) <= 32_768
+        assert len(evidence) <= 65_536
         assert tfc.first_matching_pattern(evidence)
+
+    def test_default_window_covers_complete_persisted_tao_log(self):
+        """The classifier must inspect all of the persisted 64 KB log payload.
+
+        The live Reason2 2B FP8 evaluate log was exactly 65 536 characters;
+        its ``Qwen3VLForConditionalGeneration`` marker began at byte 32 175.
+        The old 32 KB tail started at byte 32 768 and missed it by 593 bytes,
+        leaving a cleanly NIM-validated Student incorrectly quality-failed.
+        """
+        signature = "Qwen3VLForConditionalGeneration"
+        prefix = "x" * 32_174
+        suffix = "y" * (65_536 - len(prefix) - len(signature))
+        job = self._job(outputs={"tao_logs_text": prefix + signature + suffix})
+
+        evidence = tfc.collect_failure_evidence(job)
+
+        assert len(evidence) == 65_536
+        assert tfc.first_matching_pattern(evidence) == signature
 
     def test_concatenates_error_refs_and_chain_halted_reason(self):
         job = self._job(
@@ -237,7 +255,7 @@ class TestMatchesKnownLoaderGap:
             matched, sig = tfc.matches_known_loader_gap(
                 session,
                 project_id=pid,
-                student_train_tao_job_id="nonexistent-train-id",
+                student_artifact_tao_job_id="nonexistent-train-id",
             )
         assert matched is False
         assert sig is None
@@ -268,7 +286,7 @@ class TestMatchesKnownLoaderGap:
             matched, sig = tfc.matches_known_loader_gap(
                 session,
                 project_id=pid,
-                student_train_tao_job_id=train_id,
+                student_artifact_tao_job_id=train_id,
             )
         assert matched is True
         # The classifier returns the FIRST matching pattern in declaration
@@ -298,7 +316,7 @@ class TestMatchesKnownLoaderGap:
             matched, sig = tfc.matches_known_loader_gap(
                 session,
                 project_id=pid,
-                student_train_tao_job_id=train_id,
+                student_artifact_tao_job_id=train_id,
             )
         assert matched is False
         assert sig is None
@@ -329,7 +347,7 @@ class TestMatchesKnownLoaderGap:
             matched, sig = tfc.matches_known_loader_gap(
                 session,
                 project_id=pid,
-                student_train_tao_job_id=train_id,
+                student_artifact_tao_job_id=train_id,
             )
         assert matched is True
         assert sig is not None

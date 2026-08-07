@@ -23,8 +23,10 @@ or sequential invocation writes into when a detector fires
 the rejected run to ``failed`` with a capability-specific ``status_reason``
 and emits the ``run_failed`` SSE event (:func:`finalize_runtime_rejection`),
 the one cancel finalizer that transitions a canceling run to ``canceled``
-(:func:`finalize_canceled`), and the one last-resort finalizer for an
-executor's unhandled exception (:func:`finalize_unhandled_exception`).
+(:func:`finalize_canceled`), the outcome-time cancellation classifier
+(:func:`mark_operation_ignored_if_canceling`), and the one last-resort
+finalizer for an executor's unhandled exception
+(:func:`finalize_unhandled_exception`).
 Interactive proposals do not use the registries — they retry the single
 invocation with the rejected control disabled instead of failing a run.
 """
@@ -41,6 +43,7 @@ from sqlalchemy.orm import Session
 from vlm_feedback_loop.config import Settings
 from vlm_feedback_loop.db.base import utc_now
 from vlm_feedback_loop.db.models.operation import OperationRecord
+from vlm_feedback_loop.db.models.run import RunRecord
 from vlm_feedback_loop.services.run_queries import update_run_if_not_terminal
 from vlm_feedback_loop.services.sse import sse_manager
 
@@ -284,10 +287,16 @@ async def finalize_runtime_rejection(
                 values["examples_schema_invalid"] = example_counts.schema_invalid
                 values["examples_timeout"] = example_counts.timeout
                 values["examples_endpoint_error"] = example_counts.endpoint_error
-            update_run_if_not_terminal(
+            applied = update_run_if_not_terminal(
                 session, run_id, values, terminal_statuses=terminal_statuses
             )
-            session.commit()
+            if applied:
+                session.commit()
+        # A recorded rejection still tells the executor to stop, but a
+        # different terminal owner may already have won the durable race.
+        # In that case it owns the client event too.
+        if not applied:
+            return True
         payload: dict[str, Any] = {
             "run_id": run_id,
             "run_type": run_type,
@@ -299,53 +308,64 @@ async def finalize_runtime_rejection(
     return False
 
 
+def mark_operation_ignored_if_canceling(
+    session: Session,
+    operation: OperationRecord,
+    run_id: str,
+) -> bool:
+    """Classify one outcome at the durable cancellation boundary.
+
+    Flushing the terminal outcome acquires SQLite's writer lock before the
+    parent status read. The outcome and ``running → canceling`` writes are
+    therefore ordered: only an outcome that commits after cancellation is
+    marked non-authoritative.
+    """
+    session.flush()
+    run_status = (
+        session.query(RunRecord.status).filter(RunRecord.run_id == run_id).scalar()
+    )
+    if run_status is None:
+        raise RuntimeError(f"Operation parent run does not exist: run_id={run_id}")
+    if run_status == "canceling":
+        operation.ignored_due_to_run_cancellation = True
+        return True
+    return False
+
+
 async def finalize_canceled(
     engine: Any,
     project_id: str,
     run_id: str,
     *,
-    run_type: str,
     event_name: str,
-    terminal_statuses: frozenset[str],
-) -> None:
-    """Transition a canceling run to ``canceled`` and emit the completed SSE.
+) -> bool:
+    """Transition ``canceling`` to ``canceled`` and emit its completed SSE.
 
-    The one cancel finalizer shared by evaluation and batch labeling,
-    Parameterized like :func:`finalize_runtime_rejection`: ``run_type``
-    selects the OperationRecord run-id column to flag and ``event_name`` is
-    the per-service completed event.
-
-    Marks any OperationRecords persisted during the canceling window with
-    ``ignored_due_to_run_cancellation=True`` so they stay auditable but
-    non-authoritative. Like the runtime-rejection finalizer, this never
-    touches the services' per-run cancel-event registries — those are
-    module-local, so each caller pops its own entry after this returns.
+    Invocation transactions classify their own outcomes at the durable
+    cancellation boundary. This finalizer deliberately does not reclassify
+    earlier authoritative outcomes. It emits only when the durable transition
+    applies, so a failure signal cannot publish a contradictory canceled event.
+    Returns whether it performed the transition, and leaves each service's
+    in-memory cancel-event registry to that service.
     """
-    run_id_column = (
-        OperationRecord.evaluation_run_id
-        if run_type == "evaluation_run"
-        else OperationRecord.batch_label_run_id
-    )
+    applied = False
     with Session(engine) as session:
-        if update_run_if_not_terminal(
+        applied = update_run_if_not_terminal(
             session,
             run_id,
             {"status": "canceled", "completed_at": utc_now()},
-            terminal_statuses=terminal_statuses,
-        ):
-            session.query(OperationRecord).filter(
-                run_id_column == run_id,
-                OperationRecord.ignored_due_to_run_cancellation.is_(False),
-            ).update(
-                {"ignored_due_to_run_cancellation": True},
-                synchronize_session="fetch",
-            )
+            only_status="canceling",
+        )
+        if applied:
             session.commit()
+    if not applied:
+        return False
     payload: dict[str, Any] = {
         "run_id": run_id,
         "status": "canceled",
     }
     await sse_manager.emit(project_id, event_name, payload)
+    return True
 
 
 async def finalize_unhandled_exception(
@@ -362,14 +382,16 @@ async def finalize_unhandled_exception(
     The one implementation shared by evaluation and batch labeling,
     parameterized like the sibling finalizers. Marks the run ``failed``
     with ``status_reason="unhandled_exception"`` unless it already
-    terminalized, then emits ``run_failed``. Never raises: the caller is
-    already inside an ``except`` block, so a persistence failure is
-    logged and the SSE still goes out. Like the siblings, this never
-    touches the services' per-run cancel-event registries.
+    terminalized, then emits ``run_failed`` only when that transition wins.
+    Never raises: the caller is already inside an ``except`` block, so a
+    persistence failure is logged without publishing an uncommitted state.
+    Like the siblings, this never touches the services' per-run cancel-event
+    registries.
     """
+    applied = False
     try:
         with Session(engine) as session:
-            update_run_if_not_terminal(
+            applied = update_run_if_not_terminal(
                 session,
                 run_id,
                 {
@@ -379,10 +401,13 @@ async def finalize_unhandled_exception(
                 },
                 terminal_statuses=terminal_statuses,
             )
-            session.commit()
+            if applied:
+                session.commit()
     except Exception:
         logger.exception("Failed to mark run %s as failed", run_id)
 
+    if not applied:
+        return
     payload: dict[str, Any] = {
         "run_id": run_id,
         "run_type": run_type,

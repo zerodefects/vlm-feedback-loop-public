@@ -14,20 +14,22 @@
 
 import { StatusPill } from "@/components/common/StatusPill";
 import { statusDisplay } from "@/lib/training/statusDisplay";
-import type { TAOJobStatus } from "@/types/training";
+import type { TAOJobOutputsFetchStatus, TAOJobStatus } from "@/types/training";
 
 interface TrainingStatusBadgeProps {
   status: TAOJobStatus;
   chainHaltedReason?: string | null;
+  outputsFetchStatus?: TAOJobOutputsFetchStatus | null;
   "data-testid"?: string;
 }
 
 export function TrainingStatusBadge({
   status,
   chainHaltedReason = null,
+  outputsFetchStatus = null,
   "data-testid": testid = "training-status-badge",
 }: TrainingStatusBadgeProps) {
-  const d = statusDisplay(status, chainHaltedReason);
+  const d = statusDisplay(status, chainHaltedReason, outputsFetchStatus);
   return (
     <StatusPill
       tone={d.tone}

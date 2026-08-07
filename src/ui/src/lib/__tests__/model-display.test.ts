@@ -6,10 +6,22 @@ import { describe, expect, it } from "vitest";
 import {
   formatModelDisplayName,
   localTeacherDisplayName,
+  quantizationDisplayName,
   shortBaseLabel,
   thinkingToggleVisible,
   visualBudgetVisible,
 } from "../model-display";
+
+describe("quantizationDisplayName", () => {
+  it("humanizes the public FP8 enum without changing compact schemes", () => {
+    expect(quantizationDisplayName("FP8_DYNAMIC")).toBe("FP8 Dynamic");
+    expect(quantizationDisplayName("W4A16")).toBe("W4A16");
+  });
+
+  it("names the full-precision baseline when no quantization is recorded", () => {
+    expect(quantizationDisplayName(null)).toBe("BF16 (baseline)");
+  });
+});
 
 describe("formatModelDisplayName (title casing, default)", () => {
   it("renders the canonical Cosmos Reason2 names", () => {
@@ -157,6 +169,11 @@ describe("shortBaseLabel", () => {
 
   it("extracts size suffix for 2b", () => {
     expect(shortBaseLabel("nvidia/cosmos-reason2-2b")).toBe("2B");
+  });
+
+  it("uses compact Cosmos 3 family names", () => {
+    expect(shortBaseLabel("nvidia/cosmos3-nano-reasoner")).toBe("Nano");
+    expect(shortBaseLabel("nvidia/cosmos3-super-reasoner")).toBe("Super");
   });
 
   it("falls back to full name when no size", () => {

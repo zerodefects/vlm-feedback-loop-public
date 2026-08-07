@@ -14,7 +14,13 @@ import { makeEnvironmentResponse, makeProjectResponse } from "@/test/fixtures";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { MemoryRouter, Routes, Route, Outlet } from "react-router-dom";
+import {
+  MemoryRouter,
+  Routes,
+  Route,
+  Outlet,
+  useOutletContext,
+} from "react-router-dom";
 import type { ReactNode } from "react";
 import { ImageIngestPage } from "@/pages/ImageIngestPage";
 import { projectKeys } from "@/api/query-keys";
@@ -114,14 +120,14 @@ const SCAN_RESULT = {
   images: [
     {
       storage_ref: "/data/images/img_001.jpg",
-      suggested_example_key: "img_001--abc123",
+      suggested_example_key: "img1",
       size_bytes: 2048576,
       key_status: "available" as const,
       existing_storage_ref: null,
     },
     {
       storage_ref: "/data/images/img_002.png",
-      suggested_example_key: "img_002--def456",
+      suggested_example_key: "img2",
       size_bytes: 1400000,
       key_status: "available" as const,
       existing_storage_ref: null,
@@ -136,20 +142,20 @@ const SCAN_RESULT = {
 const INGEST_RESPONSE = {
   results: [
     {
-      example_key: "img_001--abc123",
+      example_key: "img1",
       status: "created" as const,
       error: null,
       error_code: null,
       warnings: [],
-      example: { example_key: "img_001--abc123", state: "Unlabeled" },
+      example: { example_key: "img1", state: "Unlabeled" },
     },
     {
-      example_key: "img_002--def456",
+      example_key: "img2",
       status: "created" as const,
       error: null,
       error_code: null,
       warnings: [],
-      example: { example_key: "img_002--def456", state: "Unlabeled" },
+      example: { example_key: "img2", state: "Unlabeled" },
     },
   ],
 };
@@ -225,6 +231,11 @@ function createReactiveWrapper(
     );
   }
 
+  function LabelingProjectCount() {
+    const { project } = useOutletContext<{ project: typeof PROJECT }>();
+    return <div data-testid="labeling-unlabeled-count">{project.counts.unlabeled}</div>;
+  }
+
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={queryClient}>
@@ -232,6 +243,7 @@ function createReactiveWrapper(
           <Routes>
             <Route path="/projects/:projectId" element={<MockSetupLayout />}>
               <Route path="ready" element={children} />
+              <Route path="labeling" element={<LabelingProjectCount />} />
             </Route>
           </Routes>
         </MemoryRouter>
@@ -265,46 +277,96 @@ describe("ImageIngestPage", () => {
     });
 
     expect(screen.getByText("Ingest Images")).toBeInTheDocument();
-    expect(screen.getByTestId("path-input")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Path" })).toBe(
+      screen.getByTestId("path-input"),
+    );
 
     await waitFor(() => {
       expect(screen.getByTestId("file-browser")).toBeInTheDocument();
     });
     expect(mockBrowseFilesystem).toHaveBeenCalledWith(undefined);
+    expect(screen.getByTestId("browse-parent-button")).toBeDisabled();
+    expect(screen.getByTestId("browse-root-boundary")).toHaveTextContent(
+      "filesystem root",
+    );
   });
 
-  it("opens the shipped sample without requiring navigation from filesystem root", async () => {
+  it("moves up one folder from the explicit filesystem control", async () => {
     mockBrowseFilesystem
+      .mockResolvedValueOnce(BROWSE_CONFIGURED_ROOT)
       .mockResolvedValueOnce({
-        ...BROWSE_ROOT,
-        bundled_sample_path: "/repo/deploy/example-images",
-      })
-      .mockResolvedValueOnce({
-        path: "/repo/deploy/example-images",
-        parent: "/repo/deploy",
-        bundled_sample_path: "/repo/deploy/example-images",
+        path: "/data/images/paper",
+        parent: "/data/images",
         entries: [
           {
-            name: "rock",
-            type: "directory" as const,
-            path: "/repo/deploy/example-images/rock",
-            size_bytes: null,
+            name: "paper-001.png",
+            type: "file" as const,
+            path: "/data/images/paper/paper-001.png",
+            size_bytes: 1024,
           },
         ],
-      });
+        bundled_sample_path: null,
+      })
+      .mockResolvedValueOnce(BROWSE_CONFIGURED_ROOT);
     const { Wrapper } = createWrapper();
     const user = userEvent.setup();
 
     render(<ImageIngestPage />, { wrapper: Wrapper });
 
-    await user.click(await screen.findByTestId("use-bundled-sample"));
+    await user.click(await screen.findByRole("button", { name: "paper/" }));
+    const upButton = screen.getByRole("button", { name: "Up one folder" });
+    expect(upButton).toBeEnabled();
+    await user.click(upButton);
+
     await waitFor(() =>
-      expect(mockBrowseFilesystem).toHaveBeenLastCalledWith(
-        "/repo/deploy/example-images",
-      ),
+      expect(mockBrowseFilesystem).toHaveBeenLastCalledWith("/data/images"),
     );
-    expect(await screen.findByText("rock/")).toBeInTheDocument();
-    expect(screen.queryByTestId("use-bundled-sample")).toBeNull();
+    expect(await screen.findByRole("button", { name: "paper/" })).toBeInTheDocument();
+  });
+
+  it("explains the configured image-root boundary when no parent is available", async () => {
+    mockBrowseFilesystem.mockResolvedValueOnce(BROWSE_CONFIGURED_ROOT);
+    const { Wrapper } = createWrapper();
+
+    render(<ImageIngestPage />, { wrapper: Wrapper });
+
+    expect(await screen.findByTestId("browse-parent-button")).toBeDisabled();
+    expect(screen.getByTestId("browse-root-boundary")).toHaveTextContent(
+      /configured image root.*change IMAGE_ROOT/i,
+    );
+  });
+
+  it("starts beside the shipped sample so its root folder is selectable", async () => {
+    const samplePath = "/repo/deploy/example-images";
+    mockBrowseFilesystem
+      .mockResolvedValueOnce({
+        ...BROWSE_ROOT,
+        bundled_sample_path: samplePath,
+      })
+      .mockResolvedValueOnce({
+        path: "/repo/deploy",
+        parent: "/repo",
+        bundled_sample_path: samplePath,
+        entries: [
+          {
+            name: "example-images",
+            type: "directory" as const,
+            path: samplePath,
+            size_bytes: null,
+          },
+        ],
+      });
+    const { Wrapper } = createWrapper();
+
+    render(<ImageIngestPage />, { wrapper: Wrapper });
+
+    await waitFor(() =>
+      expect(mockBrowseFilesystem).toHaveBeenLastCalledWith("/repo/deploy"),
+    );
+    expect(
+      await screen.findByRole("checkbox", { name: "Select directory example-images" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/use bundled sample/i)).toBeNull();
   });
 
   it("hides recent paths that fall outside the backend-selected root", async () => {
@@ -370,8 +432,8 @@ describe("ImageIngestPage", () => {
   // able to hop out as soon as the first batch lands — they should NOT
   // have to wait for the entire progress bar to fill.
 
-  it("shows [Start labeling] in progress card after first batch", async () => {
-    // Enough images to require multiple batches: 50 (first) + 200 = 250.
+  it("refreshes project counts before mid-ingest [Start labeling] navigation", async () => {
+    // Enough images to require multiple ramped batches.
     const TWO_BATCH_SCAN = {
       ...SCAN_RESULT,
       images: Array.from({ length: 250 }, (_, i) => ({
@@ -424,7 +486,9 @@ describe("ImageIngestPage", () => {
       },
     );
 
-    const { Wrapper } = createWrapper({
+    const { Wrapper } = createReactiveWrapper({
+      ...PROJECT,
+      active_guidance_id: "g-1",
       embedding_provider: "hosted_nvclip",
     });
     const user = userEvent.setup();
@@ -450,10 +514,15 @@ describe("ImageIngestPage", () => {
       screen.getByText("Computing CLIP embeddings via NVIDIA hosted NIM…"),
     ).toBeInTheDocument();
 
-    // Drain the remaining batch so the test cleans up.
-    for (let i = 1; i < deferreds.length; i++) {
-      deferreds[i].resolve({ results: [] });
-    }
+    await user.click(screen.getByTestId("in-progress-start-labeling"));
+    expect(await screen.findByTestId("labeling-unlabeled-count")).toHaveTextContent(
+      "12",
+    );
+    // Drain the held batch, then let later ramp batches resolve immediately
+    // so no async ingestion work leaks into the next test.
+    await waitFor(() => expect(deferreds.length).toBeGreaterThan(1));
+    mockIngestExamples.mockResolvedValue({ results: [] });
+    deferreds[1].resolve({ results: [] });
   });
 
   // ── Completion Summary ────────────────────────────────────────────────
@@ -595,31 +664,25 @@ describe("ImageIngestPage", () => {
 
   it("identifies the bundled sample as a walkthrough rather than a scale-up dataset", async () => {
     const samplePath = "/repo/deploy/example-images";
-    mockBrowseFilesystem
-      .mockResolvedValueOnce({
-        ...BROWSE_ROOT,
-        bundled_sample_path: samplePath,
-      })
-      .mockResolvedValueOnce({
-        path: samplePath,
-        parent: "/repo/deploy",
-        bundled_sample_path: samplePath,
-        entries: [
-          {
-            name: "rock",
-            type: "directory" as const,
-            path: `${samplePath}/rock`,
-            size_bytes: null,
-          },
-        ],
-      });
+    mockBrowseFilesystem.mockResolvedValueOnce({
+      path: samplePath,
+      parent: "/repo/deploy",
+      bundled_sample_path: samplePath,
+      entries: [
+        {
+          name: "rock",
+          type: "directory" as const,
+          path: `${samplePath}/rock`,
+          size_bytes: null,
+        },
+      ],
+    });
     mockScanDirectory.mockResolvedValueOnce(SCAN_RESULT);
     mockIngestExamples.mockResolvedValueOnce(INGEST_RESPONSE);
     const { Wrapper } = createWrapper();
     const user = userEvent.setup();
 
     render(<ImageIngestPage />, { wrapper: Wrapper });
-    await user.click(await screen.findByTestId("use-bundled-sample"));
     await user.click((await screen.findAllByRole("checkbox"))[0]);
     await user.click(screen.getByText("Ingest Selected"));
 
@@ -737,7 +800,7 @@ describe("ImageIngestPage", () => {
     expect(disabledEl).toBeInTheDocument();
     expect(disabledEl.textContent).toContain("Filesystem browsing is disabled");
     expect(disabledEl.textContent).toContain("IMAGE_ROOT");
-    expect(screen.getByText("Back")).toBeInTheDocument();
+    expect(screen.getByText("Previous screen")).toBeInTheDocument();
   });
 
   // ── Batch dispatch invariant ─────────────────────────────────────────
@@ -944,7 +1007,7 @@ describe("ImageIngestPage", () => {
   // ── Backend key authority for individually selected files ───────────
   //
   // The backend's scan endpoint owns the example-key scheme (slug +
-  // relpath-hash with key_status dedupe). Individually checked files
+  // canonical-path hash with key_status dedupe). Individually checked files
   // must reuse it via a parent-directory scan — a client-side slug of
   // the basename collides on same-named files from different folders
   // (backend rejects the second with example_key_collision).

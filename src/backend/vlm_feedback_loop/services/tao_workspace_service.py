@@ -36,6 +36,7 @@ from vlm_feedback_loop.config import Settings
 from vlm_feedback_loop.db.deployment_models import TAODeploymentConfig
 from vlm_feedback_loop.db.engine import init_deployment_db
 from vlm_feedback_loop.services.http_client import resilient_request
+from vlm_feedback_loop.services.logging_config import redact_exact_secrets
 
 # ``tao_auth_headers`` moved to ``tao_auth``; the redundant alias marks it
 # as deliberately re-exported here so existing importers
@@ -128,14 +129,7 @@ def _redact_workspace_credentials(
     secret_key: str,
 ) -> str:
     """Remove S3 credentials that an FTMS diagnostic may echo."""
-    redacted = text
-    for value in sorted(
-        {value for value in (access_key, secret_key) if value},
-        key=len,
-        reverse=True,
-    ):
-        redacted = redacted.replace(value, "[REDACTED]")
-    return redacted
+    return redact_exact_secrets(text, (access_key, secret_key))
 
 
 # ── Workspace: create or get ────────────────────────────────────────────────

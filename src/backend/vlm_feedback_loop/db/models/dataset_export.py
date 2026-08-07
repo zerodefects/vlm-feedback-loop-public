@@ -34,7 +34,8 @@ class DatasetExport(ProjectBase):
     )
     # Status lifecycle: the standalone POST endpoint creates the row
     # `running` and a background task builds the archive; the training-suite
-    # path stages fully built `completed` rows inside its atomic transaction.
+    # path commits a completed row, links it to its durable preparing suite,
+    # and only then starts workspace upload.
     # `artifact_refs`/`manifest_ref` stay NULL until the build completes.
     status: Mapped[str] = mapped_column(
         String, nullable=False, server_default="completed"

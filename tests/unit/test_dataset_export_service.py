@@ -15,6 +15,7 @@ import json
 import tarfile
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy.orm import Session
@@ -33,6 +34,7 @@ from conftest import (
 from vlm_feedback_loop.db.base import generate_uuid4, utc_now
 from vlm_feedback_loop.db.models.dataset_export import DatasetExport
 from vlm_feedback_loop.db.models.example import Example
+from vlm_feedback_loop.db.models.guidance import Guidance
 from vlm_feedback_loop.db.models.label import Label
 from vlm_feedback_loop.db.models.operation import OperationRecord
 from vlm_feedback_loop.db.models.run import RunRecord
@@ -41,6 +43,7 @@ from vlm_feedback_loop.services.dataset_export_service import (
     _serialize_label_for_export,
     create_dataset_export,
     get_dataset_export,
+    get_dataset_export_archive,
     get_schema_invalid_manifest,
     list_dataset_exports,
     persist_dataset_export_in_session,
@@ -155,6 +158,35 @@ def _setup_export_project(tmp_path, n_verified=3, n_pool=2, n_auto=2):
     return engine, pdir, settings
 
 
+def _add_non_rationale_aux_field(engine) -> None:
+    """Give export-mode tests an ordinary Aux field to include or exclude."""
+    with Session(engine) as session:
+        guidance = session.get(Guidance, GID)
+        assert guidance is not None
+        schema = dict(guidance.schema)
+        schema["fields"] = [
+            *schema["fields"],
+            {
+                "field_id": "f3",
+                "field_name": "inspection_note",
+                "type": "string",
+                "role": "aux",
+                "display_order": 3,
+            },
+        ]
+        schema["generation_order"] = [
+            *schema["generation_order"],
+            "inspection_note",
+        ]
+        guidance.schema = schema
+        for label in session.query(Label).filter_by(project_id=PID):
+            label.label_json = {
+                **label.label_json,
+                "inspection_note": "reviewed by SME",
+            }
+        session.commit()
+
+
 def _extract_annotations(tar_path: str | Path) -> list[dict[str, Any]]:
     """Extract and parse annotations.json from a .tar.gz archive.
 
@@ -260,6 +292,54 @@ class TestCreateExport:
         assert isinstance(result, str)
         assert "validation:" in result
         assert "image file" in result
+
+    def test_symlink_retarget_during_build_cannot_escape_image_root(self, tmp_path):
+        """The tar must reopen through policy, not trust selection-time reachability."""
+        from vlm_feedback_loop.services import dataset_export_service as service
+
+        engine, pdir, original_settings = _setup_export_project(
+            tmp_path, n_verified=1, n_pool=0, n_auto=0
+        )
+        images_root = tmp_path / "images"
+        outside = tmp_path / "outside.jpg"
+        outside.write_bytes(b"outside bytes")
+        link = images_root / "current.jpg"
+        with Session(engine) as session:
+            example = session.query(Example).filter_by(project_id=PID).one()
+            original = Path(example.storage_ref)
+            link.symlink_to(original.name)
+            example.storage_ref = str(link)
+            session.commit()
+
+        settings = original_settings.model_copy(update={"IMAGE_ROOT": str(images_root)})
+        real_open = service.open_authorized_image
+        calls = 0
+
+        def retarget_before_archive(storage_ref, current_settings):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                link.unlink()
+                link.symlink_to(outside)
+            return real_open(storage_ref, current_settings)
+
+        with patch.object(
+            service,
+            "open_authorized_image",
+            side_effect=retarget_before_archive,
+        ):
+            result = create_dataset_export(
+                PID,
+                dataset_intent="training",
+                settings=settings,
+            )
+
+        assert isinstance(result, str)
+        assert result.startswith("validation:")
+        assert "IMAGE_ROOT" in result
+        assert list((Path(pdir) / "exports").iterdir()) == []
+        with Session(engine) as session:
+            assert session.query(DatasetExport).count() == 0
 
     def test_verified_only_evaluation(self, tmp_path):
         engine, pdir, settings = _setup_export_project(
@@ -692,6 +772,7 @@ class TestExportFieldMode:
         engine, pdir, settings = _setup_export_project(
             tmp_path, n_verified=1, n_pool=0, n_auto=0
         )
+        _add_non_rationale_aux_field(engine)
         result = create_dataset_export(
             PID,
             dataset_intent="training",
@@ -701,6 +782,7 @@ class TestExportFieldMode:
         annotations = _extract_annotations(result["artifact_refs"]["archive_path"])
         parsed = json.loads(annotations[0]["conversations"][1]["value"])
         assert "rationale_note" in parsed
+        assert "inspection_note" in parsed
         assert "severity" in parsed
         assert "damaged" in parsed
 
@@ -708,6 +790,7 @@ class TestExportFieldMode:
         engine, pdir, settings = _setup_export_project(
             tmp_path, n_verified=1, n_pool=0, n_auto=0
         )
+        _add_non_rationale_aux_field(engine)
         result = create_dataset_export(
             PID,
             dataset_intent="training",
@@ -717,6 +800,7 @@ class TestExportFieldMode:
         annotations = _extract_annotations(result["artifact_refs"]["archive_path"])
         parsed = json.loads(annotations[0]["conversations"][1]["value"])
         assert "rationale_note" not in parsed
+        assert "inspection_note" in parsed
         assert "severity" in parsed
         assert "damaged" in parsed
 
@@ -724,6 +808,7 @@ class TestExportFieldMode:
         engine, pdir, settings = _setup_export_project(
             tmp_path, n_verified=1, n_pool=0, n_auto=0
         )
+        _add_non_rationale_aux_field(engine)
         result = create_dataset_export(
             PID,
             dataset_intent="training",
@@ -733,6 +818,7 @@ class TestExportFieldMode:
         annotations = _extract_annotations(result["artifact_refs"]["archive_path"])
         parsed = json.loads(annotations[0]["conversations"][1]["value"])
         assert "rationale_note" not in parsed
+        assert "inspection_note" not in parsed
         assert "severity" in parsed
         assert "damaged" in parsed
 
@@ -988,6 +1074,106 @@ class TestGetList:
         result = get_dataset_export(PID, "no-such-id", settings=settings)
         assert isinstance(result, str)
         assert "not found" in result.lower()
+
+    def test_completed_archive_resolves_inside_project_exports(self, tmp_path):
+        """The download boundary returns only the completed local artifact."""
+        _engine, _pdir, settings = _setup_export_project(
+            tmp_path, n_verified=1, n_pool=0, n_auto=0
+        )
+        created = create_dataset_export(
+            PID,
+            dataset_intent="training",
+            settings=settings,
+        )
+
+        result = get_dataset_export_archive(
+            PID,
+            created["dataset_export_id"],
+            settings=settings,
+        )
+
+        assert not isinstance(result, str), result
+        assert result.path.is_file()
+        assert result.path.is_relative_to(
+            (Path(settings.WORKSPACE_ROOT) / "projects" / PID / "exports").resolve()
+        )
+        assert result.checksum_sha256 == created["artifact_refs"]["checksum_sha256"]
+        result.opened_file.close()
+
+    def test_export_rejects_selected_image_outside_current_root(self, tmp_path):
+        engine, _pdir, original_settings = _setup_export_project(
+            tmp_path, n_verified=1, n_pool=0, n_auto=0
+        )
+        allowed = tmp_path / "different-image-root"
+        allowed.mkdir()
+        settings = original_settings.model_copy(update={"IMAGE_ROOT": str(allowed)})
+
+        result = create_dataset_export(
+            PID,
+            dataset_intent="training",
+            settings=settings,
+        )
+
+        assert isinstance(result, str)
+        assert result.startswith("validation:")
+        assert "IMAGE_ROOT" in result
+        with Session(engine) as session:
+            assert session.query(DatasetExport).count() == 0
+
+    def test_archive_download_rejects_artifact_path_outside_project(self, tmp_path):
+        """A corrupted artifact ref cannot turn download into arbitrary read."""
+        engine, _pdir, settings = _setup_export_project(
+            tmp_path, n_verified=1, n_pool=0, n_auto=0
+        )
+        created = create_dataset_export(
+            PID,
+            dataset_intent="training",
+            settings=settings,
+        )
+        outside = tmp_path / "outside.tar.gz"
+        outside.write_bytes(b"not an export")
+        with Session(engine) as session:
+            record = session.get(DatasetExport, created["dataset_export_id"])
+            assert record is not None
+            refs = dict(record.artifact_refs or {})
+            refs["archive_path"] = str(outside)
+            record.artifact_refs = refs
+            session.commit()
+
+        result = get_dataset_export_archive(
+            PID,
+            created["dataset_export_id"],
+            settings=settings,
+        )
+
+        assert isinstance(result, str)
+        assert result.startswith("validation:")
+
+    def test_archive_download_requires_completed_export(self, tmp_path):
+        """A running record is not downloadable as a partial artifact."""
+        engine, _pdir, settings = _setup_export_project(tmp_path)
+        export_id = generate_uuid4()
+        with Session(engine) as session:
+            session.add(
+                DatasetExport(
+                    dataset_export_id=export_id,
+                    project_id=PID,
+                    dataset_intent="training",
+                    export_field_mode="all",
+                    guidance_id=GID,
+                    label_tier_filter="verified_only",
+                    selection_definition_snapshot={},
+                    status="running",
+                    example_count=1,
+                    created_at=utc_now(),
+                )
+            )
+            session.commit()
+
+        result = get_dataset_export_archive(PID, export_id, settings=settings)
+
+        assert isinstance(result, str)
+        assert result.startswith("conflict:")
 
     def test_list_returns_items(self, tmp_path):
         engine, pdir, settings = _setup_export_project(
@@ -1423,7 +1609,7 @@ class TestBackgroundExportLifecycle:
         completed row visible in the caller's own transaction — it must
         not regress to the background create-running-then-build path,
         whose record the suite could observe mid-build."""
-        engine, _pdir, _settings = _setup_export_project(
+        engine, _pdir, settings = _setup_export_project(
             tmp_path, n_verified=2, n_pool=0, n_auto=0
         )
         with Session(engine) as s:
@@ -1431,7 +1617,7 @@ class TestBackgroundExportLifecycle:
                 s,
                 PID,
                 dataset_intent="training",
-                workspace_root=str(tmp_path / "workspace"),
+                settings=settings,
             )
             assert not isinstance(result, str), result
             # The artifact exists before the caller ever commits.

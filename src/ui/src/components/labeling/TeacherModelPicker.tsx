@@ -51,6 +51,12 @@ export function TeacherModelPicker({
   const availableConfigs = teacherConfigs.filter(
     (mc) => mc.availability?.available ?? true,
   );
+  const currentConfig = teacherConfigs.find(
+    (mc) => mc.model_config_id === currentTeacherId,
+  );
+  const currentIsUnavailable =
+    currentTeacherId !== null &&
+    !availableConfigs.some((mc) => mc.model_config_id === currentTeacherId);
 
   // No models at all — likely the catalog hasn't loaded yet. Render a stable
   // top-bar slot without a dropdown so layout doesn't jump during hydration.
@@ -69,7 +75,7 @@ export function TeacherModelPicker({
   // Catalog loaded but every entry is unreachable from the current env /
   // endpoint state. Surface the recovery path inline rather than showing
   // an empty <select>.
-  if (availableConfigs.length === 0) {
+  if (availableConfigs.length === 0 && currentTeacherId === null) {
     return (
       <div
         className="flex items-center gap-2"
@@ -117,12 +123,33 @@ export function TeacherModelPicker({
             Select Teacher
           </option>
         )}
+        {/* Keep the backend-authoritative selection visible even when its
+            endpoint is currently unhealthy or the catalog entry was removed.
+            Omitting the selected value makes a native <select> visually fall
+            back to its first available option, which falsely names a
+            different Teacher without changing project state. */}
+        {currentIsUnavailable && (
+          <option value={currentTeacherId} disabled>
+            {currentConfig?.model_name ?? "Selected Teacher"} (unavailable)
+          </option>
+        )}
         {availableConfigs.map((mc) => (
           <option key={mc.model_config_id} value={mc.model_config_id}>
             {mc.model_name}
           </option>
         ))}
       </select>
+      {currentIsUnavailable && (
+        <Link
+          to={`/projects/${projectId}/settings/nim`}
+          style={{ color: "var(--accent-green)", textDecoration: "underline" }}
+          data-testid="teacher-model-picker-configure-link"
+        >
+          <Text kind="label/regular/xs" style={{ color: "inherit" }}>
+            Configure endpoint
+          </Text>
+        </Link>
+      )}
     </div>
   );
 }

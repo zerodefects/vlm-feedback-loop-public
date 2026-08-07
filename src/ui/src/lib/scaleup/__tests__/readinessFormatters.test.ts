@@ -161,4 +161,47 @@ describe("formatEvalLine", () => {
     ]);
     expect(line.status).toBe("fail");
   });
+
+  it("attributes a stale score to the evaluated Teacher", () => {
+    const line = formatEvalLine([
+      makeCriterion({
+        criterion_name: "overall_exact_match",
+        current_value: 0.908333,
+        threshold: 0.8,
+        passed: true,
+        message: "Passed.",
+        details: {
+          evaluated_model_name: "minimaxai/minimax-m3",
+          current_configuration_differs: true,
+          changed_fields: ["teacher_model"],
+        },
+      }),
+    ]);
+    expect(line.status).toBe("pending");
+    expect(line.label).toBe("Evaluation: minimaxai/minimax-m3");
+    expect(line.detail).toContain("Model accuracy: 91% (need 80%)");
+    expect(line.detail).toContain(
+      "Current settings differ; run a new evaluation to measure the selected setup.",
+    );
+  });
+
+  it("attributes a current score without a stale warning", () => {
+    const line = formatEvalLine([
+      makeCriterion({
+        criterion_name: "overall_exact_match",
+        current_value: 0.85,
+        threshold: 0.8,
+        passed: true,
+        message: "Passed.",
+        details: {
+          evaluated_model_name: "current-teacher",
+          current_configuration_differs: false,
+          changed_fields: [],
+        },
+      }),
+    ]);
+    expect(line.status).toBe("pass");
+    expect(line.label).toBe("Evaluation: current-teacher");
+    expect(line.detail).toBe("Passed.");
+  });
 });

@@ -13,10 +13,13 @@ from __future__ import annotations
 from typing import Any
 
 from vlm_feedback_loop.model_catalog_constants import (
+    COSMOS3_NANO_REASONER,
+    COSMOS3_SUPER_REASONER,
+    COSMOS_REASON2_8B,
     EMBEDDING_DIM,
     EMBEDDING_INPUT_TYPE,
     EMBEDDING_MODEL_ID,
-    MINIMAX_M3,
+    STEP_3_7_FLASH,
 )
 
 # Keys that are deployment-scoped secrets and belong ONLY in .env,
@@ -200,10 +203,9 @@ DEFAULTS: dict[str, Any] = {
     "STUDENT_LATENCY_TEST_CONCURRENCIES": [1, 8, 24],
     # ── Student NIM deployment ───────────────────────────────────────
     # Per-precision GPU memory minima used by the Student preflight
-    # check. Cosmos Reason2 8B BF16 needs >56 GB, FP8 >48 GB; 2B BF16
-    # needs >36 GB, FP8 >24 GB. W4A16 reuses the FP8 floor for the same
-    # base model. The orchestrator's _resolve_gpu_memory_minimum() helper
-    # selects the right value from base model size + quantization_method.
+    # check. The seeded nominal floors are 56 GB (8B BF16), 48 GB (8B
+    # FP8), 36 GB (2B BF16), and 24 GB (2B FP8); the shared GPU-floor
+    # check allows 1% for nvidia-smi reporting. W4A16 reuses the FP8 floor.
     "NIM_GPU_MEMORY_8B_BF16_GB": 56,
     "NIM_GPU_MEMORY_8B_FP8_GB": 48,
     "NIM_GPU_MEMORY_2B_BF16_GB": 36,
@@ -295,23 +297,16 @@ DEFAULTS: dict[str, Any] = {
     "TAO_POLL_MIN_INTERVAL_RUNNING_S": 60,
     "TAO_POLL_TICK_S": 10,
     # ── TAO auto-eval skip blocklist ─────────────────────────────────
-    # Auto-skip chain advancement of TAO ``evaluate`` jobs whose parent
-    # train job's base model is on this blocklist. Default contains
-    # the empirically-blocked 8B path: TAO
-    # ``cosmos-rl-evaluate`` hits a weight-init loader gap on
-    # every Cosmos-Reason2-8B trained checkpoint (the same checkpoint
-    # NIM 1.6.0's vLLM serves cleanly). Routing around the doomed
-    # evaluate saves ~3 min of TAO compute per chain and lands the
-    # Student at ``quality_status="pending"`` (the cleaner cold-start
-    # NIM-eval-fallback path) instead of ``failed`` (which requires the
-    # weight-init failure pattern-match branch). Operator clears this
-    # list once TAO ships an upstream fix. Identification uses the
-    # trained ``ModelConfig.model_name`` — match is exact-string against
-    # the seeded names (``nvidia/cosmos-reason2-2b`` / ``-8b``).
+    # Auto-skip TAO ``evaluate`` jobs whose trained base is known to fail
+    # upstream evaluation. Reason2 8B hits a weight-init loader gap; Cosmos 3
+    # reasoners return unusable predictions. Routing these Students to the
+    # local NIM evaluation fallback avoids wasted TAO compute and misleading
+    # failed-quality state. Operators can clear the list after validating an
+    # upstream fix. Matching uses canonical persisted model names.
     "TAO_AUTOEVAL_SKIP_BASES": [
-        "nvidia/cosmos-reason2-8b",
-        "nvidia/cosmos3-nano-reasoner",
-        "nvidia/cosmos3-super-reasoner",
+        COSMOS_REASON2_8B,
+        COSMOS3_NANO_REASONER,
+        COSMOS3_SUPER_REASONER,
     ],
     # ── Operational logging ──────────────────────────────────────────
     "LOG_LEVEL": "info",
@@ -333,6 +328,6 @@ DEFAULTS: dict[str, Any] = {
     # then probes the URL on create and rebinds the matching model_config to a
     # self_hosted endpoint, so the new project's first proposal stays local
     # rather than 404'ing at the hosted catalog.
-    "DEFAULT_TEACHER_MODEL": MINIMAX_M3,
+    "DEFAULT_TEACHER_MODEL": STEP_3_7_FLASH,
     "DEFAULT_TEACHER_LOCAL_BASE_URL": None,
 }

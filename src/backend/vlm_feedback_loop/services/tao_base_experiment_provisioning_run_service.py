@@ -30,6 +30,7 @@ from vlm_feedback_loop.db.deployment_models import (
 from vlm_feedback_loop.db.engine import init_deployment_db
 from vlm_feedback_loop.db.models.model_config import ModelConfig
 from vlm_feedback_loop.services.background import background_manager
+from vlm_feedback_loop.services.logging_config import redact_exact_secrets
 from vlm_feedback_loop.services.project_service import get_project_engine
 from vlm_feedback_loop.services.runtime_secrets import get_effective_secret
 from vlm_feedback_loop.services.tao_base_experiment_provisioning_service import (
@@ -55,16 +56,15 @@ TERMINAL_STATUSES = frozenset({"succeeded", "failed"})
 
 def _redact(text: str, settings: Settings) -> str:
     """Remove every provisioning credential from a persisted/returned error."""
-    values = {
-        get_effective_secret("TAO_API_KEY", settings) or "",
-        settings.HF_TOKEN or "",
-        settings.TAO_WORKSPACE_S3_ACCESS_KEY or "",
-        settings.TAO_WORKSPACE_S3_SECRET_KEY or "",
-    }
-    redacted = text
-    for value in sorted({value for value in values if value}, key=len, reverse=True):
-        redacted = redacted.replace(value, "[REDACTED]")
-    return redacted
+    return redact_exact_secrets(
+        text,
+        (
+            get_effective_secret("TAO_API_KEY", settings),
+            settings.HF_TOKEN,
+            settings.TAO_WORKSPACE_S3_ACCESS_KEY,
+            settings.TAO_WORKSPACE_S3_SECRET_KEY,
+        ),
+    )
 
 
 def _roles(value: Any) -> list[str]:

@@ -146,13 +146,53 @@ class TestRationaleRegeneration:
         assert not isinstance(result, str), f"Error: {result}"
         assert result["invocation_status"] == "success"
         assert "dent" in result["rationale_note"].lower()
-        # Regression guard — prepare_images is inline-only and takes exactly
-        # the storage refs, no endpoint_mode/settings args (those belonged to
-        # the removed NVCF asset path).
         prepare_mock.assert_called_once()
-        args, _ = prepare_mock.call_args
+        args, kwargs = prepare_mock.call_args
         assert len(args) == 1
         assert isinstance(args[0], list) and len(args[0]) == 1
+        assert kwargs["settings"] is settings
+
+    @pytest.mark.asyncio
+    async def test_image_preparation_failure_never_dispatches_text_only(self, tmp_path):
+        engine, pid, _mcid, settings = _setup_project(tmp_path)
+        failed_prep = fake_prepare_result(1)
+        failed_prep.success = False
+        failed_prep.images[0].error = "Path is outside IMAGE_ROOT"
+        chat_mock = AsyncMock(return_value=_fake_nim_success())
+
+        with (
+            patch(
+                "vlm_feedback_loop.services.rationale_service.nim_client.chat_completions",
+                new=chat_mock,
+            ),
+            patch(
+                "vlm_feedback_loop.services.rationale_service.prepare_images",
+                new=AsyncMock(return_value=failed_prep),
+            ),
+        ):
+            from vlm_feedback_loop.services.rationale_service import (
+                regenerate_rationale,
+            )
+
+            result = await regenerate_rationale(
+                pid,
+                "img_000",
+                None,
+                settings.WORKSPACE_ROOT,
+                settings,
+            )
+
+        assert not isinstance(result, str)
+        assert result["invocation_status"] == "endpoint_error"
+        assert result["rationale_note"] == ""
+        chat_mock.assert_not_awaited()
+        with Session(engine) as session:
+            record = session.get(
+                OperationRecord,
+                result["inference_invocation_id"],
+            )
+            assert record is not None
+            assert "Image preparation failed" in (record.provider_error_ref or "")
 
     @pytest.mark.asyncio
     async def test_disabled_guidance_rejects_regeneration_without_dispatch(

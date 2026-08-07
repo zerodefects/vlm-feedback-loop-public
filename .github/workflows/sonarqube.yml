@@ -34,7 +34,7 @@ jobs:
       team: Blueprints
       product: vlm-feedback-loop
       scmRepoName: vlm-feedback-loop
-      # TODO: Add scmRepoUrl once Jenkins job supports GitHub URLs
+      # Intentionally omitted: the Jenkins job does not yet accept GitHub URLs.
       # scmRepoUrl: https://github.com/NVIDIA-AI-Blueprints/vlm-feedback-loop
 
       # Project tags for tracking

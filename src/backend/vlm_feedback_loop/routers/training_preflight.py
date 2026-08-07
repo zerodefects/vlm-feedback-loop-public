@@ -41,5 +41,6 @@ async def run_training_preflight_endpoint(
         settings=settings,
         include_auto_labeled=body.include_auto_labeled,
         enable_lora=body.enable_lora,
+        quantization_schemes=list(body.quantization_schemes),
     )
     return TrainingPreflightResponse.model_validate(result)

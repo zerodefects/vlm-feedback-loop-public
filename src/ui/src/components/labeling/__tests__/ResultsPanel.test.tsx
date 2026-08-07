@@ -54,31 +54,70 @@ function makeRun(
   };
 }
 
+function renderResultsPanel(
+  run: EvaluationRunResponse = makeRun(),
+  onClose = vi.fn(),
+  minPerValueF1Threshold = 0.6,
+) {
+  return render(
+    <ResultsPanel
+      run={run}
+      onClose={onClose}
+      minPerValueF1Threshold={minPerValueF1Threshold}
+    />,
+  );
+}
+
 describe("ResultsPanel", () => {
+  it("names the icon-only close action", () => {
+    const onClose = vi.fn();
+    renderResultsPanel(makeRun(), onClose);
+
+    const close = screen.getByRole("button", { name: "Close evaluation results" });
+    fireEvent.click(close);
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
   it("renders accuracy section", () => {
-    render(<ResultsPanel run={makeRun()} onClose={vi.fn()} />);
+    renderResultsPanel();
     expect(screen.getByTestId("results-panel")).toBeInTheDocument();
     expect(screen.getByTestId("accuracy-section")).toBeInTheDocument();
     expect(screen.getByText(/85%/)).toBeInTheDocument();
   });
 
+  it("preserves meaningful fractional precision in measured results", () => {
+    const run = makeRun();
+    if (run.metrics?.overall) run.metrics.overall.exact_match_rate = 0.908333;
+    renderResultsPanel(run);
+    expect(screen.getByText(/90\.8%/)).toBeInTheDocument();
+  });
+
   it("shows per-field match rates", () => {
-    render(<ResultsPanel run={makeRun()} onClose={vi.fn()} />);
+    renderResultsPanel();
     expect(screen.getByTestId("per-field-section")).toBeInTheDocument();
     expect(screen.getByText("severity")).toBeInTheDocument();
     expect(screen.getByText("damaged")).toBeInTheDocument();
   });
 
   it("expands per-value breakdown on click", async () => {
-    render(<ResultsPanel run={makeRun()} onClose={vi.fn()} />);
+    renderResultsPanel();
     const toggle = screen.getByTestId("toggle-per-value");
     fireEvent.click(toggle);
     expect(screen.getByText("high")).toBeInTheDocument();
     expect(screen.getByText("low")).toBeInTheDocument();
   });
 
+  it("uses the project's per-value F1 threshold", () => {
+    renderResultsPanel(makeRun(), vi.fn(), 0.68);
+    fireEvent.click(screen.getByTestId("toggle-per-value"));
+
+    expect(screen.getAllByText("below 68%")).toHaveLength(1);
+    expect(screen.queryByLabelText("below 68%")).not.toBeInTheDocument();
+    expect(screen.queryByText("below 60%")).not.toBeInTheDocument();
+  });
+
   it("shows incomplete warning", () => {
-    render(<ResultsPanel run={makeRun({ status: "incomplete" })} onClose={vi.fn()} />);
+    renderResultsPanel(makeRun({ status: "incomplete" }));
     expect(screen.getByTestId("incomplete-warning")).toBeInTheDocument();
   });
 
@@ -88,14 +127,14 @@ describe("ResultsPanel", () => {
         { field_name: "severity", field_type: "enum", missing_values: ["medium"] },
       ],
     });
-    render(<ResultsPanel run={run} onClose={vi.fn()} />);
+    renderResultsPanel(run);
     expect(screen.getByTestId("coverage-gaps")).toBeInTheDocument();
     expect(screen.getByText(/medium/)).toBeInTheDocument();
   });
 
   it("does not crash when metrics is null", () => {
     const run = makeRun({ metrics: null });
-    render(<ResultsPanel run={run} onClose={vi.fn()} />);
+    renderResultsPanel(run);
     expect(screen.getByTestId("results-panel")).toBeInTheDocument();
   });
 
@@ -103,7 +142,7 @@ describe("ResultsPanel", () => {
     const run = makeRun({
       metrics: { overall: undefined as unknown as never, returning: null, new: null },
     });
-    render(<ResultsPanel run={run} onClose={vi.fn()} />);
+    renderResultsPanel(run);
     expect(screen.getByTestId("results-panel")).toBeInTheDocument();
   });
 
@@ -123,7 +162,7 @@ describe("ResultsPanel", () => {
         new: null,
       },
     });
-    render(<ResultsPanel run={run} onClose={vi.fn()} />);
+    renderResultsPanel(run);
     expect(screen.getByTestId("results-panel")).toBeInTheDocument();
     expect(screen.getByTestId("per-field-section")).toBeInTheDocument();
   });

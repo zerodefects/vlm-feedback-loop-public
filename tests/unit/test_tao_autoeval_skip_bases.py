@@ -3,24 +3,20 @@
 
 """Auto-skip TAO ``evaluate`` for known-broken base models.
 
-Without the skip, every Cosmos-Reason2-8B chain auto-submits a doomed
-``evaluate`` job (the upstream weight-init loader gap fails reliably). The
-doomed evaluate burns ~3 min of TAO compute per chain, leaves the Student
-at ``quality_status="failed"`` (cleanable only via the
-pattern-match fallback after a separate NIM eval), and confuses operators
-who don't know about the upstream gap.
+Without the skip, affected chains auto-submit doomed ``evaluate`` jobs.
+Cosmos-Reason2-8B hits an upstream weight-init loader gap; Cosmos 3 reasoners
+return unusable predictions. The failed jobs waste TAO compute, leave Students
+at ``quality_status="failed"``, and obscure the supported local NIM fallback.
 
 The auto-skip routes around it: when the trained base is in
-``Settings.TAO_AUTOEVAL_SKIP_BASES`` (default
-``["nvidia/cosmos-reason2-8b"]``), the polling service's chain-advance
-path marks the planned ``evaluate`` TAOJob ``status="canceled"`` with a
+``Settings.TAO_AUTOEVAL_SKIP_BASES``, the polling service's chain-advance path
+marks the planned ``evaluate`` TAOJob ``status="canceled"`` with a
 ``chain_halted_reason`` carrying the persisted auto-skip marker and
-continues to the next eligible
-chain member. Quantize siblings (which parent on the still-succeeded
-train, not on evaluate) remain eligible by the chain-isolation rule
-. The Student lands at ``quality_status="pending"``, cleanly
-routed through the cold-start NIM-eval-fallback branch instead of
-the failure-branch pattern-match path.
+continues to the next eligible chain member. Quantize siblings (which parent
+on the still-succeeded train, not on evaluate) remain eligible by the
+chain-isolation rule. The Student lands at ``quality_status="pending"``,
+cleanly routed through the cold-start NIM-eval-fallback branch instead of the
+failure-branch pattern-match path.
 """
 
 from __future__ import annotations
@@ -259,7 +255,7 @@ class TestBaseBlocklistSkipPath:
         train_id, eval_id, _ = _seed_chain(
             engine, chain_id=CHAIN, train_status="succeeded", base_mc_id=MC_8B
         )
-        settings = _make_settings(workspace)  # default skip list = 8B
+        settings = _make_settings(workspace)
         submit_mock = AsyncMock()
         monkeypatch.setattr(tao_job_service, "submit_chain_job", submit_mock)
 
@@ -331,7 +327,7 @@ class TestBaseBlocklistSkipPath:
         train_id, _eval_id, _ = _seed_chain(
             engine, chain_id=CHAIN, train_status="succeeded", base_mc_id=MC_8B
         )
-        settings = _make_settings(workspace)  # default skip list = 8B
+        settings = _make_settings(workspace)
         monkeypatch.setattr(tao_job_service, "submit_chain_job", AsyncMock())
 
         await _advance_after_terminal(

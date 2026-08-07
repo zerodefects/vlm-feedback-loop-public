@@ -83,3 +83,21 @@ export const DEFAULT_SETUP_CHAIN_STATE: SetupChainState = {
   cameFromAutoSkip: false,
   localDeployQueued: [],
 };
+
+/**
+ * Distinguish an in-progress onboarding transition from a copied/deep URL.
+ * Completed projects must not reconstruct a fake setup summary from
+ * ``DEFAULT_SETUP_CHAIN_STATE`` when the ephemeral chain state is absent.
+ */
+export function isSetupChainState(value: unknown): value is SetupChainState {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    (candidate.activePath === "hosted" ||
+      candidate.activePath === "local" ||
+      candidate.activePath === "hybrid") &&
+    typeof candidate.cameFromAutoSkip === "boolean" &&
+    Array.isArray(candidate.localDeployQueued) &&
+    candidate.localDeployQueued.every((name) => typeof name === "string")
+  );
+}

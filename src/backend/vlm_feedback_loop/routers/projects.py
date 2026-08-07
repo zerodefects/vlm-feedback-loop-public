@@ -28,7 +28,11 @@ from vlm_feedback_loop.schemas.project import (
     ProjectResponse,
     ProjectUpdate,
 )
-from vlm_feedback_loop.services import action_requests, project_service
+from vlm_feedback_loop.services import (
+    action_requests,
+    evaluation_service,
+    project_service,
+)
 from vlm_feedback_loop.services.errors import not_found
 from vlm_feedback_loop.services.project_db_locks import get_project_write_lock
 from vlm_feedback_loop.services.project_service import ProjectArchivedError
@@ -89,23 +93,27 @@ async def create_project(
     # adopts a running resident when it is still the preferred model on this
     # host; a different resident remains an explicit keep/replace choice.
     from vlm_feedback_loop.services.environment import (
+        get_cached_machine_assessment,
         pick_local_teacher_recommendation,
-        probe_gpu_inventory,
     )
 
+    machine = await get_cached_machine_assessment()
     local_recommendation = pick_local_teacher_recommendation(
-        await probe_gpu_inventory()
+        list(machine.gpu_inventory)
     )
-    project = project_service.create_project(
-        name=body.name,
-        description=body.description,
-        settings=settings,
-        preferred_local_teacher_model_name=(
-            str(local_recommendation["model_name"])
-            if local_recommendation is not None
-            else None
-        ),
-    )
+    try:
+        project = project_service.create_project(
+            name=body.name,
+            description=body.description,
+            settings=settings,
+            preferred_local_teacher_model_name=(
+                str(local_recommendation["model_name"])
+                if local_recommendation is not None
+                else None
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Embedding-NIM probe at project creation
     from vlm_feedback_loop.services.clip_embedding_service import (
         probe_and_set_embedding_provider,
@@ -202,6 +210,11 @@ async def update_project(
                 updates=updates,
                 workspace_root=settings.WORKSPACE_ROOT,
             )
+            if updated is not None:
+                await evaluation_service.maybe_start_auto_evaluation(
+                    project_id,
+                    settings,
+                )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -268,8 +281,9 @@ async def mark_setup_completed_endpoint(
     Called by the frontend whenever the SME exits onboarding (NIM
     connection auto-skip or manual [Continue], embedding setup auto-skip
     or manual Save). ``ProjectIndexRedirect`` gates the setup route on this
-    field — once stamped, the SME proceeds straight to labeling on
-    subsequent project opens.
+    field. Subsequent project opens resume active training, open the
+    state-aware Project Overview for mature projects, or enter labeling
+    when the project has no training history yet.
 
     Idempotency is enforced in the service layer: if the field is already
     non-null, the call is a no-op (no double-stamp, no duplicate

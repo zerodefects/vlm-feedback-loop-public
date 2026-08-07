@@ -9,14 +9,15 @@ one TAOJob chain per selected student_base model (train → evaluate →
 quantize/evaluate per scheme). ``chain_ids_ordered`` preserves the
 intended sequential-model execution order.
 
-``idempotency_key`` is UNIQUE per project so a retry-safe POST returns the
-existing suite response instead of creating duplicates (see
+``idempotency_key`` is UNIQUE per project. Active and completed requests replay
+the existing response; a failed pre-chain dataset transfer can reclaim the
+same suite and frozen export ids (see
 ``training_suite_service.create_training_suite``).
 """
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, String, UniqueConstraint
+from sqlalchemy import Boolean, String, UniqueConstraint, true
 from sqlalchemy.dialects.sqlite import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -45,6 +46,14 @@ class TrainingSuite(ProjectBase):
         String, nullable=False
     )  # all | aux_and_core | core_only
     include_auto_labeled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # Training mode is suite-level lineage and completes the persisted request
+    # body used to validate idempotency-key replays.
+    enable_lora: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=true(),
+    )
 
     # Null only while first-use base provisioning / suite preparation is active.
     training_dataset_export_id: Mapped[str | None] = mapped_column(

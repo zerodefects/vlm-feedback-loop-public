@@ -65,10 +65,16 @@ describe("ConnectionTestPanel — self-hosted", () => {
 
   it("probes GET /models unauthenticated (auth_mode=none, no credential)", async () => {
     mockTestConnection.mockResolvedValue({ success: true, models: ["m1"] });
+    const onTestSuccess = vi.fn();
     const user = userEvent.setup();
-    render(<ConnectionTestPanel mode="self_hosted" apiKeyConfigured={false} />, {
-      wrapper: Wrapper,
-    });
+    render(
+      <ConnectionTestPanel
+        mode="self_hosted"
+        apiKeyConfigured={false}
+        onTestSuccess={onTestSuccess}
+      />,
+      { wrapper: Wrapper },
+    );
 
     await user.type(screen.getByPlaceholderText(URL_PLACEHOLDER), URL_PLACEHOLDER);
     await user.click(screen.getByRole("button", { name: /Test Connection/i }));
@@ -80,6 +86,35 @@ describe("ConnectionTestPanel — self-hosted", () => {
       probe_kind: "models",
     });
     await waitFor(() => expect(screen.getByText(/Connected to/i)).toBeInTheDocument());
+    expect(onTestSuccess).toHaveBeenCalledWith(
+      { success: true, models: ["m1"] },
+      "",
+      URL_PLACEHOLDER,
+    );
+  });
+
+  it("can require a real embedding operation instead of a model-list probe", async () => {
+    mockTestConnection.mockResolvedValue({ success: true });
+    const user = userEvent.setup();
+    render(
+      <ConnectionTestPanel
+        mode="self_hosted"
+        apiKeyConfigured={false}
+        probeKind="embeddings"
+      />,
+      { wrapper: Wrapper },
+    );
+
+    await user.type(screen.getByPlaceholderText(URL_PLACEHOLDER), URL_PLACEHOLDER);
+    await user.click(screen.getByRole("button", { name: /Test Connection/i }));
+
+    await waitFor(() =>
+      expect(mockTestConnection).toHaveBeenCalledWith({
+        base_url: URL_PLACEHOLDER,
+        auth_mode: "none",
+        probe_kind: "embeddings",
+      }),
+    );
   });
 
   it("shows a non-blocking hint when the base URL lacks a version suffix", async () => {

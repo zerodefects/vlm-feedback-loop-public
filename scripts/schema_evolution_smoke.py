@@ -20,7 +20,9 @@ Then verifies the re-label flow:
   • Re-labeling rebuilds ICL from zero
   • New core field values appear in subsequent proposals
 
-Uses Mistral teacher and the RPS schema. Drives:
+Uses the current default hosted Teacher and the RPS schema against a
+local-source backend whose
+API-returned ``project_dir`` is visible to this process. Drives:
   1. Create project; ingest 12 RPS images.
   2. Drive 12 saves (mix of Edits + a few Accepts to vary
      prior_verified_outcome).
@@ -51,6 +53,8 @@ from typing import Any
 
 import httpx
 
+from vlm_feedback_loop.model_catalog_constants import STEP_3_7_FLASH
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_helpers import (  # noqa: E402
     resolve_teacher_model_config_id,
@@ -58,9 +62,8 @@ from smoke_helpers import (  # noqa: E402
 )
 
 BACKEND_URL = "http://127.0.0.1:8000"
-WORKSPACE_ROOT = Path("/tmp/vlm_workspace")
 RPS_ROOT = Path(os.environ.get("RPS_TEST_SET_ROOT", "~/rps-test-set")).expanduser()
-TEACHER_MODEL = "mistralai/mistral-large-3-675b-instruct-2512"
+TEACHER_MODEL = STEP_3_7_FLASH
 
 GUIDANCE_V1: dict[str, Any] = {
     "description": (
@@ -105,9 +108,22 @@ GUIDANCE_V2_EDIT: dict[str, Any] = {
 RPS_FINGERS = {"rock": 0, "paper": 5, "scissors": 2}
 
 
-def _db_query(project_id: str, sql: str, params: tuple = ()) -> list[Any]:
-    db = WORKSPACE_ROOT / "projects" / project_id / "project.db"
-    conn = sqlite3.connect(str(db))
+def _require_project_db(project_dir: Path) -> Path:
+    """Fail the local-source precondition before any paid Teacher work."""
+
+    project_db = project_dir / "project.db"
+    if not project_db.is_file():
+        raise RuntimeError(
+            f"project DB is not locally accessible at {project_db}; schema "
+            "evolution DB audits require a local-source backend on this host"
+        )
+    return project_db
+
+
+def _db_query(project_db: Path, sql: str, params: tuple = ()) -> list[Any]:
+    """Query the exact project database named by the backend response."""
+
+    conn = sqlite3.connect(str(project_db))
     conn.row_factory = sqlite3.Row
     try:
         return [dict(r) for r in conn.execute(sql, params)]
@@ -126,7 +142,7 @@ async def amain(argv: list[str]) -> int:
     )
     parser.parse_args(argv)
     print("=" * 72)
-    print("Schema-evolution re-verification smoke (Mistral)")
+    print(f"Schema-evolution re-verification smoke ({TEACHER_MODEL})")
     print("=" * 72)
 
     discoveries: list[str] = []
@@ -152,7 +168,13 @@ async def amain(argv: list[str]) -> int:
         if r.status_code != 201:
             print(f"✗ create_project: HTTP {r.status_code}")
             return 1
-        pid = r.json()["project_id"]
+        project_payload = r.json()
+        pid = project_payload["project_id"]
+        try:
+            project_db = _require_project_db(Path(project_payload["project_dir"]))
+        except RuntimeError as exc:
+            print(f"✗ project_db_access: {exc}")
+            return 1
         print(f"✓ create_project ({time.monotonic() - t0:.1f}s): {pid}")
 
         mc_id = await resolve_teacher_model_config_id(
@@ -342,7 +364,7 @@ async def amain(argv: list[str]) -> int:
 
         # (a) New Guidance with semantic_core_change_from_guidance_id = v1
         rows = _db_query(
-            pid,
+            project_db,
             "SELECT guidance_id, semantic_core_change_from_guidance_id "
             "FROM guidances WHERE guidance_id = ?",
             (gid_v2,),
@@ -363,7 +385,7 @@ async def amain(argv: list[str]) -> int:
 
         # (b) All Verified examples → Unlabeled with prior_verified_label_ref
         rows = _db_query(
-            pid,
+            project_db,
             "SELECT state, prior_verified_label_ref, prior_verified_outcome "
             "FROM examples WHERE state = 'Unlabeled' "
             "AND prior_verified_label_ref IS NOT NULL",
@@ -382,7 +404,8 @@ async def amain(argv: list[str]) -> int:
 
         # (c) Auto-Labeled examples → Unlabeled (none in this project)
         rows = _db_query(
-            pid, "SELECT COUNT(*) as cnt FROM examples WHERE state = 'Auto-Labeled'"
+            project_db,
+            "SELECT COUNT(*) as cnt FROM examples WHERE state = 'Auto-Labeled'",
         )
         _print_check(
             "(c) Auto-Labeled examples remaining",
@@ -393,7 +416,7 @@ async def amain(argv: list[str]) -> int:
             overall_ok = False
 
         # (d) Pool memberships cleared (all Labels with pool_assignment deleted)
-        rows = _db_query(pid, "SELECT COUNT(*) as cnt FROM labels")
+        rows = _db_query(project_db, "SELECT COUNT(*) as cnt FROM labels")
         _print_check(
             "(d) Label records (incl. pool assignments) deleted",
             rows[0]["cnt"] == 0,
@@ -404,7 +427,7 @@ async def amain(argv: list[str]) -> int:
 
         # (e) icl_recommendation_dismissed_at_count = 0
         rows = _db_query(
-            pid, "SELECT icl_recommendation_dismissed_at_count FROM projects"
+            project_db, "SELECT icl_recommendation_dismissed_at_count FROM projects"
         )
         val = rows[0]["icl_recommendation_dismissed_at_count"]
         _print_check(
@@ -414,7 +437,9 @@ async def amain(argv: list[str]) -> int:
             overall_ok = False
 
         # (f) review_selector_scheduler_state reset (SQL NULL or JSON null literal)
-        rows = _db_query(pid, "SELECT review_selector_scheduler_state FROM projects")
+        rows = _db_query(
+            project_db, "SELECT review_selector_scheduler_state FROM projects"
+        )
         sched = rows[0]["review_selector_scheduler_state"]
         # Accept both SQL NULL (None) and JSON null literal ("null" text) — both
         # represent "scheduler state cleared". SQLAlchemy's JSON type may serialize
@@ -429,7 +454,9 @@ async def amain(argv: list[str]) -> int:
             overall_ok = False
 
         # (g) schema_change_context_example_key recorded if set (None acceptable)
-        rows = _db_query(pid, "SELECT schema_change_context_example_key FROM projects")
+        rows = _db_query(
+            project_db, "SELECT schema_change_context_example_key FROM projects"
+        )
         ctx = rows[0]["schema_change_context_example_key"]
         _print_check(
             "(g) schema_change_context_example_key",
@@ -439,7 +466,7 @@ async def amain(argv: list[str]) -> int:
 
         # (h) schema_refinement_reminders_dismissed = 0
         rows = _db_query(
-            pid, "SELECT schema_refinement_reminders_dismissed FROM projects"
+            project_db, "SELECT schema_refinement_reminders_dismissed FROM projects"
         )
         rem = rows[0]["schema_refinement_reminders_dismissed"]
         _print_check(
@@ -456,7 +483,7 @@ async def amain(argv: list[str]) -> int:
         first_ex = nxt.json().get("example_key")
         if first_ex:
             rows = _db_query(
-                pid,
+                project_db,
                 "SELECT prior_verified_label_ref, prior_verified_outcome "
                 "FROM examples WHERE example_key = ?",
                 (first_ex,),
@@ -533,7 +560,7 @@ async def amain(argv: list[str]) -> int:
 
         # Verify ICL grew from zero (post-evolution starts at 0, after 2 Edits → 1+ ICL)
         rows = _db_query(
-            pid,
+            project_db,
             "SELECT COUNT(*) as cnt FROM labels "
             "WHERE label_status = 'verified' AND verified_outcome = 'Edit' "
             "AND pool_assignment IS NULL AND guidance_id = ?",

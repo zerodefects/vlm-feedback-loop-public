@@ -15,6 +15,7 @@ describe("ImagePanel zoom controls", () => {
         exampleKey="image-1.png"
         isLoading={false}
         onImageMissing={vi.fn()}
+        onImageLoaded={vi.fn()}
       />,
     );
 
@@ -42,6 +43,7 @@ describe("ImagePanel zoom controls", () => {
         exampleKey="image-1.png"
         isLoading={false}
         onImageMissing={vi.fn()}
+        onImageLoaded={vi.fn()}
       />,
     );
 
@@ -75,6 +77,7 @@ describe("ImagePanel zoom controls", () => {
         exampleKey="image-1.png"
         isLoading={false}
         onImageMissing={vi.fn()}
+        onImageLoaded={vi.fn()}
       />,
     );
 
@@ -89,11 +92,39 @@ describe("ImagePanel zoom controls", () => {
         exampleKey="image-2.png"
         isLoading={false}
         onImageMissing={vi.fn()}
+        onImageLoaded={vi.fn()}
       />,
     );
 
     expect(screen.getByTestId("zoom-level")).toHaveTextContent("100%");
     expect(screen.getByRole("button", { name: "Zoom out" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Reset zoom" })).toBeDisabled();
+  });
+
+  it("retries the same image and reports recovery to the labeling page", async () => {
+    const user = userEvent.setup();
+    const onImageMissing = vi.fn();
+    const onImageLoaded = vi.fn();
+    render(
+      <ImagePanel
+        projectId="project-1"
+        exampleKey="image-1.png"
+        storageRef="/data/image-1.png"
+        isLoading={false}
+        onImageMissing={onImageMissing}
+        onImageLoaded={onImageLoaded}
+      />,
+    );
+
+    fireEvent.error(screen.getByTestId("labeling-image"));
+    expect(onImageMissing).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("image-panel-missing")).toBeInTheDocument();
+
+    await user.click(screen.getByTestId("retry-image-btn"));
+    const retriedImage = screen.getByTestId("labeling-image");
+    expect(retriedImage).toHaveAttribute("src", expect.stringContaining("?retry=1"));
+
+    fireEvent.load(retriedImage);
+    expect(onImageLoaded).toHaveBeenCalledOnce();
   });
 });

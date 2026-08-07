@@ -12,12 +12,9 @@
  * local embeddings ("Want faster local embeddings?"), never a
  * requirement.
  *
- * Local embeddings are the default whenever a suitable GPU exists, so
- * this screen queues what its copy promises: both [Use my GPU] and the
- * NGC-already-configured auto-skip append the embedding NIM to
- * ``localDeployQueued`` when the host fits it (the setup gate
- * dispatches the deploy). The rest of the incoming ``SetupChainState``
- * is forwarded unchanged.
+ * Local embeddings are queued only when the backend recommends that
+ * provider. This preserves explicit ``EMBEDDING_PROVIDER=none`` opt-out
+ * and keeps GPU support-matrix policy in the backend.
  *
  * Instead of a "Skip" affordance, the screen offers a plain ``[Back]``
  * button that returns the SME to the setup-choice screen. Going back
@@ -27,10 +24,9 @@
  * situation).
  *
  * Auto-skip rule: skip if ``ngc_api_key_configured`` (nothing to ask)
- * OR ``!local_deploy_available`` (no GPU/Docker, NGC isn't useful) OR
- * the embedding NIM doesn't fit the GPU it would actually get (the
- * screen's only offer can't be delivered, so asking for an NGC key
- * would be collecting a credential for nothing).
+ * OR the backend does not recommend local embeddings. In those cases the
+ * screen's only offer cannot or should not be delivered, so collecting an
+ * NGC key would be misleading.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -42,25 +38,23 @@ import { ArrowLeft, ArrowRight, Check } from "lucide-react";
 import { setSecret } from "@/api/secrets";
 import { KeyPasteInput } from "@/components/KeyPasteInput";
 import { KeyPortalLink } from "@/components/KeyPortalLink";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { SetupTransitionCard } from "@/components/common/SetupTransitionCard";
+import { useEnvironmentSetupContext } from "@/pages/setup-context";
 import { NGC_API_KEY_PORTAL_URL } from "@/lib/key-portal-urls";
 import { describeSecretPersistError } from "@/lib/secret-errors";
 import type { EnvironmentResponse } from "@/types/nim";
 import { DEFAULT_SETUP_CHAIN_STATE, type SetupChainState } from "@/types/setupChain";
 
-// Local embeddings are the default provider whenever a suitable GPU
-// exists — hosted is the fallback. Append the embedding NIM to the
-// deploy queue when the backend's placement-aware assessment says it
-// fits; the setup gate dispatches the deploy. The includes-guard keeps
-// deep-linked chains that already queued it upstream duplicate-free.
+// The backend owns provider selection, placement, and hardware eligibility.
+// The includes-guard keeps deep-linked chains duplicate-free.
 function withLocalEmbeddingQueued(env: EnvironmentResponse, queue: string[]): string[] {
-  if (!env.local_deploy_available || !env.embedding_deployment.fits) return queue;
+  if (env.recommended_embedding_mode !== "local") return queue;
   const model = env.embedding_deployment.model_name;
   return queue.includes(model) ? queue : [...queue, model];
 }
 
 export function NIMNgcKeyPage(): JSX.Element {
-  const { environment } = useSetupContext();
+  const { environment } = useEnvironmentSetupContext();
   const navigate = useNavigate();
   const location = useLocation();
   const incoming = {
@@ -73,20 +67,13 @@ export function NIMNgcKeyPage(): JSX.Element {
   const [value, setValue] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  // Skip when there is nothing to ask (NGC already configured), when
-  // local isn't useful (no GPU/Docker), or when the embedding NIM
-  // doesn't fit the GPU it would actually get — the promise this
-  // screen makes couldn't be kept.
+  // Skip when there is nothing to ask or the backend selected a hosted/pHash
+  // embedding path. The frontend does not recreate provider policy.
   const shouldAutoSkip =
-    env.ngc_api_key_configured ||
-    !env.local_deploy_available ||
-    !env.embedding_deployment.fits;
+    env.ngc_api_key_configured || env.recommended_embedding_mode !== "local";
 
-  // Queue forwarded to the gate: local embeddings are the default when
-  // the host fits them, so the append applies on BOTH exits — the
-  // manual [Use my GPU] and the NGC-already-configured auto-skip (a
-  // second project on the same host shouldn't lose the deploy just
-  // because there was nothing left to ask).
+  // Apply the backend-selected local provider on both exits: manual
+  // [Use my GPU] and the NGC-already-configured auto-skip.
   const forwardedQueue = withLocalEmbeddingQueued(env, incoming.localDeployQueued);
 
   // ── Auto-skip (→ setup gate) ─────────────────────────────────────────
@@ -154,14 +141,25 @@ export function NIMNgcKeyPage(): JSX.Element {
     if (error) setError(null);
   }
 
-  if (shouldAutoSkip) return <></>;
+  if (shouldAutoSkip) {
+    return (
+      <SetupTransitionCard
+        title="Applying your setup…"
+        description="No additional registry key is needed. You'll continue automatically."
+        testId="ngc-auto-skip-transition"
+      />
+    );
+  }
 
   const disabled = applyMutation.isPending || value.length === 0;
   const gpuLabel = env.gpus[0]?.name ?? "your GPU";
 
   return (
     <div className="flex flex-1 flex-col items-center justify-center p-6">
-      <div className="glass-card--elevated flex w-full max-w-[640px] flex-col gap-6 p-8">
+      <div
+        className="glass-card glass-card--elevated flex w-full max-w-[640px] flex-col gap-6 p-8"
+        data-testid="ngc-setup-card"
+      >
         {/* Confirmation pill — the hosted path arrives here with the
             NVIDIA key in place (freshly pasted or already configured). */}
         <span

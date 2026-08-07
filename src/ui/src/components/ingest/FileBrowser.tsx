@@ -15,7 +15,6 @@ interface FileBrowserProps {
   entries: BrowseEntry[];
   rootPath: string;
   currentPath: string;
-  parentPath: string | null;
   selectedPaths: Set<string>;
   onNavigate: (path: string) => void;
   onToggleSelect: (path: string) => void;
@@ -25,7 +24,6 @@ export function FileBrowser({
   entries,
   rootPath,
   currentPath,
-  parentPath,
   selectedPaths,
   onNavigate,
   onToggleSelect,
@@ -92,22 +90,6 @@ export function FileBrowser({
         className="glass-inner-panel rounded-[14px] overflow-auto"
         style={{ maxHeight: 400 }}
       >
-        {/* Parent directory link */}
-        {parentPath && (
-          <button
-            className="flex items-center gap-2 w-full px-3 py-2 text-left hover:bg-white/5 cursor-pointer"
-            onClick={() => onNavigate(parentPath)}
-            type="button"
-          >
-            <Text kind="body/regular/sm" style={{ color: "var(--text-muted)" }}>
-              ..
-            </Text>
-            <Text kind="body/regular/xs" style={{ color: "var(--text-muted)" }}>
-              (parent)
-            </Text>
-          </button>
-        )}
-
         {dirs.map((entry) => (
           <div
             key={entry.path}
@@ -115,6 +97,7 @@ export function FileBrowser({
           >
             <input
               type="checkbox"
+              aria-label={`Select directory ${entry.name}`}
               checked={selectedPaths.has(entry.path)}
               onChange={() => onToggleSelect(entry.path)}
               className="glass-input"
@@ -139,6 +122,7 @@ export function FileBrowser({
           >
             <input
               type="checkbox"
+              aria-label={`Select file ${entry.name}`}
               checked={selectedPaths.has(entry.path)}
               onChange={() => onToggleSelect(entry.path)}
               className="glass-input"

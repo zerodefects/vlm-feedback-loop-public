@@ -169,6 +169,54 @@ def test_recover_training_suite_setups_isolates_broken_project(
     assert any("DatabaseMigrationError" in message for message in warning_msgs)
 
 
+def test_recover_training_suite_setups_never_opens_archived_project(
+    workspace_with_two_projects,
+):
+    """Startup recovery must leave an intentionally archived project paused."""
+    workspace, active_id, archived_id = workspace_with_two_projects
+    from vlm_feedback_loop.services import training_suite_service
+
+    (workspace / "projects" / archived_id / ".archived").touch()
+    visited: list[str] = []
+
+    class _EmptyQuery:
+        def filter(self, *_args):
+            return self
+
+        def all(self):
+            return []
+
+    class _EmptySession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def query(self, *_args):
+            return _EmptyQuery()
+
+    def _fake_open_project_db(project_dir: Path):
+        visited.append(project_dir.name)
+        return object()
+
+    settings = type("S", (), {"WORKSPACE_ROOT": str(workspace)})()
+    with (
+        patch.object(
+            training_suite_service,
+            "open_project_db",
+            side_effect=_fake_open_project_db,
+        ),
+        patch.object(training_suite_service, "Session", return_value=_EmptySession()),
+    ):
+        recovered = training_suite_service.recover_interrupted_training_suite_setups(
+            settings  # type: ignore[arg-type]
+        )
+
+    assert recovered == 0
+    assert visited == [active_id]
+
+
 # ── recover_embedding_tasks ─────────────────────────────────────────────────
 
 

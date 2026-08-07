@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy.orm import Session
@@ -50,6 +50,7 @@ from vlm_feedback_loop.services.evaluation_service import (
     dismiss_trigger,
     get_evaluation_run,
     list_evaluation_runs,
+    maybe_start_auto_evaluation,
     serialize_metrics_overall,
     start_evaluation_run,
 )
@@ -262,11 +263,7 @@ class TestStateMachine:
     async def test_icl_max_examples_override(
         self, tmp_path, override, expected_in_run_config
     ):
-        """Per-run icl_max_examples override flows through start → execute → invoke.
-
-        Diagnostic-only knob. Verifies the value lands in run_config so
-        _invoke_for_evaluation can read it.
-        """
+        """The effective per-run ICL cap survives delayed execution."""
         engine, pdir, settings = _setup_project_with_pool(
             tmp_path, n_pool=2, n_nonpool=0
         )
@@ -293,9 +290,9 @@ class TestStateMachine:
                 _execute_evaluation,
             )
 
-            await _execute_evaluation(PID, run_id, settings, icl_max_examples=override)
+            await _execute_evaluation(PID, run_id, settings)
 
-        # run_config must carry the override value (None when not set)
+        # The persisted snapshot, not a memory-only executor kwarg, owns it.
         assert "icl_max_examples" in captured["run_config"]
         assert captured["run_config"]["icl_max_examples"] == expected_in_run_config
 
@@ -425,13 +422,20 @@ class TestStateMachine:
             assert not isinstance(result, str), result
             run_id = result["run_id"]
 
+            changed_settings = make_stub_settings(
+                WORKSPACE_ROOT=settings.WORKSPACE_ROOT,
+                ICL_SIM_GAP=0.9,
+                ICL_ABS_THRESHOLD=-0.9,
+            )
+
             from vlm_feedback_loop.services.evaluation_service import (
                 _execute_evaluation,
             )
 
-            await _execute_evaluation(PID, run_id, settings)
+            await _execute_evaluation(PID, run_id, changed_settings)
 
-        assert captured["run_config"].get("icl_sim_gap") is None
+        assert captured["run_config"]["icl_sim_gap"] == 0.05
+        assert captured["run_config"]["icl_abs_threshold"] == 0.4
 
         from vlm_feedback_loop.services import evaluation_service as es
         from vlm_feedback_loop.services.prompt_service import (
@@ -459,10 +463,11 @@ class TestStateMachine:
                 member_key,
                 run_config=captured["run_config"],
                 engine=engine,
-                settings=settings,
+                settings=changed_settings,
             )
         assert invoke_mock.call_args.kwargs["icl_sim_gap"] == 0.05
         assert invoke_mock.call_args.kwargs["icl_abs_threshold"] == 0.4
+        assert invoke_mock.call_args.kwargs["settings"] is changed_settings
 
         # An explicit override — including falsy-but-valid 0.0 — must win
         # over the deployment default (an ``or`` fallback would clobber it).
@@ -511,9 +516,47 @@ class TestConfigSnapshot:
         # Verify persisted on RunRecord
         with Session(engine) as s:
             run = s.query(RunRecord).filter_by(run_id=result["run_id"]).first()
+            assert run is not None
             assert run.guidance_id == GID
             assert run.icl_eligible_count_at_start is not None
             assert run.inference_contract is not None
+            assert run.runtime_config_snapshot == {
+                "version": 2,
+                "project_id": PID,
+                "model_config_id": MCID,
+                "model_name": "test-model",
+                "endpoint_id": EID,
+                "endpoint_base_url": "https://test.nvidia.com/v1",
+                "endpoint_mode": "hosted",
+                "endpoint_auth_mode": "bearer",
+                "context_window_tokens": 256000,
+                "thinking_toggle_mode": "none",
+                "thinking_toggle_support": "unsupported",
+                "visual_budget_mode": "none",
+                "visual_budget_support": "unsupported",
+                "structured_generation_support": "supported",
+                "max_images_per_request": 5,
+                "default_icl_max_examples": None,
+                "inference_settings": {
+                    "generation_preset_key": "precise",
+                    "sampling_params": {"temperature": 0.0, "top_p": 1.0},
+                    "visual_budget_preset_key": "balanced",
+                    "visual_budget_params_effective": None,
+                    "base_output_tokens_floor": 256,
+                    "json_structural_overhead": 48,
+                    "max_output_fraction": 0.25,
+                    "rationale_note_estimate": 160,
+                    "default_unbounded_string_budget": 200,
+                    "model_reasoning_headroom_tokens": 16384,
+                    "runtime_prompt_output_max_tokens_override": None,
+                    "token_safety_margin": 0.85,
+                    "icl_max_examples": None,
+                    "icl_candidate_limit": None,
+                    "icl_sim_gap": 0.05,
+                    "icl_abs_threshold": None,
+                    "image_transport_max_longest_edge": 2090,
+                },
+            }
 
     @pytest.mark.asyncio
     async def test_generation_preset_override_snapshotted(self, tmp_path):
@@ -1313,6 +1356,143 @@ class TestTriggerStatus:
         assert result["configuration_change"]["is_active"] is False
 
 
+class TestAutoEvaluate:
+    """Enabled §7.1 triggers durably queue one background evaluation."""
+
+    @staticmethod
+    def _enable(engine) -> None:
+        evaluation_service_module._auto_start_locks.clear()
+        with Session(engine) as session:
+            project = session.query(Project).filter_by(project_id=PID).one()
+            project.auto_evaluate_enabled = True
+            session.commit()
+
+    @pytest.mark.asyncio
+    async def test_first_pool_trigger_starts_automatically(self, tmp_path):
+        engine, pdir, settings = _setup_project_with_pool(
+            tmp_path, n_pool=5, n_nonpool=0
+        )
+        self._enable(engine)
+        start = AsyncMock(return_value={"run_id": "auto-first", "status": "queued"})
+
+        with patch.object(evaluation_service_module, "start_evaluation_run", start):
+            result = await maybe_start_auto_evaluation(PID, settings)
+
+        start.assert_awaited_once_with(PID, settings=settings)
+        assert result is not None and not isinstance(result, str)
+        assert result["auto_trigger_types"] == ["first_pool_threshold"]
+
+    @pytest.mark.asyncio
+    async def test_configuration_change_trigger_starts_automatically(self, tmp_path):
+        engine, pdir, settings = _setup_project_with_pool(tmp_path, n_pool=5)
+        self._enable(engine)
+        with Session(engine) as session:
+            _add_completed_eval(session, model_config_id="previous-teacher")
+            session.commit()
+        start = AsyncMock(return_value={"run_id": "auto-config", "status": "queued"})
+
+        with patch.object(evaluation_service_module, "start_evaluation_run", start):
+            result = await maybe_start_auto_evaluation(PID, settings)
+
+        start.assert_awaited_once_with(PID, settings=settings)
+        assert result is not None and not isinstance(result, str)
+        assert result["auto_trigger_types"] == ["configuration_change"]
+
+    @pytest.mark.asyncio
+    async def test_icl_growth_trigger_starts_automatically(self, tmp_path):
+        engine, pdir, settings = _setup_project_with_pool(
+            tmp_path, n_pool=5, n_nonpool=10
+        )
+        self._enable(engine)
+        with Session(engine) as session:
+            _add_completed_eval(session, icl_eligible_count_at_completion=3)
+            session.commit()
+        start = AsyncMock(return_value={"run_id": "auto-icl", "status": "queued"})
+
+        with patch.object(evaluation_service_module, "start_evaluation_run", start):
+            result = await maybe_start_auto_evaluation(PID, settings)
+
+        start.assert_awaited_once_with(PID, settings=settings)
+        assert result is not None and not isinstance(result, str)
+        assert result["auto_trigger_types"] == ["icl_growth"]
+
+    @pytest.mark.asyncio
+    async def test_disabled_toggle_keeps_trigger_as_recommendation(self, tmp_path):
+        evaluation_service_module._auto_start_locks.clear()
+        engine, pdir, settings = _setup_project_with_pool(
+            tmp_path, n_pool=5, n_nonpool=0
+        )
+        start = AsyncMock()
+
+        with patch.object(evaluation_service_module, "start_evaluation_run", start):
+            result = await maybe_start_auto_evaluation(PID, settings)
+
+        assert result is None
+        start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_existing_gate_run_suppresses_duplicate_auto_start(self, tmp_path):
+        engine, pdir, settings = _setup_project_with_pool(
+            tmp_path, n_pool=5, n_nonpool=0
+        )
+        self._enable(engine)
+        with Session(engine) as session:
+            session.add(
+                RunRecord(
+                    run_id="already-running",
+                    project_id=PID,
+                    run_type="evaluation_run",
+                    status="running",
+                    examples_total=5,
+                    model_config_id=MCID,
+                    guidance_id=GID,
+                    generation_preset_key="precise",
+                    thinking_mode_effective="on",
+                    visual_budget_preset_key="balanced",
+                )
+            )
+            session.commit()
+        start = AsyncMock()
+
+        with patch.object(evaluation_service_module, "start_evaluation_run", start):
+            result = await maybe_start_auto_evaluation(PID, settings)
+
+        assert result is None
+        start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_changed_config_supersedes_stale_active_auto_run(self, tmp_path):
+        engine, pdir, settings = _setup_project_with_pool(tmp_path, n_pool=5)
+        self._enable(engine)
+        with Session(engine) as session:
+            _add_completed_eval(session)
+            session.add(
+                RunRecord(
+                    run_id="stale-running",
+                    project_id=PID,
+                    run_type="evaluation_run",
+                    status="running",
+                    examples_total=5,
+                    model_config_id=MCID,
+                    guidance_id=GID,
+                    generation_preset_key="precise",
+                    thinking_mode_effective="on",
+                    visual_budget_preset_key="balanced",
+                )
+            )
+            project = session.query(Project).filter_by(project_id=PID).one()
+            project.thinking_default_on = False
+            session.commit()
+        start = AsyncMock(return_value={"run_id": "new-config", "status": "queued"})
+
+        with patch.object(evaluation_service_module, "start_evaluation_run", start):
+            result = await maybe_start_auto_evaluation(PID, settings)
+
+        start.assert_awaited_once_with(PID, settings=settings)
+        assert result is not None and not isinstance(result, str)
+        assert result["auto_trigger_types"] == ["configuration_change"]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Section G: Trigger Dismissal
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1621,6 +1801,110 @@ class TestBackgroundExecution:
             assert run.status == "incomplete"
             # pool_000 was called twice (concurrent + retry)
             assert call_count.get("pool_000", 0) == 2
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_priority_hold_stops_sequential_retry(self, tmp_path):
+        """A retry released after durable cancellation never reaches the Teacher."""
+        engine, _pdir, settings = _setup_project_with_pool(
+            tmp_path, n_pool=1, n_nonpool=0
+        )
+        retry_waiting = asyncio.Event()
+        release_retry = asyncio.Event()
+        wait_count = 0
+        invoke_count = 0
+
+        async def _wait_for_background():
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 2:
+                retry_waiting.set()
+                await release_retry.wait()
+
+        async def _mock_invoke(_project_id, _run_id, example_key, **_kwargs):
+            nonlocal invoke_count
+            invoke_count += 1
+            return _make_failure_result(example_key, "timeout")
+
+        with patched_register(evaluation_service_module):
+            created = await start_evaluation_run(PID, settings=settings)
+        assert not isinstance(created, str), created
+        run_id = created["run_id"]
+
+        with (
+            patch.object(
+                evaluation_service_module.priority_dispatch,
+                "wait_for_background",
+                side_effect=_wait_for_background,
+            ),
+            patch(
+                "vlm_feedback_loop.services.evaluation_service._invoke_for_evaluation",
+                side_effect=_mock_invoke,
+            ),
+        ):
+            executor = asyncio.create_task(
+                evaluation_service_module._execute_evaluation(
+                    PID, run_id, settings, eval_concurrency=1
+                )
+            )
+            await asyncio.wait_for(retry_waiting.wait(), timeout=2)
+            canceled = await cancel_evaluation_run(PID, run_id, settings=settings)
+            assert not isinstance(canceled, str), canceled
+            release_retry.set()
+            await executor
+
+        assert invoke_count == 1
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "canceled"
+            assert run.examples_succeeded == 0
+            assert run.examples_timeout == 1
+
+    @pytest.mark.asyncio
+    async def test_cancel_interrupts_rate_limit_backoff(self, tmp_path):
+        """Cancellation does not wait behind a retry timer with no call in flight."""
+        engine, _pdir, _settings = _setup_project_with_pool(
+            tmp_path, n_pool=1, n_nonpool=0
+        )
+        settings = make_stub_settings(
+            WORKSPACE_ROOT=str(tmp_path / "workspace"),
+            EVAL_RATE_LIMIT_RETRY_MAX_PASSES=1,
+            EVAL_RATE_LIMIT_RETRY_BACKOFF_S=3600,
+        )
+        invoke_count = 0
+
+        async def _mock_invoke(_project_id, _run_id, example_key, **_kwargs):
+            nonlocal invoke_count
+            invoke_count += 1
+            return _make_failure_result(example_key, "rate_limited")
+
+        with patched_register(evaluation_service_module):
+            created = await start_evaluation_run(PID, settings=settings)
+        assert not isinstance(created, str), created
+        run_id = created["run_id"]
+
+        with patch(
+            "vlm_feedback_loop.services.evaluation_service._invoke_for_evaluation",
+            side_effect=_mock_invoke,
+        ):
+            executor = asyncio.create_task(
+                evaluation_service_module._execute_evaluation(
+                    PID, run_id, settings, eval_concurrency=1
+                )
+            )
+            for _ in range(200):
+                if invoke_count == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert invoke_count == 2
+            canceled = await cancel_evaluation_run(PID, run_id, settings=settings)
+            assert not isinstance(canceled, str), canceled
+            await asyncio.wait_for(executor, timeout=2)
+
+        assert invoke_count == 2
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "canceled"
+            assert run.examples_endpoint_error == 1
 
     @pytest.mark.asyncio
     async def test_unhandled_exception_transitions_to_failed(self, tmp_path):
@@ -1974,6 +2258,133 @@ class TestProfileBProductionPipeline:
                 assert r.guidance_id == GID
 
     @pytest.mark.asyncio
+    async def test_cancel_marks_only_the_operation_crossing_its_boundary(
+        self, tmp_path
+    ):
+        """Cancellation leaves earlier evaluation evidence authoritative."""
+        from vlm_feedback_loop.db.models.operation import OperationRecord
+        from vlm_feedback_loop.services.evaluation_service import (
+            _execute_evaluation,
+        )
+
+        engine, _pdir, settings = _setup_project_with_pool(
+            tmp_path,
+            n_pool=2,
+            n_nonpool=0,
+        )
+        second_request_started = asyncio.Event()
+        release_second_response = asyncio.Event()
+        call_count = 0
+        payload = '{"rationale_note":"ok","severity":"high","damaged":true}'
+
+        async def _chat(*_args, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                second_request_started.set()
+                await release_second_response.wait()
+            return fake_nim_success(payload)
+
+        patches = _patch_nim_pipeline(_chat)
+        with patches[0], patches[1], patched_register(evaluation_service_module):
+            result = await start_evaluation_run(
+                PID, eval_concurrency=1, settings=settings
+            )
+            assert not isinstance(result, str), result
+            run_id = result["run_id"]
+            executor = asyncio.create_task(
+                _execute_evaluation(PID, run_id, settings, eval_concurrency=1)
+            )
+            try:
+                await asyncio.wait_for(second_request_started.wait(), timeout=2)
+                cancel_result = await cancel_evaluation_run(
+                    PID, run_id, settings=settings
+                )
+                assert not isinstance(cancel_result, str), cancel_result
+                assert cancel_result["status"] == "canceling"
+            finally:
+                release_second_response.set()
+                await executor
+
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "canceled"
+            assert run.examples_succeeded == 1
+            assert run.examples_schema_invalid == 0
+            assert run.examples_timeout == 0
+            assert run.examples_endpoint_error == 0
+            operations = (
+                session.query(OperationRecord)
+                .filter_by(evaluation_run_id=run_id)
+                .order_by(OperationRecord.example_key)
+                .all()
+            )
+            assert [row.ignored_due_to_run_cancellation for row in operations] == [
+                False,
+                True,
+            ]
+
+    @pytest.mark.asyncio
+    async def test_cancel_wins_over_a_crossing_capability_rejection(self, tmp_path):
+        """A post-cancel rejection cannot replace the user's terminal cause."""
+        from vlm_feedback_loop.db.models.operation import OperationRecord
+        from vlm_feedback_loop.services.evaluation_service import (
+            _execute_evaluation,
+        )
+
+        engine, _pdir, settings = _setup_project_with_pool(
+            tmp_path, n_pool=2, n_nonpool=0
+        )
+        request_started = asyncio.Event()
+        release_response = asyncio.Event()
+
+        async def _chat(*_args, **_kwargs):
+            request_started.set()
+            await release_response.wait()
+            return fake_nim_failure(
+                "HTTP 400: response_format json_schema not supported"
+            )
+
+        patches = _patch_nim_pipeline(_chat)
+        with (
+            patches[0],
+            patches[1],
+            patched_register(evaluation_service_module),
+            patch(
+                "vlm_feedback_loop.services.teacher_rejection.sse_manager"
+            ) as mock_finalizer_sse,
+        ):
+            mock_finalizer_sse.emit = AsyncMock()
+            result = await start_evaluation_run(
+                PID, eval_concurrency=1, settings=settings
+            )
+            assert not isinstance(result, str), result
+            run_id = result["run_id"]
+            executor = asyncio.create_task(
+                _execute_evaluation(PID, run_id, settings, eval_concurrency=1)
+            )
+            await asyncio.wait_for(request_started.wait(), timeout=2)
+            canceled = await cancel_evaluation_run(PID, run_id, settings=settings)
+            assert not isinstance(canceled, str), canceled
+            release_response.set()
+            await executor
+
+        with Session(engine) as session:
+            run = session.get(RunRecord, run_id)
+            operations = (
+                session.query(OperationRecord).filter_by(evaluation_run_id=run_id).all()
+            )
+            assert run is not None
+            assert run.status == "canceled"
+            assert run.status_reason is None
+            assert len(operations) == 1
+            assert operations[0].ignored_due_to_run_cancellation is True
+        assert all(
+            call.args[1] != "run_failed"
+            for call in mock_finalizer_sse.emit.call_args_list
+        )
+
+    @pytest.mark.asyncio
     async def test_rest_progress_keeps_frozen_total_after_run(self, tmp_path):
         """REST exposes progress during a run and retains its frozen denominator.
 
@@ -2086,7 +2497,8 @@ class TestProfileBProductionPipeline:
     async def test_timeout_triggers_sequential_retry(self, tmp_path):
         """First-pass NIM call times out → Phase C sequential retry kicks
         in → retry succeeds → run completes. Each pool example yields
-        two OperationRecords (the failed attempt + the retry)."""
+        two OperationRecords (the failed attempt + the retry), and every
+        successful retry links to its exact failed attempt."""
         from vlm_feedback_loop.db.models.operation import OperationRecord
         from vlm_feedback_loop.services.evaluation_service import (
             _execute_evaluation,
@@ -2132,6 +2544,18 @@ class TestProfileBProductionPipeline:
             assert len(records) == 4
             statuses = sorted(r.invocation_status for r in records)
             assert statuses == ["success", "success", "timeout", "timeout"]
+            failed_by_key = {
+                r.example_key: r.inference_invocation_id
+                for r in records
+                if r.invocation_status == "timeout"
+            }
+            successful_retries = [
+                r for r in records if r.invocation_status == "success"
+            ]
+            assert {
+                r.example_key: r.retry_of_inference_invocation_id
+                for r in successful_retries
+            } == failed_by_key
 
     @pytest.mark.asyncio
     async def test_rate_limited_multipass_retry_completes_pool(self, tmp_path):
@@ -2140,6 +2564,7 @@ class TestProfileBProductionPipeline:
         the pool finalizes COMPLETE instead of incomplete. This is the
         rate-limit-aware completion fix: 429 is transient, so don't let it
         truncate the regression pool."""
+        from vlm_feedback_loop.db.models.operation import OperationRecord
         from vlm_feedback_loop.services.evaluation_service import _execute_evaluation
 
         engine, pdir, _ = _setup_project_with_pool(tmp_path, n_pool=1, n_nonpool=0)
@@ -2166,6 +2591,20 @@ class TestProfileBProductionPipeline:
             assert run.status == "completed", (
                 f"status={run.status}, reason={run.status_reason}"
             )
+            records = (
+                s.query(OperationRecord)
+                .filter_by(evaluation_run_id=run_id)
+                .order_by(OperationRecord.inference_invocation_id)
+                .all()
+            )
+            assert len(records) == 3
+            by_id = {r.inference_invocation_id: r for r in records}
+            terminal = next(r for r in records if r.invocation_status == "success")
+            second = by_id[terminal.retry_of_inference_invocation_id]
+            first = by_id[second.retry_of_inference_invocation_id]
+            assert first.invocation_status == "rate_limited"
+            assert second.invocation_status == "rate_limited"
+            assert first.retry_of_inference_invocation_id is None
 
     @pytest.mark.asyncio
     async def test_rate_limited_multipass_bounded_finalizes_incomplete(self, tmp_path):

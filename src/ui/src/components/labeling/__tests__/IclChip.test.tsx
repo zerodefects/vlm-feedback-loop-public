@@ -7,6 +7,21 @@ import { render, screen } from "@testing-library/react";
 import { IclChip } from "../IclChip";
 
 describe("IclChip", () => {
+  it("does not imply context selection when no proposal is active", () => {
+    render(<IclChip count={null} idle />);
+    expect(screen.getByTestId("icl-chip-idle")).toHaveTextContent(
+      "ICL: no active proposal",
+    );
+    expect(screen.queryByTestId("icl-chip-pending")).not.toBeInTheDocument();
+  });
+
+  it("does not claim cold start while the next proposal is selecting context", () => {
+    render(<IclChip count={null} />);
+    expect(screen.getByTestId("icl-chip-pending")).toBeInTheDocument();
+    expect(screen.getByText("ICL: selecting context…")).toBeInTheDocument();
+    expect(screen.queryByText("ICL: no edits yet")).not.toBeInTheDocument();
+  });
+
   it("renders cold-start state when count is 0", () => {
     render(<IclChip count={0} />);
     expect(screen.getByTestId("icl-chip-coldstart")).toBeInTheDocument();

@@ -123,10 +123,28 @@ export function formatEvalLine(criteria: GateCriterion[]): ReadinessLine {
   }
   // "Model accuracy" matches the backend gate message and verdict banner —
   // the UI never exposes the raw metric name.
-  return summariseCriterion(
+  const base = summariseCriterion(
     c,
     `Model accuracy: ${formatPct(c.current_value)} (need ${formatPct(c.threshold)})`,
   );
+  const evaluatedModel =
+    typeof c.details?.evaluated_model_name === "string"
+      ? c.details.evaluated_model_name
+      : null;
+  if (!evaluatedModel) return base;
+
+  const score = `Model accuracy: ${formatPct(c.current_value)} (need ${formatPct(c.threshold)}).`;
+  if (c.details?.current_configuration_differs === true) {
+    return {
+      status: "pending",
+      label: `Evaluation: ${evaluatedModel}`,
+      detail: `${score} Current settings differ; run a new evaluation to measure the selected setup.`,
+    };
+  }
+  return {
+    ...base,
+    label: `Evaluation: ${evaluatedModel}`,
+  };
 }
 
 function formatValue(v: number): string {

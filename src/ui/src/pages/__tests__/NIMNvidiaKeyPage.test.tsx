@@ -145,7 +145,7 @@ function makeCaseAEnv(
 const EMBEDDING_FITS: EnvironmentResponse["embedding_deployment"] = {
   model_name: "nvidia/llama-nemotron-embed-vl-1b-v2",
   nim_container_image: "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0",
-  gpu_memory_minimum_gb: 10,
+  gpu_memory_minimum_gb: 24,
   fits: true,
   provider: "none",
 };
@@ -277,7 +277,8 @@ describe("NIMNvidiaKeyPage", () => {
     const { Wrapper } = createWrapper();
     render(<div />, { wrapper: Wrapper });
 
-    await screen.findByTestId("combined-card-local-and-hosted");
+    const setupCard = await screen.findByTestId("combined-card-local-and-hosted");
+    expect(setupCard).toHaveClass("glass-card", "glass-card--elevated");
     const localCheckbox = screen.getByTestId("local-row-checkbox");
     const hostedCheckbox = screen.getByTestId("hosted-row-checkbox");
     expect(localCheckbox).toBeChecked();
@@ -506,8 +507,12 @@ describe("NIMNvidiaKeyPage", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       /NGC key rejected by nvcr\.io/i,
     );
-    // Backend was called WITHOUT a credential body (effective-key mode).
-    expect(mockTestNgcCredential).toHaveBeenCalledWith();
+    // Backend was called without a credential value (effective-key mode) and
+    // receives the abort signal that bounds this best-effort preflight.
+    expect(mockTestNgcCredential).toHaveBeenCalledWith(
+      undefined,
+      expect.any(AbortSignal),
+    );
   });
 
   it("Case D: persisted-bad NVIDIA blocks auto-skip + renders replacement card", async () => {
@@ -604,7 +609,7 @@ describe("NIMNvidiaKeyPage", () => {
     expect(recommended).toHaveTextContent(/Run Cosmos Reason2 8B locally/i);
     expect(recommended).toHaveTextContent(/Local responses are typically seconds/i);
     expect(recommended).not.toHaveTextContent(/hosted requests/i);
-    expect(recommended).toHaveTextContent(/start with Minimax M3 now/i);
+    expect(recommended).toHaveTextContent(/start with Step 3\.7 Flash now/i);
     expect(recommended).toHaveTextContent(
       /HOSTED FIRST · SWITCHES TO LOCAL AFTER VERIFICATION/i,
     );
@@ -612,7 +617,7 @@ describe("NIMNvidiaKeyPage", () => {
 
     const hostedOnly = screen.getByTestId("hosted-only-card");
     expect(hostedOnly).toHaveTextContent(/ALTERNATIVE · HOSTED ONLY/);
-    expect(hostedOnly).toHaveTextContent(/Keep Minimax M3 hosted/i);
+    expect(hostedOnly).toHaveTextContent(/Keep Step 3\.7 Flash hosted/i);
     expect(hostedOnly).toHaveTextContent(/Use hosted only/i);
 
     // No navigation has fired — the SME must choose.
@@ -694,7 +699,7 @@ describe("NIMNvidiaKeyPage", () => {
 
     const hostedOnly = screen.getByTestId("hosted-only-card");
     expect(hostedOnly).toHaveTextContent(/ALTERNATIVE · HOSTED ONLY/);
-    expect(hostedOnly).toHaveTextContent(/Keep Minimax M3 hosted/i);
+    expect(hostedOnly).toHaveTextContent(/Keep Step 3\.7 Flash hosted/i);
   });
 
   it("Case B (single-GPU + key): local recommendation starts hosted and queues the local model", async () => {
@@ -813,7 +818,7 @@ describe("NIMNvidiaKeyPage", () => {
 
     const row = await screen.findByTestId("hosted-row-label");
     expect(row).toHaveTextContent(/A free NVIDIA API key/i);
-    expect(row).toHaveTextContent(/more Teacher models/i);
+    expect(row).toHaveTextContent(/hosted Teacher models/i);
     expect(row).toHaveTextContent(/hosted image embeddings/i);
     expect(row).toHaveTextContent(/improving review variety/i);
     expect(row).toHaveTextContent(/without using your GPU/i);
@@ -847,11 +852,14 @@ describe("NIMNvidiaKeyPage", () => {
     expect(screen.queryByTestId("hosted-only-card")).toBeNull();
   });
 
-  // ── Case D: key + no GPU — auto-skip preserved ───────────────────────────
+  // ── Case D: key + no GPU ─────────────────────────────────────────────────
 
-  it("Case D: auto-skips to setup/ngc when key already configured AND no GPU", async () => {
+  it("Case D: auto-skips after validating the configured hosted key", async () => {
     mockFetchEnvironment.mockResolvedValue(
-      makeEnv({ nvidia_api_key_configured: true }),
+      makeEnv({
+        nvidia_api_key_configured: true,
+        default_teacher_model_name: "stepfun-ai/step-3.7-flash",
+      }),
     );
     const { Wrapper } = createWrapper();
     render(<div />, { wrapper: Wrapper });
@@ -859,6 +867,23 @@ describe("NIMNvidiaKeyPage", () => {
     const ngc = await screen.findByTestId("ngc-page");
     expect(ngc.getAttribute("data-came-from-auto-skip")).toBe("true");
     expect(ngc.getAttribute("data-active-path")).toBe("hosted");
+  });
+
+  it("Case D: shows progress instead of a blank page while the saved-key probe is pending", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      makeEnv({
+        nvidia_api_key_configured: true,
+        default_teacher_model_name: "stepfun-ai/step-3.7-flash",
+      }),
+    );
+    mockTestNvidiaCredential.mockReturnValue(new Promise(() => {}));
+    const { Wrapper } = createWrapper();
+    render(<div />, { wrapper: Wrapper });
+
+    expect(await screen.findByTestId("nvidia-key-probe-transition")).toHaveTextContent(
+      /Checking your saved NVIDIA API key/i,
+    );
+    expect(screen.getByRole("status")).toBeInTheDocument();
   });
 
   // ── Hosted-key entry on Case A peer card and Case C primary ─────────────

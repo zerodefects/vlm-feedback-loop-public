@@ -9,6 +9,7 @@
  *   - GET  /v1/projects/{id}/student_models                  (list)
  *   - POST /v1/projects/{id}/student_models/{id}:deploy_nim
  *   - POST /v1/projects/{id}/student_models/{id}:deployment_handoff
+ *   - GET  /v1/projects/{id}/student_models/{id}/deployment_bundle
  *          (gated dual + Inference Contract; returns 409 if any
  *           gate fails)
  *
@@ -94,4 +95,13 @@ export function requestDeploymentHandoff(
     `/projects/${projectId}/student_models/${studentModelId}:deployment_handoff`,
     { method: "POST", body: JSON.stringify({}) },
   );
+}
+
+/**
+ * Same-origin URL for the streamed, gated Student NIM deployment bundle.
+ * A browser navigation is intentional: loading a multi-gigabyte deployment
+ * bundle through ``apiFetch`` would buffer it in JavaScript memory.
+ */
+export function deploymentBundleUrl(projectId: string, studentModelId: string): string {
+  return `/v1/projects/${encodeURIComponent(projectId)}/student_models/${encodeURIComponent(studentModelId)}/deployment_bundle`;
 }

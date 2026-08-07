@@ -28,7 +28,14 @@ from typing import Any, cast, get_args, get_origin
 
 import yaml
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PositiveInt,
+    ValidationError,
+    field_validator,
+)
 
 from vlm_feedback_loop._defaults import DEFAULTS
 
@@ -71,7 +78,7 @@ class Settings(BaseModel):
     # ── Embedding computation ────────────────────────────────────────
     EMBEDDING_PROVIDER: str = DEFAULTS["EMBEDDING_PROVIDER"]
     EMBEDDING_MODEL_ID: str = DEFAULTS["EMBEDDING_MODEL_ID"]
-    EMBEDDING_DIM: int = DEFAULTS["EMBEDDING_DIM"]
+    EMBEDDING_DIM: PositiveInt = DEFAULTS["EMBEDDING_DIM"]
     # NeMo Retriever asymmetric embedding models require an `input_type`
     # parameter (`"query"` vs `"passage"`).  NV-CLIP and other symmetric
     # CLIP-style models do not — set to None for those.  Default
@@ -82,12 +89,14 @@ class Settings(BaseModel):
     # embedding worker.  Hosted (build.nvidia.com) is shared/rate-limited
     # — keep concurrency at 1 and batch larger requests.  Self-hosted
     # local NIMs run small concurrent requests instead.
-    EMBEDDING_CONCURRENCY_HOSTED: int = DEFAULTS["EMBEDDING_CONCURRENCY_HOSTED"]
-    EMBEDDING_BATCH_SIZE_HOSTED: int = DEFAULTS["EMBEDDING_BATCH_SIZE_HOSTED"]
-    EMBEDDING_CONCURRENCY_SELF_HOSTED: int = DEFAULTS[
+    EMBEDDING_CONCURRENCY_HOSTED: PositiveInt = DEFAULTS["EMBEDDING_CONCURRENCY_HOSTED"]
+    EMBEDDING_BATCH_SIZE_HOSTED: PositiveInt = DEFAULTS["EMBEDDING_BATCH_SIZE_HOSTED"]
+    EMBEDDING_CONCURRENCY_SELF_HOSTED: PositiveInt = DEFAULTS[
         "EMBEDDING_CONCURRENCY_SELF_HOSTED"
     ]
-    EMBEDDING_BATCH_SIZE_SELF_HOSTED: int = DEFAULTS["EMBEDDING_BATCH_SIZE_SELF_HOSTED"]
+    EMBEDDING_BATCH_SIZE_SELF_HOSTED: PositiveInt = DEFAULTS[
+        "EMBEDDING_BATCH_SIZE_SELF_HOSTED"
+    ]
 
     # ── Generation Controls ──────────────────────────────────────────
     # (The default labeling/visual-budget preset KEYS are
@@ -95,6 +104,26 @@ class Settings(BaseModel):
     # API — not process config. The preset VALUE tables below stay here.)
     THINKING_DEFAULT_ON: bool = DEFAULTS["THINKING_DEFAULT_ON"]
     LABELING_PRESETS: dict[str, dict[str, float]] = DEFAULTS["LABELING_PRESETS"]
+
+    @field_validator("LABELING_PRESETS", mode="after")
+    @classmethod
+    def _validate_labeling_presets(
+        cls, presets: dict[str, dict[str, float]]
+    ) -> dict[str, dict[str, float]]:
+        """Each generation preset is exactly one valid sampling pair."""
+        if not presets:
+            raise ValueError("LABELING_PRESETS must define at least one preset")
+        for name, params in presets.items():
+            if not name or set(params) != {"temperature", "top_p"}:
+                raise ValueError(
+                    "each LABELING_PRESETS entry must define exactly "
+                    "temperature and top_p"
+                )
+            if params["temperature"] < 0:
+                raise ValueError("LABELING_PRESETS temperature must be >= 0")
+            if not 0 < params["top_p"] <= 1:
+                raise ValueError("LABELING_PRESETS top_p must be > 0 and <= 1")
+        return presets
 
     # ── Visual Budget Controls ───────────────────────────────────────
     VISUAL_BUDGET_PRESETS: dict[str, Any] = DEFAULTS["VISUAL_BUDGET_PRESETS"]
@@ -130,31 +159,45 @@ class Settings(BaseModel):
         return v
 
     # ── Prompt budgets ───────────────────────────────────────────────
-    RUNTIME_PROMPT_OUTPUT_MAX_TOKENS_OVERRIDE: int | None = DEFAULTS[
+    RUNTIME_PROMPT_OUTPUT_MAX_TOKENS_OVERRIDE: PositiveInt | None = DEFAULTS[
         "RUNTIME_PROMPT_OUTPUT_MAX_TOKENS_OVERRIDE"
     ]
-    RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN: float = DEFAULTS[
-        "RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN"
+    RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN: float = Field(
+        default=DEFAULTS["RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN"], gt=0.0, le=1.0
+    )
+    BASE_OUTPUT_TOKENS_FLOOR: PositiveInt = DEFAULTS["BASE_OUTPUT_TOKENS_FLOOR"]
+    JSON_STRUCTURAL_OVERHEAD_TOKENS: int = Field(
+        default=DEFAULTS["JSON_STRUCTURAL_OVERHEAD_TOKENS"], ge=0
+    )
+    MAX_OUTPUT_FRACTION: float = Field(
+        default=DEFAULTS["MAX_OUTPUT_FRACTION"], gt=0.0, le=1.0
+    )
+    RATIONALE_NOTE_ESTIMATE_TOKENS: PositiveInt = DEFAULTS[
+        "RATIONALE_NOTE_ESTIMATE_TOKENS"
     ]
-    BASE_OUTPUT_TOKENS_FLOOR: int = DEFAULTS["BASE_OUTPUT_TOKENS_FLOOR"]
-    JSON_STRUCTURAL_OVERHEAD_TOKENS: int = DEFAULTS["JSON_STRUCTURAL_OVERHEAD_TOKENS"]
-    MAX_OUTPUT_FRACTION: float = DEFAULTS["MAX_OUTPUT_FRACTION"]
-    RATIONALE_NOTE_ESTIMATE_TOKENS: int = DEFAULTS["RATIONALE_NOTE_ESTIMATE_TOKENS"]
-    DEFAULT_UNBOUNDED_STRING_BUDGET: int = DEFAULTS["DEFAULT_UNBOUNDED_STRING_BUDGET"]
-    MODEL_REASONING_HEADROOM_TOKENS: int = DEFAULTS["MODEL_REASONING_HEADROOM_TOKENS"]
+    DEFAULT_UNBOUNDED_STRING_BUDGET: PositiveInt = DEFAULTS[
+        "DEFAULT_UNBOUNDED_STRING_BUDGET"
+    ]
+    MODEL_REASONING_HEADROOM_TOKENS: int = Field(
+        default=DEFAULTS["MODEL_REASONING_HEADROOM_TOKENS"], ge=4096
+    )
 
     # ── ICL selection ────────────────────────────────────────────────
-    ICL_MAX_EXAMPLES: int | None = DEFAULTS["ICL_MAX_EXAMPLES"]
-    ICL_SIM_GAP: float | None = DEFAULTS["ICL_SIM_GAP"]
-    ICL_ABS_THRESHOLD: float | None = DEFAULTS["ICL_ABS_THRESHOLD"]
+    ICL_MAX_EXAMPLES: PositiveInt | None = DEFAULTS["ICL_MAX_EXAMPLES"]
+    ICL_SIM_GAP: float | None = Field(default=DEFAULTS["ICL_SIM_GAP"], ge=0.0)
+    ICL_ABS_THRESHOLD: float | None = Field(
+        default=DEFAULTS["ICL_ABS_THRESHOLD"], ge=-1.0, le=1.0
+    )
 
     # ── Batch labeling ───────────────────────────────────────────────
-    BATCH_LABEL_RUN_LIMIT: int | None = DEFAULTS["BATCH_LABEL_RUN_LIMIT"]
-    BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD: int = DEFAULTS[
+    BATCH_LABEL_RUN_LIMIT: PositiveInt | None = DEFAULTS["BATCH_LABEL_RUN_LIMIT"]
+    BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD: PositiveInt = DEFAULTS[
         "BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD"
     ]
-    BATCH_LABEL_CONCURRENCY_HOSTED: int = DEFAULTS["BATCH_LABEL_CONCURRENCY_HOSTED"]
-    BATCH_LABEL_CONCURRENCY_SELF_HOSTED: int = DEFAULTS[
+    BATCH_LABEL_CONCURRENCY_HOSTED: PositiveInt = DEFAULTS[
+        "BATCH_LABEL_CONCURRENCY_HOSTED"
+    ]
+    BATCH_LABEL_CONCURRENCY_SELF_HOSTED: PositiveInt = DEFAULTS[
         "BATCH_LABEL_CONCURRENCY_SELF_HOSTED"
     ]
 
@@ -185,11 +228,12 @@ class Settings(BaseModel):
     MERGE_LORA_PYTHON: str | None = DEFAULTS["MERGE_LORA_PYTHON"]
 
     # ── NIM serving benchmark ────────────────────────────────────────
-    NIM_STARTUP_TIMEOUT_S: int = DEFAULTS["NIM_STARTUP_TIMEOUT_S"]
-    NIM_BENCHMARK_TIMEOUT_S: int = DEFAULTS["NIM_BENCHMARK_TIMEOUT_S"]
-    STUDENT_LATENCY_TEST_CONCURRENCIES: list[int] = DEFAULTS[
-        "STUDENT_LATENCY_TEST_CONCURRENCIES"
-    ]
+    NIM_STARTUP_TIMEOUT_S: PositiveInt = DEFAULTS["NIM_STARTUP_TIMEOUT_S"]
+    NIM_BENCHMARK_TIMEOUT_S: PositiveInt = DEFAULTS["NIM_BENCHMARK_TIMEOUT_S"]
+    STUDENT_LATENCY_TEST_CONCURRENCIES: list[PositiveInt] = Field(
+        default_factory=lambda: list(DEFAULTS["STUDENT_LATENCY_TEST_CONCURRENCIES"]),
+        min_length=1,
+    )
 
     # ── Student NIM deployment ───────────────────────────────────────
     NIM_GPU_MEMORY_8B_BF16_GB: int = DEFAULTS["NIM_GPU_MEMORY_8B_BF16_GB"]
@@ -221,8 +265,8 @@ class Settings(BaseModel):
     ENABLE_VISUAL_BUDGET_FALLBACK: bool = DEFAULTS["ENABLE_VISUAL_BUDGET_FALLBACK"]
 
     # ── Evaluation ───────────────────────────────────────────────────
-    EVAL_CONCURRENCY_HOSTED: int = DEFAULTS["EVAL_CONCURRENCY_HOSTED"]
-    EVAL_CONCURRENCY_SELF_HOSTED: int = DEFAULTS["EVAL_CONCURRENCY_SELF_HOSTED"]
+    EVAL_CONCURRENCY_HOSTED: PositiveInt = DEFAULTS["EVAL_CONCURRENCY_HOSTED"]
+    EVAL_CONCURRENCY_SELF_HOSTED: PositiveInt = DEFAULTS["EVAL_CONCURRENCY_SELF_HOSTED"]
     FOREGROUND_HOLD_ENABLED: bool = DEFAULTS["FOREGROUND_HOLD_ENABLED"]
     EVAL_RATE_LIMIT_RETRY_MAX_PASSES: int = DEFAULTS["EVAL_RATE_LIMIT_RETRY_MAX_PASSES"]
     EVAL_RATE_LIMIT_RETRY_BACKOFF_S: float = DEFAULTS["EVAL_RATE_LIMIT_RETRY_BACKOFF_S"]
@@ -230,9 +274,9 @@ class Settings(BaseModel):
     EVAL_FIRST_POOL_SIZE: int = DEFAULTS["EVAL_FIRST_POOL_SIZE"]
 
     # ── HTTP client ──────────────────────────────────────────────────
-    HTTP_DEADLINE_INTERACTIVE_S: int = DEFAULTS["HTTP_DEADLINE_INTERACTIVE_S"]
-    HTTP_DEADLINE_BACKGROUND_S: int = DEFAULTS["HTTP_DEADLINE_BACKGROUND_S"]
-    HTTP_MAX_RETRIES: int = DEFAULTS["HTTP_MAX_RETRIES"]
+    HTTP_DEADLINE_INTERACTIVE_S: PositiveInt = DEFAULTS["HTTP_DEADLINE_INTERACTIVE_S"]
+    HTTP_DEADLINE_BACKGROUND_S: PositiveInt = DEFAULTS["HTTP_DEADLINE_BACKGROUND_S"]
+    HTTP_MAX_RETRIES: PositiveInt = DEFAULTS["HTTP_MAX_RETRIES"]
 
     TAO_POLL_MIN_INTERVAL_S: int = DEFAULTS["TAO_POLL_MIN_INTERVAL_S"]
     TAO_POLL_MIN_INTERVAL_RUNNING_S: int = DEFAULTS["TAO_POLL_MIN_INTERVAL_RUNNING_S"]
@@ -600,7 +644,11 @@ def init_settings(cli_env_file: str | None = None) -> Settings:
 
 
 def reset_settings() -> None:
-    """Clear cached settings. For testing only."""
+    """Clear cached settings so the next read reloads configuration.
+
+    CLI commands call this after writing configuration; tests also use it to
+    isolate process-wide settings state.
+    """
     global _override_settings
     _override_settings = None
     _cached_default_settings.cache_clear()

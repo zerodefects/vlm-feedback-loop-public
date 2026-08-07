@@ -18,6 +18,7 @@ from conftest import (
     add_guidance_row,
     add_model_config_row,
     add_project_row,
+    make_settings,
     open_project_workspace,
 )
 from vlm_feedback_loop.db.base import generate_uuid4, utc_now
@@ -94,6 +95,7 @@ def _setup(tmp_path):
 class TestInternalHelper:
     def test_helper_without_commit_stages_rollback_safe(self, tmp_path):
         engine, workspace = _setup(tmp_path)
+        settings = make_settings(workspace)
 
         # The helper stages the row but does NOT commit. A rollback must
         # leave zero DatasetExport rows.
@@ -104,7 +106,7 @@ class TestInternalHelper:
                 dataset_intent="training",
                 label_tier_filter="verified_only",
                 export_field_mode="all",
-                workspace_root=str(workspace),
+                settings=settings,
             )
             assert not isinstance(result, str), result
             s.rollback()
@@ -114,6 +116,7 @@ class TestInternalHelper:
 
     def test_helper_returns_error_on_missing_project(self, tmp_path):
         engine, workspace = _setup(tmp_path)
+        settings = make_settings(workspace)
         # Delete the project to force the error branch.
         with Session(engine) as s:
             s.query(Project).filter_by(project_id=PID).delete()
@@ -126,7 +129,7 @@ class TestInternalHelper:
                 dataset_intent="training",
                 label_tier_filter="verified_only",
                 export_field_mode="all",
-                workspace_root=str(workspace),
+                settings=settings,
             )
         assert isinstance(result, str)
         assert "not found" in result.lower()

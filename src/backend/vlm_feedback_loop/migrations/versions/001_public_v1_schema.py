@@ -548,7 +548,7 @@ def upgrade() -> None:
         sa.Column(
             "scaleup_min_per_value_f1_threshold",
             sa.FLOAT(),
-            server_default=sa.text("'0.8'"),
+            server_default=sa.text("'0.6'"),
             nullable=False,
         ),
         sa.Column(
@@ -659,6 +659,7 @@ def upgrade() -> None:
         "student_models",
         sa.Column("student_model_id", sa.VARCHAR(length=36), nullable=False),
         sa.Column("project_id", sa.VARCHAR(length=36), nullable=False),
+        sa.Column("training_suite_id", sa.VARCHAR(length=36), nullable=True),
         sa.Column(
             "student_base_model_config_id", sa.VARCHAR(length=36), nullable=False
         ),

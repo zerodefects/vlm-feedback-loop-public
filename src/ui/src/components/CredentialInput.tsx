@@ -125,9 +125,9 @@ export function CredentialInput({
             {copy.label}
           </Text>
           {isRequired && (
-            <span aria-hidden="true" className="text-error">
+            <Text kind="label/bold/sm" aria-hidden="true" className="text-error">
               *
-            </span>
+            </Text>
           )}
         </label>
         <KeyPasteInput

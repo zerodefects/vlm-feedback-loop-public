@@ -242,7 +242,9 @@ def build_output(packages: list[Package]) -> str:
         if representative:
             lines.append(f"Full license text (as shipped with {representative.name}):")
             lines.append("")
-            lines.append(representative.license_text)
+            lines.extend(
+                line.rstrip() for line in representative.license_text.splitlines()
+            )
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 

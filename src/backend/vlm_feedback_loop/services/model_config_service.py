@@ -120,7 +120,7 @@ def generate_probe_image_data_url() -> str:
 # ── Active-use check ────────────────────────────────────────────────────────
 
 
-def _is_model_in_active_use(
+def is_model_in_active_use(
     session: Session, project_id: str, model_config_id: str
 ) -> bool:
     """Check if the model is referenced by any active run or TAO job."""
@@ -152,6 +152,9 @@ def _is_model_in_active_use(
 
 # ── Capability probes ───────────────────────────────────────────────────────
 
+_STRUCTURED_PROBE_MAX_TOKENS = 16
+_STRUCTURED_PROBE_REASONING_MAX_TOKENS = 4096
+
 
 async def probe_structured_generation(
     base_url: str,
@@ -169,6 +172,11 @@ async def probe_structured_generation(
     )["thinking_request_fields"]
     thinking_off_kwargs: dict[str, Any] = (
         {} if fields is None else {"chat_template_kwargs": fields}
+    )
+    max_tokens = (
+        _STRUCTURED_PROBE_REASONING_MAX_TOKENS
+        if thinking_toggle_mode == "always_on_reasoning"
+        else _STRUCTURED_PROBE_MAX_TOKENS
     )
 
     result = await nim_client.chat_completions(
@@ -196,7 +204,7 @@ async def probe_structured_generation(
                 },
             },
         },
-        max_tokens=16,
+        max_tokens=max_tokens,
         **thinking_off_kwargs,
     )
 
@@ -211,8 +219,16 @@ async def probe_structured_generation(
                 return "supported"
         except (json.JSONDecodeError, TypeError):
             pass
+        # A truncated reasoning trace proves neither acceptance nor rejection
+        # of response_format. Preserve unknown so a long always-on trace cannot
+        # falsely demote a supported capability.
+        if result.finish_reason == "length":
+            return "unknown"
         # Response received but didn't validate
         return "unsupported"
+
+    if result.success and result.finish_reason == "length":
+        return "unknown"
 
     if result.status_code is not None and 400 <= result.status_code < 500:
         return "unsupported"
@@ -528,6 +544,21 @@ def create_model_config(
 _HARD_UNHEALTHY_STATUSES = frozenset({"unhealthy", "auth_failed", "unreachable"})
 
 
+def endpoint_is_operational(endpoint: NimEndpoint) -> bool:
+    """Whether persisted endpoint state permits a new model invocation.
+
+    ``is_enabled`` is the lifecycle authority for system-managed endpoints:
+    stopping a shared Teacher disables every consumer attachment even if a
+    different process later happens to reuse the same TCP port.  The hard
+    probe statuses cover explicitly enabled hosted/self-hosted endpoints whose
+    most recent connectivity check failed.
+    """
+
+    return bool(endpoint.is_enabled) and (
+        endpoint.last_probe_status not in _HARD_UNHEALTHY_STATUSES
+    )
+
+
 def compute_availability(
     mc: ModelConfig,
     endpoint: NimEndpoint | None,
@@ -545,11 +576,11 @@ def compute_availability(
 
     * No bound endpoint → ``endpoint_missing`` (defensive; shouldn't happen
       in normal seeded flow but handles orphaned references gracefully).
-    * Endpoint in a hard-unhealthy state → ``endpoint_unhealthy`` regardless
-      of mode. The ``"unknown"`` status (default for never-probed endpoints)
-      is treated as benign — local NIM deployments report unknown before
-      their first health probe, and we don't want a probe lag to hide
-      otherwise-working endpoints.
+    * Disabled endpoint or endpoint in a hard-unhealthy state →
+      ``endpoint_unhealthy`` regardless of mode. The ``"unknown"`` status
+      (default for never-probed endpoints) is treated as benign — local NIM
+      deployments report unknown before their first health probe, and we don't
+      want a probe lag to hide otherwise-working endpoints.
     * Hosted endpoint:
         - No NVIDIA_API_KEY → ``no_nvidia_api_key``
         - Model not hosted-compatible (NVCF-gated like Cosmos) →
@@ -562,7 +593,7 @@ def compute_availability(
     if endpoint is None:
         return {"available": False, "reason": "endpoint_missing"}
 
-    if endpoint.last_probe_status in _HARD_UNHEALTHY_STATUSES:
+    if not endpoint_is_operational(endpoint):
         return {"available": False, "reason": "endpoint_unhealthy"}
 
     mode = endpoint.endpoint_mode
@@ -794,7 +825,7 @@ async def reprobe_model_config(
         if mc is None:
             return None
 
-        if _is_model_in_active_use(session, project_id, model_config_id):
+        if is_model_in_active_use(session, project_id, model_config_id):
             return "active_use"
 
         # Reset all three to unknown before re-probing

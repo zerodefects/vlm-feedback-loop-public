@@ -112,13 +112,31 @@ export function localTeacherDisplayName(modelName: string | null | undefined): s
 }
 
 /**
- * Extract a short compact label (e.g. `8B`, `2B`) from a model identifier.
- * Used for tight-space chain progress lines like `8B: done  2B: 5 of 6`.
+ * Human-readable precision/quantization label for product surfaces.
+ *
+ * Persistence and API payloads retain the canonical Cosmos-RL enum
+ * (``FP8_DYNAMIC``); UI copy uses normal words while keeping compact
+ * industry-standard names such as W4A16 unchanged.
+ */
+export function quantizationDisplayName(
+  quantization: string | null | undefined,
+): string {
+  if (!quantization) return "BF16 (baseline)";
+  if (quantization === "FP8_DYNAMIC") return "FP8 Dynamic";
+  return quantization;
+}
+
+/**
+ * Extract a short compact label (e.g. `8B`, `2B`, `Nano`, `Super`) from a
+ * model identifier. Used for tight-space chain progress lines like
+ * `8B: done  2B: 5 of 6`.
  *
  * Falls back to the full model name when no size suffix is present.
  */
 export function shortBaseLabel(modelName: string | null | undefined): string {
   if (!modelName) return "—";
+  if (modelName.includes("cosmos3-nano-reasoner")) return "Nano";
+  if (modelName.includes("cosmos3-super-reasoner")) return "Super";
   const match = modelName.match(/(\d+\s*b)$/i);
   if (match) return match[1].replace(/\s+/g, "").toUpperCase();
   return modelName;

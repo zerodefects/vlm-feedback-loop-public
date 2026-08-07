@@ -11,10 +11,10 @@
  *   - Project Lock Error dialog
  */
 
-import { useState } from "react";
+import { useRef, useState, type RefObject } from "react";
 import { useNavigate } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
-import { Button, Card, CardContent, Dropdown, Spinner, Text } from "@kui/react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Badge, Button, Card, CardContent, Dropdown, Spinner, Text } from "@kui/react";
 import { MoreVertical } from "lucide-react";
 
 import { ApiError } from "@/api/client";
@@ -26,18 +26,6 @@ import { HeaderRightPortal } from "@/components/HeaderRightPortal";
 import { ProjectArchiveDialog } from "@/components/ProjectArchiveDialog";
 import { ProjectLockDialog } from "@/components/ProjectLockDialog";
 import type { ProjectListItem } from "@/types/project";
-
-// ---------------------------------------------------------------------------
-// localStorage helper for "last active screen"
-// ---------------------------------------------------------------------------
-
-function saveLastActiveProject(projectId: string): void {
-  try {
-    localStorage.setItem(`lastActiveScreen:${projectId}`, `/projects/${projectId}`);
-  } catch {
-    // localStorage unavailable — ignore silently
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Sub-components
@@ -143,49 +131,56 @@ function LoopDiagram() {
       </svg>
 
       {/* Cycle stage labels — uppercase tracked via .glass-caption. */}
-      <span
+      <Text
+        kind="label/semibold/xs"
         className="glass-caption"
         style={{ position: "absolute", top: "44px", left: "6px" }}
       >
         Propose
-      </span>
-      <span
+      </Text>
+      <Text
+        kind="label/semibold/xs"
         className="glass-caption"
         style={{ position: "absolute", top: "44px", left: "86px" }}
       >
         Review
-      </span>
-      <span
+      </Text>
+      <Text
+        kind="label/semibold/xs"
         className="glass-caption"
         style={{ position: "absolute", top: "44px", left: "162px" }}
       >
         Refine
-      </span>
+      </Text>
 
       {/* Exit labels -- same .glass-caption typography so the whole
           diagram reads as one typographic register. */}
-      <span
+      <Text
+        kind="label/semibold/xs"
         className="glass-caption"
         style={{ position: "absolute", top: "44px", left: "236px" }}
       >
         Optimize
-      </span>
-      <span
+      </Text>
+      <Text
+        kind="label/semibold/xs"
         className="glass-caption"
         style={{ position: "absolute", top: "44px", left: "324px" }}
       >
         Deploy
-      </span>
+      </Text>
     </div>
   );
 }
 
 function EmptyState({
   onCreateClick,
+  createButtonRef,
   hasArchived,
   onShowArchived,
 }: {
   onCreateClick: () => void;
+  createButtonRef: RefObject<HTMLButtonElement | null>;
   hasArchived: boolean;
   onShowArchived: () => void;
 }) {
@@ -203,9 +198,9 @@ function EmptyState({
           maxWidth: "600px",
         }}
       >
-        <span className="glass-caption">
+        <Text kind="label/semibold/xs" className="glass-caption">
           NVIDIA Blueprint &middot; Interactive VLM Loop
-        </span>
+        </Text>
 
         <Text
           kind="title/lg"
@@ -235,6 +230,7 @@ function EmptyState({
         <LoopDiagram />
 
         <Button
+          ref={createButtonRef}
           kind="primary"
           className="nvidia-green-button"
           onClick={onCreateClick}
@@ -263,7 +259,27 @@ function EmptyState({
 
 /** Numeric count one step above the surrounding secondary-text label. */
 function CountValue({ value }: { value: number }) {
-  return <span style={{ color: "var(--text-primary)", fontWeight: 600 }}>{value}</span>;
+  return (
+    <Text kind="body/semibold/sm" style={{ color: "var(--text-primary)" }}>
+      {value}
+    </Text>
+  );
+}
+
+/** Keep a metric's label and value together while allowing the row to wrap
+ * between metrics. In particular, Chromium may otherwise break at the
+ * hyphen in "Auto-Labeled" and strand half the label on either line. */
+function CountMetric({ label, value }: { label: string; value: number }) {
+  return (
+    <Text
+      kind="body/regular/sm"
+      className="project-count-metric inline-block whitespace-nowrap"
+      style={{ color: "inherit" }}
+    >
+      {label}:{"\u00a0"}
+      <CountValue value={value} />
+    </Text>
+  );
 }
 
 function ProjectCard({
@@ -341,17 +357,9 @@ function ProjectCard({
                 {project.name}
               </Text>
               {isArchived && (
-                <span
-                  className="glass-pill"
-                  style={{
-                    fontSize: "11px",
-                    padding: "2px 8px",
-                    color: "var(--text-muted)",
-                  }}
-                  data-testid="archived-badge"
-                >
+                <Badge color="gray" kind="outline" data-testid="archived-badge">
                   Archived
-                </span>
+                </Badge>
               )}
             </div>
             {/* Kebab Dropdown trigger click bubbles to the card's
@@ -390,20 +398,13 @@ function ProjectCard({
           )}
 
           <Text kind="body/regular/sm" style={{ color: "var(--text-secondary)" }}>
-            Verified: <CountValue value={counts.verified} /> &middot; Unlabeled:{" "}
-            <CountValue value={counts.unlabeled} />
-            {counts.auto_labeled > 0 && (
-              <>
-                {" "}
-                &middot; Auto-Labeled: <CountValue value={counts.auto_labeled} />
-              </>
-            )}
+            <CountMetric label="Verified" value={counts.verified} /> &middot;{" "}
+            <CountMetric label="Unlabeled" value={counts.unlabeled} />
           </Text>
-          {counts.omitted > 0 && (
-            <Text kind="body/regular/sm" style={{ color: "var(--text-secondary)" }}>
-              Omitted: <CountValue value={counts.omitted} />
-            </Text>
-          )}
+          <Text kind="body/regular/sm" style={{ color: "var(--text-secondary)" }}>
+            <CountMetric label="Auto-Labeled" value={counts.auto_labeled} /> &middot;{" "}
+            <CountMetric label="Omitted" value={counts.omitted} />
+          </Text>
 
           <Text kind="label/regular/xs" style={{ color: "var(--text-muted)" }}>
             Created {formatDate(project.created_at)} &middot; Updated{" "}
@@ -421,6 +422,8 @@ function ProjectCard({
 
 export function ProjectListPage() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const createButtonRef = useRef<HTMLButtonElement>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [lockDialogOpen, setLockDialogOpen] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
@@ -449,13 +452,23 @@ export function ProjectListPage() {
     window.setTimeout(() => setToast(null), 4000);
   }
 
+  function handleCreateDialogOpenChange(isOpen: boolean) {
+    setDialogOpen(isOpen);
+    if (!isOpen) {
+      window.requestAnimationFrame(() => createButtonRef.current?.focus());
+    }
+  }
+
   async function handleCardClick(project: ProjectListItem) {
     // Single-process lock: probe the project before navigating. The
     // backend returns 409 (global handler in main.py) when another process
     // holds the lock; render the project-lock dialog instead of navigating
     // into a doomed detail route.
     try {
-      await fetchProject(project.project_id);
+      await queryClient.fetchQuery({
+        queryKey: projectKeys.detail(project.project_id),
+        queryFn: () => fetchProject(project.project_id),
+      });
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
         setLockDialogOpen(true);
@@ -463,7 +476,6 @@ export function ProjectListPage() {
       }
       throw err;
     }
-    saveLastActiveProject(project.project_id);
     navigate(`/projects/${project.project_id}`);
   }
 
@@ -503,10 +515,14 @@ export function ProjectListPage() {
       <>
         <EmptyState
           onCreateClick={() => setDialogOpen(true)}
+          createButtonRef={createButtonRef}
           hasArchived={hasArchived}
           onShowArchived={() => setShowArchived(true)}
         />
-        <CreateProjectDialog open={dialogOpen} onOpenChange={setDialogOpen} />
+        <CreateProjectDialog
+          open={dialogOpen}
+          onOpenChange={handleCreateDialogOpenChange}
+        />
       </>
     );
   }
@@ -519,6 +535,7 @@ export function ProjectListPage() {
           rendering when AppShell isn't mounted (unit tests). */}
       <HeaderRightPortal>
         <Button
+          ref={createButtonRef}
           kind="primary"
           className="nvidia-green-button"
           onClick={() => setDialogOpen(true)}
@@ -578,7 +595,10 @@ export function ProjectListPage() {
         </div>
       </div>
 
-      <CreateProjectDialog open={dialogOpen} onOpenChange={setDialogOpen} />
+      <CreateProjectDialog
+        open={dialogOpen}
+        onOpenChange={handleCreateDialogOpenChange}
+      />
       <ProjectLockDialog
         open={lockDialogOpen}
         onClose={() => setLockDialogOpen(false)}

@@ -89,11 +89,6 @@ class ForegroundPriorityDispatch:
         """
         await self._bg_gate.wait()
 
-    @property
-    def foreground_active(self) -> bool:
-        """Test-observability accessor — no production reader."""
-        return self._foreground_count > 0
-
 
 # Module-level singleton
 priority_dispatch = ForegroundPriorityDispatch()

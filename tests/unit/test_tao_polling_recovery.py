@@ -98,6 +98,7 @@ def _setup(tmp_path: Path):
             name="R",
             active_guidance_id=GID,
             teacher_model_config_id=MC,
+            scaleup_min_test_pool_size=1,
         )
         add_guidance_row(
             s,
@@ -126,8 +127,8 @@ def _setup(tmp_path: Path):
             tao_base_experiment_id="be-recovery-uuid",
             tao_base_experiment_pull_status="pull_complete",
         )
-        # Seed a single verified non-pool label + one pool label so both
-        # exports find content.
+        # Seed one Verified training label plus the fixture's configured
+        # one-example Test Pool minimum so both exports satisfy launch.
         images_dir = tmp_path / "imgs"
         images_dir.mkdir(exist_ok=True)
         for key, pool in [("v1", None), ("p1", "test_pool")]:
@@ -189,12 +190,13 @@ def _autostub_upload_archive(monkeypatch):
         session,
         *,
         dataset_export,
-        archive_path,
         deployment_config,
         s3_client,
-        annotations_path,
         **_kw,
     ):
+        refs = dataset_export.artifact_refs or {}
+        archive_path = Path(refs["archive_path"])
+        annotations_path = Path(refs["annotations_path"])
         key = build_s3_key(
             project_id=dataset_export.project_id,
             dataset_export_id=dataset_export.dataset_export_id,
@@ -233,7 +235,7 @@ def _autostub_upload_archive(monkeypatch):
         )
 
     monkeypatch.setattr(_uploads, "upload_dataset_archive", _noop)
-    monkeypatch.setattr(_tss, "build_s3_client", lambda _cfg: object())
+    monkeypatch.setattr(_tss, "build_s3_client", lambda _cfg, **_kwargs: object())
 
 
 # ══════════════════════════════════════════════════════════════════════════

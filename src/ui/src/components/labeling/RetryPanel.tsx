@@ -10,7 +10,7 @@
  * teacher model's capabilities.
  */
 
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { Button, Text } from "@kui/react";
 
 import { SegmentedControl } from "@/components/SegmentedControl";
@@ -58,6 +58,8 @@ export function RetryPanel({
   const [preset, setPreset] = useState(currentPreset);
   const [thinking, setThinking] = useState(currentThinking);
   const [visualBudget, setVisualBudget] = useState(currentVisualBudget);
+  const teacherSelectId = useId();
+  const guidanceSelectId = useId();
 
   // Look up selected teacher to determine control visibility
   const selectedTeacher = useMemo(
@@ -89,14 +91,17 @@ export function RetryPanel({
 
       {/* Teacher */}
       <div data-testid="retry-teacher">
-        <Text
-          kind="label/regular/xs"
-          style={{ color: "var(--text-muted)" }}
-          className="mb-1 block"
-        >
-          Teacher
-        </Text>
+        <label htmlFor={teacherSelectId}>
+          <Text
+            kind="label/regular/xs"
+            style={{ color: "var(--text-muted)" }}
+            className="mb-1 block"
+          >
+            Teacher
+          </Text>
+        </label>
         <select
+          id={teacherSelectId}
           className="glass-input w-full px-3 py-2 text-sm"
           value={teacherId}
           onChange={(e) => setTeacherId(e.target.value)}
@@ -115,14 +120,17 @@ export function RetryPanel({
 
       {/* Guidance */}
       <div data-testid="retry-guidance">
-        <Text
-          kind="label/regular/xs"
-          style={{ color: "var(--text-muted)" }}
-          className="mb-1 block"
-        >
-          Guidance
-        </Text>
+        <label htmlFor={guidanceSelectId}>
+          <Text
+            kind="label/regular/xs"
+            style={{ color: "var(--text-muted)" }}
+            className="mb-1 block"
+          >
+            Guidance
+          </Text>
+        </label>
         <select
+          id={guidanceSelectId}
           className="glass-input w-full px-3 py-2 text-sm"
           value={guidanceId}
           onChange={(e) => setGuidanceId(e.target.value)}
@@ -149,6 +157,7 @@ export function RetryPanel({
         </Text>
         <SegmentedControl
           testId="retry-stability-group"
+          ariaLabel="Stability"
           options={[
             { key: "precise", label: "Precise" },
             { key: "explore", label: "Explore" },
@@ -170,6 +179,7 @@ export function RetryPanel({
           </Text>
           <SegmentedControl
             testId="retry-thinking-group"
+            ariaLabel="Thinking"
             options={[
               { key: "on", label: "ON" },
               { key: "off", label: "OFF" },
@@ -192,6 +202,7 @@ export function RetryPanel({
           </Text>
           <SegmentedControl
             testId="retry-vb-group"
+            ariaLabel="Detail"
             options={[
               { key: "fast", label: "Fast" },
               { key: "balanced", label: "Balanced" },

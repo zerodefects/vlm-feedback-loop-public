@@ -74,6 +74,7 @@ INGEST_SWEEP_INTER_BATCH_SLEEP_S = 0.02
 async def _ingest_worker(
     project_id: str,
     workspace_root: str,
+    settings: Settings,
 ) -> None:
     """Background coroutine that backfills pHash for ingested examples.
 
@@ -165,7 +166,9 @@ async def _ingest_worker(
             computed: list[tuple[str, str | None]] = []
             for key, storage_ref in batch:
                 phash_value = await run_in_low_priority_thread(
-                    compute_phash_from_path, storage_ref
+                    compute_phash_from_path,
+                    storage_ref,
+                    settings,
                 )
                 computed.append((key, phash_value))
 
@@ -243,6 +246,7 @@ async def _ingest_worker(
 def trigger_ingest_processing(
     project_id: str,
     workspace_root: str,
+    settings: Settings,
 ) -> None:
     """Trigger the background pHash sweeper for a project.
 
@@ -253,7 +257,7 @@ def trigger_ingest_processing(
     """
     background_manager.try_register(
         f"ingest-sweep-{project_id}",
-        _ingest_worker(project_id, workspace_root),
+        _ingest_worker(project_id, workspace_root, settings),
         no_loop_warning=(
             f"Ingest sweeper NOT scheduled for {project_id}: caller has no "
             "running event loop. Async route handler required; sweeper will "
@@ -312,7 +316,7 @@ async def recover_ingest_tasks(settings: Settings) -> None:
                     null_count,
                     project_id,
                 )
-                trigger_ingest_processing(project_id, workspace_root)
+                trigger_ingest_processing(project_id, workspace_root, settings)
         except Exception as exc:
             logger.warning(
                 "Skipping ingest sweeper recovery for project %s (%s: %s)",

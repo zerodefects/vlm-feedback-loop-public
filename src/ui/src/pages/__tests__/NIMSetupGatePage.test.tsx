@@ -75,7 +75,7 @@ function makeEnv(overrides: Partial<EnvironmentResponse> = {}): EnvironmentRespo
     embedding_deployment: {
       model_name: "nvidia/llama-nemotron-embed-vl-1b-v2",
       nim_container_image: "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0",
-      gpu_memory_minimum_gb: 10,
+      gpu_memory_minimum_gb: 24,
       fits: true,
       provider: "self_hosted_nvclip",
     },
@@ -247,7 +247,11 @@ describe("NIMSetupGatePage", () => {
     await waitFor(() => {
       expect(screen.getByText(/You're set up/i)).toBeInTheDocument();
     });
-    expect(screen.getByText(/Minimax M3/)).toBeInTheDocument();
+    expect(screen.getByTestId("setup-gate-card")).toHaveClass(
+      "glass-card",
+      "glass-card--elevated",
+    );
+    expect(screen.getByText(/Step 3\.7 Flash/)).toBeInTheDocument();
     expect(screen.getByText(/NeMo Retriever VL/)).toBeInTheDocument();
     expect(screen.queryByTestId("confirm-defaults-page")).toBeNull();
   });
@@ -286,7 +290,7 @@ describe("NIMSetupGatePage", () => {
         embedding_deployment: {
           model_name: "nvidia/llama-nemotron-embed-vl-1b-v2",
           nim_container_image: "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0",
-          gpu_memory_minimum_gb: 10,
+          gpu_memory_minimum_gb: 24,
           fits: false,
           provider: "none",
         },
@@ -377,7 +381,7 @@ describe("NIMSetupGatePage", () => {
     expect(screen.getByText(/TEACHER MODEL/)).toBeInTheDocument();
     expect(screen.getByText(/Cosmos Reason2 8B/)).toBeInTheDocument();
     expect(screen.getByText(/Local NIM · NVIDIA A100/)).toBeInTheDocument();
-    expect(screen.queryByText(/Minimax M3/)).toBeNull();
+    expect(screen.queryByText(/Step 3\.7 Flash/)).toBeNull();
     expect(screen.getByText(/NeMo Retriever VL/)).toBeInTheDocument();
     expect(screen.getByText(/Hosted on build\.nvidia\.com/)).toBeInTheDocument();
   });
@@ -556,7 +560,7 @@ describe("NIMSetupGatePage", () => {
         /Start labeling immediately with the hosted Teacher.*becomes active automatically once verified/i,
       ),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Minimax M3/)).toBeInTheDocument();
+    expect(screen.getByText(/Step 3\.7 Flash/)).toBeInTheDocument();
     expect(
       screen.getByText(/Starting now · Hosted until the local Teacher is ready/i),
     ).toBeInTheDocument();
@@ -679,7 +683,7 @@ describe("NIMSetupGatePage", () => {
         embedding_deployment: {
           model_name: "nvidia/llama-nemotron-embed-vl-1b-v2",
           nim_container_image: "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0",
-          gpu_memory_minimum_gb: 10,
+          gpu_memory_minimum_gb: 24,
           fits: false,
           provider: "none",
         },
@@ -776,7 +780,7 @@ describe("NIMSetupGatePage", () => {
     await waitFor(() => {
       expect(screen.getByText(/You're set up/i)).toBeInTheDocument();
     });
-    expect(screen.getByText(/Minimax M3/)).toBeInTheDocument();
+    expect(screen.getByText(/Step 3\.7 Flash/)).toBeInTheDocument();
     expect(screen.getByText(/Hosted on build\.nvidia\.com/)).toBeInTheDocument();
     expect(screen.getByText(/NeMo Retriever VL/)).toBeInTheDocument();
     expect(screen.getByText(/Local NIM · NVIDIA RTX 5000 Ada/)).toBeInTheDocument();

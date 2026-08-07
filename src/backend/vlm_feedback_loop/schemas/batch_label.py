@@ -72,6 +72,7 @@ class BatchLabelRunResponse(BaseModel):
     status: str
     status_reason: str | None = None
     paused_reason: str | None = None
+    circuit_breaker_threshold: int | None = None
 
     # Config snapshot
     guidance_id: str | None = None

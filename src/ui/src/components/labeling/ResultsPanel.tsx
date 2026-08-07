@@ -15,7 +15,7 @@ import type { GuidanceResponse } from "@/types/guidance";
 import type { ModelConfigResponse } from "@/types/nim";
 
 import { formatTimestamp } from "@/lib/format-date";
-import { formatDeltaPoints, formatPct } from "@/lib/format-percent";
+import { formatDeltaPoints, formatMetricPct } from "@/lib/format-percent";
 import { titleCasePreset } from "@/lib/formatPreset";
 
 import { safeMetrics } from "./metricsHelpers";
@@ -31,6 +31,7 @@ interface ResultsPanelProps {
    */
   teacherConfigs?: ModelConfigResponse[];
   guidanceVersions?: GuidanceResponse[];
+  minPerValueF1Threshold: number;
 }
 
 export function ResultsPanel({
@@ -38,6 +39,7 @@ export function ResultsPanel({
   onClose,
   teacherConfigs,
   guidanceVersions,
+  minPerValueF1Threshold,
 }: ResultsPanelProps) {
   const [showPerValue, setShowPerValue] = useState(false);
   const metrics = safeMetrics(run.metrics);
@@ -65,7 +67,12 @@ export function ResultsPanel({
         style={{ borderColor: "var(--glass-border)" }}
       >
         <Text kind="title/sm">Evaluation Results</Text>
-        <Button kind="tertiary" onClick={onClose} data-testid="close-results">
+        <Button
+          kind="tertiary"
+          onClick={onClose}
+          aria-label="Close evaluation results"
+          data-testid="close-results"
+        >
           <X size={16} />
         </Button>
       </div>
@@ -304,10 +311,38 @@ export function ResultsPanel({
                                   fontSize: 10,
                                 }}
                               >
-                                <th className="text-left py-1">Value</th>
-                                <th className="text-right py-1">F1</th>
-                                <th className="text-right py-1">Prec</th>
-                                <th className="text-right py-1">Recall</th>
+                                <th className="text-left py-1">
+                                  <Text
+                                    kind="label/bold/xs"
+                                    style={{ color: "inherit" }}
+                                  >
+                                    Value
+                                  </Text>
+                                </th>
+                                <th className="text-right py-1">
+                                  <Text
+                                    kind="label/bold/xs"
+                                    style={{ color: "inherit" }}
+                                  >
+                                    F1
+                                  </Text>
+                                </th>
+                                <th className="text-right py-1">
+                                  <Text
+                                    kind="label/bold/xs"
+                                    style={{ color: "inherit" }}
+                                  >
+                                    Prec
+                                  </Text>
+                                </th>
+                                <th className="text-right py-1">
+                                  <Text
+                                    kind="label/bold/xs"
+                                    style={{ color: "inherit" }}
+                                  >
+                                    Recall
+                                  </Text>
+                                </th>
                                 <th className="text-left py-1 pl-3"></th>
                               </tr>
                             </thead>
@@ -322,24 +357,46 @@ export function ResultsPanel({
                                       key={val}
                                       data-testid={`pv-${field}-${val}-empty`}
                                     >
-                                      <td className="py-1">{val}</td>
-                                      <td
-                                        className="text-right"
-                                        style={{ color: "var(--text-faint)" }}
-                                      >
-                                        —
+                                      <td className="py-1">
+                                        <Text
+                                          kind="label/regular/xs"
+                                          style={{ color: "inherit" }}
+                                        >
+                                          {val}
+                                        </Text>
                                       </td>
                                       <td
                                         className="text-right"
                                         style={{ color: "var(--text-faint)" }}
                                       >
-                                        —
+                                        <Text
+                                          kind="label/regular/xs"
+                                          style={{ color: "inherit" }}
+                                        >
+                                          —
+                                        </Text>
                                       </td>
                                       <td
                                         className="text-right"
                                         style={{ color: "var(--text-faint)" }}
                                       >
-                                        —
+                                        <Text
+                                          kind="label/regular/xs"
+                                          style={{ color: "inherit" }}
+                                        >
+                                          —
+                                        </Text>
+                                      </td>
+                                      <td
+                                        className="text-right"
+                                        style={{ color: "var(--text-faint)" }}
+                                      >
+                                        <Text
+                                          kind="label/regular/xs"
+                                          style={{ color: "inherit" }}
+                                        >
+                                          —
+                                        </Text>
                                       </td>
                                       <td
                                         className="text-left py-1 pl-3"
@@ -348,15 +405,29 @@ export function ResultsPanel({
                                           fontSize: 10,
                                         }}
                                       >
-                                        (no examples)
+                                        <Text
+                                          kind="label/regular/xs"
+                                          style={{ color: "inherit" }}
+                                        >
+                                          (no examples)
+                                        </Text>
                                       </td>
                                     </tr>
                                   );
                                 }
-                                const belowThreshold = m.f1 < 0.8;
+                                const belowThreshold = m.f1 < minPerValueF1Threshold;
+                                const thresholdLabel =
+                                  formatMetricPct(minPerValueF1Threshold);
                                 return (
                                   <tr key={val} data-testid={`pv-${field}-${val}`}>
-                                    <td className="py-1">{val}</td>
+                                    <td className="py-1">
+                                      <Text
+                                        kind="label/regular/xs"
+                                        style={{ color: "inherit" }}
+                                      >
+                                        {val}
+                                      </Text>
+                                    </td>
                                     <td
                                       className="text-right"
                                       style={
@@ -365,27 +436,39 @@ export function ResultsPanel({
                                           : undefined
                                       }
                                     >
-                                      <span className="inline-flex items-center justify-end gap-1">
-                                        {formatPct(m.f1)}
+                                      <Text
+                                        kind="label/regular/xs"
+                                        className="inline-flex items-center justify-end gap-1"
+                                        style={{ color: "inherit" }}
+                                      >
+                                        {formatMetricPct(m.f1)}
                                         {belowThreshold && (
                                           <AlertTriangle
                                             size={14}
-                                            aria-label="below 80%"
+                                            aria-hidden="true"
                                             style={{ color: "var(--warning-amber)" }}
                                           />
                                         )}
-                                      </span>
+                                      </Text>
                                     </td>
                                     <td className="text-right">
-                                      {formatPct(m.precision)}
+                                      <Text
+                                        kind="label/regular/xs"
+                                        style={{ color: "inherit" }}
+                                      >
+                                        {formatMetricPct(m.precision)}
+                                      </Text>
                                     </td>
                                     <td className="text-right">
-                                      {formatPct(m.recall)}
+                                      <Text
+                                        kind="label/regular/xs"
+                                        style={{ color: "inherit" }}
+                                      >
+                                        {formatMetricPct(m.recall)}
+                                      </Text>
                                     </td>
-                                    {/* An inline
-                                       "below 80%" text suffix sits beside the icon
-                                       so the affordance is screen-reader-legible
-                                       without depending on the icon's aria-label. */}
+                                    {/* The visible suffix carries the accessible
+                                       warning text; the adjacent icon is decorative. */}
                                     <td
                                       className="text-left py-1 pl-3"
                                       style={{ fontSize: 10 }}
@@ -395,7 +478,7 @@ export function ResultsPanel({
                                           kind="label/regular/xs"
                                           style={{ color: "var(--warning-amber)" }}
                                         >
-                                          below 80%
+                                          below {thresholdLabel}
                                         </Text>
                                       )}
                                     </td>
@@ -476,7 +559,7 @@ function MetricLine({
       <Text kind={kind}>{label}</Text>
       <div className="flex items-center gap-2">
         <Text kind={kind}>
-          {formatPct(rate)} ({countLabel})
+          {formatMetricPct(rate)} ({countLabel})
         </Text>
         {/* Fixed-width delta slot rendered on every row so the value
            column right-aligns at one edge whether or not a row carries
@@ -515,10 +598,14 @@ function MetadataSegments({
       {present.map((segment, i) => (
         <Fragment key={i}>
           {i > 0 && " "}
-          <span className="whitespace-nowrap">
+          <Text
+            kind="body/regular/xs"
+            className="whitespace-nowrap"
+            style={{ color: "inherit", fontSize: "inherit" }}
+          >
             {segment}
             {i < present.length - 1 && " ·"}
-          </span>
+          </Text>
         </Fragment>
       ))}
     </>
@@ -530,7 +617,7 @@ function FieldBar({ field, rate }: { field: string; rate: number }) {
     <div className="mb-2">
       <div className="flex items-center justify-between mb-1">
         <Text kind="label/regular/xs">{field}</Text>
-        <Text kind="label/regular/xs">{formatPct(rate)}</Text>
+        <Text kind="label/regular/xs">{formatMetricPct(rate)}</Text>
       </div>
       <div className="h-2 rounded-full" style={{ background: "var(--bar-track)" }}>
         <div

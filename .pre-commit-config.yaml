@@ -12,7 +12,7 @@
 #   - agents-claude-twins (instant; AGENTS.md/CLAUDE.md must stay identical)
 #
 # Bootstrap:
-#     pip install pre-commit
+#     uv tool install pre-commit
 #     pre-commit install
 #
 # Run all hooks against the entire repo (the repo-wide smoke check):

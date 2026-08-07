@@ -23,7 +23,7 @@ export interface BrowseResponse {
 
 // ── Scan ────────────────────────────────────────────────────────────────────
 
-export interface ScanImageEntry {
+interface ScanImageEntry {
   storage_ref: string;
   suggested_example_key: string;
   size_bytes: number;
@@ -31,7 +31,7 @@ export interface ScanImageEntry {
   existing_storage_ref: string | null;
 }
 
-export interface ScanSkippedEntry {
+interface ScanSkippedEntry {
   path: string;
   reason: string;
 }
@@ -47,7 +47,7 @@ export interface ScanResponse {
 
 // ── Ingest ──────────────────────────────────────────────────────────────────
 
-export interface IngestItem {
+interface IngestItem {
   example_key: string;
   storage_ref: string;
   source_metadata?: Record<string, unknown>;
@@ -57,7 +57,7 @@ export interface IngestRequest {
   examples: IngestItem[];
 }
 
-export interface IngestResultItem {
+interface IngestResultItem {
   example_key: string;
   status: "created" | "exists" | "error";
   error: string | null;

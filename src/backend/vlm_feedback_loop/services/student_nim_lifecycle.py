@@ -16,9 +16,9 @@ filters don't pick them up), runs the evaluation pipeline against the Test
 Pool with ``evaluation_source="nim"``, sweeps latency benchmarks at
 ``STUDENT_LATENCY_TEST_CONCURRENCIES``, then stops the container.
 
-External mode: registers the supplied URL as a permanent NimEndpoint and
-runs only the evaluation phase (no docker, no benchmark sweep). The
-Compare & Benchmark UI may follow up with a benchmark request later.
+External mode: registers the supplied URL as a permanent NimEndpoint, runs
+the same Test Pool evaluation and production VLM benchmark sweep as local
+mode, and requires an explicit declaration that KV-cache reuse is disabled.
 
 State writes are durable BEFORE any SSE event fires; both StudentModel
 fields (``serving_status``, ``nim_*``, ``serving_evaluation_run_id``) and
@@ -31,7 +31,7 @@ Per-stage timeouts (``asyncio.wait_for``):
 
 Failure categories (persisted in ``StudentModel.nim_preflight_details``):
   preflight_failed | docker_run_failed | health_timeout | smoke_failed |
-  register_endpoint_failed | eval_failed | benchmark_timeout | internal_error
+  register_endpoint_failed | eval_failed | benchmark_failed | internal_error
 """
 
 from __future__ import annotations
@@ -39,6 +39,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
+import shutil
 import time
 from dataclasses import dataclass
 from typing import Any, cast
@@ -61,7 +63,7 @@ from vlm_feedback_loop.services.benchmark_adapter import (
     select_adapter,
 )
 from vlm_feedback_loop.services.dataset_export_service import (
-    resolve_test_pool_dataset_sha,
+    resolve_paired_test_pool_dataset_sha,
 )
 from vlm_feedback_loop.services.evaluation_service import (
     TERMINAL_STATUSES,
@@ -75,9 +77,11 @@ from vlm_feedback_loop.services.inference_contract_resolver import (
 )
 from vlm_feedback_loop.services.nim_endpoint_service import create_nim_endpoint
 from vlm_feedback_loop.services.nim_metrics_scraper import scrape_prometheus
-from vlm_feedback_loop.services.project_service import (
-    get_project_engine,
-    project_dir_path,
+from vlm_feedback_loop.services.project_service import get_project_engine
+from vlm_feedback_loop.services.runtime_secrets import get_effective_secret
+from vlm_feedback_loop.services.serving_benchmark_workload import (
+    ServingBenchmarkWorkload,
+    build_serving_benchmark_workload,
 )
 from vlm_feedback_loop.services.sse import sse_manager
 
@@ -127,6 +131,8 @@ class StudentSnapshot:
     base_max_images_per_request: int
     dataset_export_ids: list[str]
     guidance_id: str
+    tao_job_id: str
+    quantize_tao_job_id: str | None
 
 
 def _load_student_snapshot(
@@ -175,6 +181,8 @@ def _load_student_snapshot(
             base_max_images_per_request=base.max_images_per_request or 5,
             dataset_export_ids=list(export_ids),
             guidance_id=student.guidance_id,
+            tao_job_id=student.tao_job_id,
+            quantize_tao_job_id=student.quantize_tao_job_id,
         )
 
 
@@ -346,10 +354,11 @@ def _promote_quality_from_nim_eval(
         # OOM / config-error TAO failure cannot be silently papered over
         # by a NIM eval that just happened to complete.
         if prior_status == "failed":
-            train_tao_job_id = student.tao_job_id
-            if not train_tao_job_id:
+            artifact_tao_job_id = student.quantize_tao_job_id or student.tao_job_id
+            if not artifact_tao_job_id:
                 logger.info(
-                    "NIM eval succeeded for Student %s but tao_job_id is unset; "
+                    "NIM eval succeeded for Student %s but its artifact TAO job "
+                    "is unset; "
                     "cannot classify prior failure — leaving quality_status=failed.",
                     student_model_id,
                 )
@@ -357,7 +366,7 @@ def _promote_quality_from_nim_eval(
             matched, signature = tao_failure_classifier.matches_known_loader_gap(
                 session,
                 project_id=project_id,
-                student_train_tao_job_id=train_tao_job_id,
+                student_artifact_tao_job_id=artifact_tao_job_id,
             )
             if not matched:
                 logger.info(
@@ -476,7 +485,7 @@ def _compute_parseable_rate(run_record: RunRecord | None) -> float:
 _SERVING_ACCEPTABLE_STATUSES = ("completed", "incomplete")
 
 
-def _apply_serving_quality_gate(
+def _apply_quality_gate(
     project_id: str,
     student_model_id: str,
     workspace_root: str,
@@ -485,26 +494,7 @@ def _apply_serving_quality_gate(
     run_id: str,
     run_record: RunRecord,
 ) -> None:
-    """Unified serving/quality gate — the ONE implementation for
-    external and local modes (they drifted apart when each carried a copy:
-    the external copy wrongly failed serving on ``incomplete`` runs below
-    the partial threshold).
-
-    Caller must have verified ``run_record.status`` is in
-    ``_SERVING_ACCEPTABLE_STATUSES``. Serving validates unconditionally;
-    quality routes by run status: full promotion on ``completed``, ``partial``
-    on ``incomplete`` with ``parseable_rate >= threshold``, otherwise left
-    at its prior value (typically ``pending`` or ``failed``).
-    """
-    _write_student_state(
-        project_id,
-        student_model_id,
-        workspace_root,
-        fields={
-            "serving_status": "validated",
-            "serving_evaluation_run_id": run_id,
-        },
-    )
+    """Apply quality promotion independently of serving benchmark success."""
     parseable_rate = _compute_parseable_rate(run_record)
     partial_threshold = settings.STUDENT_QUALITY_PARTIAL_PARSEABLE_THRESHOLD
     if run_record.status == "completed":
@@ -523,8 +513,25 @@ def _apply_serving_quality_gate(
             parseable_rate=parseable_rate,
             threshold=partial_threshold,
         )
-    # else: incomplete below the threshold — serving stays validated;
-    # quality keeps its prior value.
+    # Else: incomplete below threshold; quality keeps its prior value.
+
+
+def _mark_serving_validated(
+    project_id: str,
+    student_model_id: str,
+    workspace_root: str,
+    *,
+    run_id: str,
+) -> None:
+    _write_student_state(
+        project_id,
+        student_model_id,
+        workspace_root,
+        fields={
+            "serving_status": "validated",
+            "serving_evaluation_run_id": run_id,
+        },
+    )
 
 
 def _persist_preflight(
@@ -1040,9 +1047,14 @@ async def _run_evaluation_phase(
                 nim_profile_metadata = student.nim_profile_metadata
                 gpu_type = student.gpu_type
                 gpu_count = student.gpu_count
-            # Test Pool DatasetExport (dataset_intent="testing") archive SHA-256.
-            dataset_manifest_sha256 = resolve_test_pool_dataset_sha(
-                session, snapshot.dataset_export_ids
+            # StudentModel export IDs are training-only. Follow the paired
+            # evaluate job from the artifact-producing train/quantize job.
+            dataset_manifest_sha256 = resolve_paired_test_pool_dataset_sha(
+                session,
+                artifact_parent_tao_job_id=(
+                    snapshot.quantize_tao_job_id or snapshot.tao_job_id
+                ),
+                fallback_export_ids=snapshot.dataset_export_ids,
             )
 
     response = await start_evaluation_run(
@@ -1092,77 +1104,158 @@ async def _run_benchmark_sweep(
     *,
     base_url: str,
     served_model: str,
+    serving_run_id: str,
     started_at: float,
     deployment_id: str | None,
+    auth_headers: dict[str, str] | None = None,
     adapter: BenchmarkAdapter | None = None,
-) -> tuple[list[dict[str, Any]], list[int]]:
+    workload: ServingBenchmarkWorkload | None = None,
+) -> tuple[list[dict[str, Any]], list[int], dict[str, Any]]:
     """Run the latency sweep at STUDENT_LATENCY_TEST_CONCURRENCIES.
 
-    Returns ``(benchmarks, skipped_concurrencies)``. On per-concurrency
-    timeout the value is appended to ``skipped_concurrencies`` and the
-    sweep breaks immediately (the container will be stopped by the
-    caller; the queue continues with the next Student variant).
+    Returns results, failed/skipped concurrencies, and durable workload
+    provenance. Every passing level must process the exact real-image workload
+    once with zero failed requests.
     """
     bench_adapter = adapter or select_adapter()
-    project_dir = str(project_dir_path(workspace_root, project_id))
     benchmarks: list[dict[str, Any]] = []
     skipped: list[int] = []
-
-    for concurrency in settings.STUDENT_LATENCY_TEST_CONCURRENCIES:
-        await _emit_progress(
-            project_id,
-            snapshot.student_model_id,
-            STAGE_BENCHMARK,
-            started_at,
-            concurrency=concurrency,
-            deployment_id=deployment_id,
+    built_here = workload is None
+    if workload is None:
+        workload = await build_serving_benchmark_workload(
+            project_id=project_id,
+            serving_run_id=serving_run_id,
+            student_model_id=snapshot.student_model_id,
+            served_model=served_model,
+            workspace_root=workspace_root,
+            settings=settings,
         )
-        try:
-            result: BenchmarkResult = await asyncio.wait_for(
-                bench_adapter.run(
-                    base_url=base_url,
-                    model=served_model,
+    assert workload is not None
+
+    try:
+        for concurrency in settings.STUDENT_LATENCY_TEST_CONCURRENCIES:
+            await _emit_progress(
+                project_id,
+                snapshot.student_model_id,
+                STAGE_BENCHMARK,
+                started_at,
+                concurrency=concurrency,
+                deployment_id=deployment_id,
+            )
+            before = await scrape_prometheus(base_url)
+            try:
+                result = await asyncio.wait_for(
+                    bench_adapter.run(
+                        base_url=base_url,
+                        model=served_model,
+                        concurrency=concurrency,
+                        input_file=workload.input_file,
+                        artifact_dir=workload.artifact_root / f"c{concurrency}",
+                        request_count=workload.request_count,
+                        auth_headers=auth_headers,
+                        deadline_s=float(settings.NIM_BENCHMARK_TIMEOUT_S),
+                    ),
+                    timeout=float(settings.NIM_BENCHMARK_TIMEOUT_S) + 5.0,
+                )
+            except TimeoutError:
+                result = BenchmarkResult(
                     concurrency=concurrency,
-                    project_dir=project_dir,
-                    student_model_id=snapshot.student_model_id,
-                    deadline_s=float(settings.NIM_BENCHMARK_TIMEOUT_S),
-                ),
-                timeout=float(settings.NIM_BENCHMARK_TIMEOUT_S),
+                    status="failed",
+                    artifact_dir=str(workload.artifact_root / f"c{concurrency}"),
+                    failure_reason="benchmark_timeout",
+                    failed=True,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "AIPerf adapter raised at concurrency=%d for Student %s",
+                    concurrency,
+                    snapshot.student_model_id,
+                )
+                result = BenchmarkResult(
+                    concurrency=concurrency,
+                    status="failed",
+                    artifact_dir=str(workload.artifact_root / f"c{concurrency}"),
+                    failure_reason=f"adapter_exception:{type(exc).__name__}",
+                    failed=True,
+                )
+
+            required_metrics = (
+                result.latency_p50_ms,
+                result.latency_p90_ms,
+                result.latency_p99_ms,
+                result.request_throughput_rps,
             )
-        except TimeoutError:
-            logger.warning(
-                "Benchmark timeout at concurrency=%d for Student %s",
-                concurrency,
-                snapshot.student_model_id,
+            contract_failures: list[str] = []
+            if result.status != "passed":
+                contract_failures.append(f"status_{result.status}")
+            if result.attempted_request_count != workload.request_count:
+                contract_failures.append(
+                    f"attempted_{result.attempted_request_count}_expected_"
+                    f"{workload.request_count}"
+                )
+            if result.successful_request_count != workload.request_count:
+                contract_failures.append(
+                    f"successful_{result.successful_request_count}_expected_"
+                    f"{workload.request_count}"
+                )
+            if result.failed_request_count != 0:
+                contract_failures.append(
+                    f"failed_requests_{result.failed_request_count}"
+                )
+            if any(
+                value is None or not math.isfinite(value) for value in required_metrics
+            ):
+                contract_failures.append("missing_or_non_finite_required_metric")
+            elif result.request_throughput_rps is not None and (
+                result.request_throughput_rps <= 0
+            ):
+                contract_failures.append("non_positive_throughput")
+            if contract_failures:
+                result.failed = True
+                result.status = "failed"
+                reasons = [result.failure_reason] if result.failure_reason else []
+                reasons.extend(contract_failures)
+                result.failure_reason = ";".join(dict.fromkeys(reasons))
+
+            after = await scrape_prometheus(base_url)
+            success_before = before.get("request_success_total")
+            success_after = after.get("request_success_total")
+            failure_before = before.get("request_failure_total")
+            failure_after = after.get("request_failure_total")
+            cache_after = after.get("gpu_cache_usage_perc")
+
+            def _counter_delta(
+                before_value: float | None, after_value: float | None
+            ) -> float | None:
+                if before_value is None or after_value is None:
+                    return None
+                if after_value < before_value:
+                    return None
+                return after_value - before_value
+
+            result.prometheus = {
+                "request_success_delta": _counter_delta(success_before, success_after),
+                "request_failure_delta": _counter_delta(failure_before, failure_after),
+                "gpu_cache_usage_perc": cache_after,
+            }
+            result.prometheus_available = any(
+                value is not None for value in result.prometheus.values()
             )
-            skipped.append(concurrency)
-            break
+            if result.failed:
+                skipped.append(concurrency)
+                logger.warning(
+                    "Production VLM benchmark failed at concurrency=%d for "
+                    "Student %s: %s",
+                    concurrency,
+                    snapshot.student_model_id,
+                    result.failure_reason,
+                )
+            benchmarks.append(result.to_json())
+    finally:
+        if built_here:
+            shutil.rmtree(workload.temporary_dir, ignore_errors=True)
 
-        if result.failed or result.request_count == 0:
-            # The driver produced no real measurement (process failure /
-            # missing output / every request errored). Guarding on
-            # request_count too catches any driver that forgets to set the
-            # failed flag. Record it as skipped rather than persisting a fake
-            # zero-latency row the ServingMatrix would render as valid.
-            logger.warning(
-                "Benchmark driver failed at concurrency=%d for Student %s — "
-                "recording as skipped",
-                concurrency,
-                snapshot.student_model_id,
-            )
-            skipped.append(concurrency)
-            continue
-
-        # Scrape Prometheus metrics post-run; merge into the BenchmarkResult.
-        try:
-            result.prometheus = await scrape_prometheus(base_url)
-        except Exception as exc:
-            logger.debug("Prometheus scrape skipped: %s", exc)
-            result.prometheus = {}
-
-        benchmarks.append(result.to_json())
-
-    return benchmarks, skipped
+    return benchmarks, skipped, workload.manifest
 
 
 def _persist_benchmarks(
@@ -1171,6 +1264,7 @@ def _persist_benchmarks(
     *,
     run_id: str,
     benchmarks: list[dict[str, Any]],
+    workload: dict[str, Any],
 ) -> None:
     """Attach the sweep results to the serving evaluation run's metrics.
 
@@ -1191,7 +1285,11 @@ def _persist_benchmarks(
             )
             return
         # Reassign (not mutate) so the JSON column change is tracked.
-        run.metrics = {**(run.metrics or {}), "benchmarks": benchmarks}
+        run.metrics = {
+            **(run.metrics or {}),
+            "benchmark_workload": workload,
+            "benchmarks": benchmarks,
+        }
         session.commit()
 
 
@@ -1329,21 +1427,76 @@ async def run_student_deployment_lifecycle(
                 await _fail("eval_failed", err)
                 return
 
-            # Unified serving/quality gate (shared with local mode): serving
-            # accepts (completed, incomplete); quality routes to
-            # validated / partial / no-promotion. See
-            # _apply_serving_quality_gate + _promote_quality_to_partial
-            # for the audit invariants.
             if run_record.status not in _SERVING_ACCEPTABLE_STATUSES:
                 await _fail("eval_failed", f"run_status={run_record.status}")
                 return
-            _apply_serving_quality_gate(
+            _apply_quality_gate(
                 project_id,
                 student_model_id,
                 workspace_root,
                 settings,
                 run_id=run_id,
                 run_record=run_record,
+            )
+            _write_student_state(
+                project_id,
+                student_model_id,
+                workspace_root,
+                fields={"serving_evaluation_run_id": run_id},
+            )
+
+            auth_headers = nim_client.build_endpoint_auth_headers(
+                auth_mode,
+                get_effective_secret("NVIDIA_API_KEY", settings),
+            )
+            try:
+                benchmarks, skipped, workload_manifest = await _run_benchmark_sweep(
+                    project_id,
+                    snapshot,
+                    workspace_root,
+                    settings,
+                    base_url=nim_endpoint_url,
+                    served_model=_served_model_name(snapshot),
+                    serving_run_id=run_id,
+                    started_at=started_at,
+                    deployment_id=None,
+                    auth_headers=auth_headers,
+                    adapter=benchmark_adapter,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Unable to build or run the production benchmark for "
+                    "external Student %s",
+                    student_model_id,
+                )
+                await _fail(
+                    "benchmark_failed",
+                    f"workload_or_driver_error:{type(exc).__name__}:{exc}",
+                )
+                return
+            _persist_benchmarks(
+                project_id,
+                workspace_root,
+                run_id=run_id,
+                benchmarks=benchmarks,
+                workload=workload_manifest,
+            )
+            if (
+                not settings.STUDENT_LATENCY_TEST_CONCURRENCIES
+                or skipped
+                or len(benchmarks) != len(settings.STUDENT_LATENCY_TEST_CONCURRENCIES)
+            ):
+                await _fail(
+                    "benchmark_failed",
+                    f"failed_concurrencies={skipped}",
+                )
+                return
+
+            _mark_serving_validated(
+                project_id,
+                student_model_id,
+                workspace_root,
+                run_id=run_id,
             )
 
             await _emit_completed(
@@ -1352,8 +1505,8 @@ async def run_student_deployment_lifecycle(
                 started_at,
                 evaluation_run_id=run_id,
                 rescored_metrics=run_record.rescored_metrics,
-                benchmarks=[],
-                skipped_concurrencies=[],
+                benchmarks=benchmarks,
+                skipped_concurrencies=skipped,
             )
             return
         except Exception as exc:
@@ -1375,9 +1528,28 @@ async def run_student_deployment_lifecycle(
             ref="missing_nim_container_image",
         )
         return
+    # The image is already the canonical runtime identity. Persist its tag
+    # when callers omit the redundant release field so every successful local
+    # deployment has a reproducible ``nim_vlm_release_version``.
+    if nim_release_version is None:
+        nim_release_version = local_nim_service.release_version_from_image(image)
+        if nim_release_version is not None:
+            _write_student_state(
+                project_id,
+                student_model_id,
+                workspace_root,
+                fields={"nim_vlm_release_version": nim_release_version},
+            )
 
     gpu_min_gb = _resolve_gpu_memory_minimum(snapshot, settings)
     served_model = _served_model_name(snapshot)
+    nim_model_size, nim_model_profile, base_served_model = (
+        local_nim_service.resolve_student_checkpoint_preflight_env(
+            project_id,
+            snapshot.student_base_model_config_id,
+            workspace_root,
+        )
+    )
     deployment_id: str | None = None
     deployment_endpoint_url: str | None = None
     eval_run_id: str | None = None
@@ -1420,6 +1592,9 @@ async def run_student_deployment_lifecycle(
             gpu_assignment=gpu,
             role="student",
             settings=settings,
+            nim_model_size=nim_model_size,
+            nim_model_profile=nim_model_profile,
+            nim_served_model_name=base_served_model,
         )
         _persist_preflight(
             project_id,
@@ -1444,6 +1619,8 @@ async def run_student_deployment_lifecycle(
                     checkpoint_mount=snapshot.nim_checkpoint_ref,
                     nim_model_name_path=STUDENT_CHECKPOINT_IN_CONTAINER,
                     nim_served_model_name=served_model,
+                    nim_model_size=nim_model_size,
+                    nim_model_profile=nim_model_profile,
                 )
                 _generate_preflight_action_request(
                     project_id=project_id,
@@ -1637,32 +1814,61 @@ async def run_student_deployment_lifecycle(
         # eval_acceptable_for_serving narrows both to non-None.
         assert eval_run_id is not None
         assert run_record is not None
-
-        # ── Stage 7: benchmark sweep ───────────────────────────────────
-        benchmarks, skipped = await _run_benchmark_sweep(
+        _apply_quality_gate(
             project_id,
-            snapshot,
+            student_model_id,
             workspace_root,
             settings,
-            base_url=deployment_endpoint_url,
-            served_model=served_model,
-            started_at=started_at,
-            deployment_id=deployment_id,
-            adapter=benchmark_adapter,
+            run_id=eval_run_id,
+            run_record=run_record,
         )
+        _write_student_state(
+            project_id,
+            student_model_id,
+            workspace_root,
+            fields={"serving_evaluation_run_id": eval_run_id},
+        )
+
+        # ── Stage 7: benchmark sweep ───────────────────────────────────
+        try:
+            benchmarks, skipped, workload_manifest = await _run_benchmark_sweep(
+                project_id,
+                snapshot,
+                workspace_root,
+                settings,
+                base_url=deployment_endpoint_url,
+                served_model=served_model,
+                serving_run_id=eval_run_id,
+                started_at=started_at,
+                deployment_id=deployment_id,
+                auth_headers={},
+                adapter=benchmark_adapter,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Unable to build or run the production benchmark for local Student %s",
+                student_model_id,
+            )
+            await _fail(
+                "benchmark_failed",
+                f"workload_or_driver_error:{type(exc).__name__}:{exc}",
+                deployment_id=deployment_id,
+            )
+            await _stop_deployment_quiet(deployment_id, project_id, workspace_root)
+            return
         # Persist the sweep onto the serving evaluation run. The SSE
         # payload below is transient — the Compare page responds to
         # ``nim_benchmark_completed`` by refetching the suite/student
         # queries and reads ``metrics.benchmarks`` from run records, so
         # without this write the ServingMatrix renders em-dashes after
         # any reload.
-        if benchmarks:
-            _persist_benchmarks(
-                project_id,
-                workspace_root,
-                run_id=eval_run_id,
-                benchmarks=benchmarks,
-            )
+        _persist_benchmarks(
+            project_id,
+            workspace_root,
+            run_id=eval_run_id,
+            benchmarks=benchmarks,
+            workload=workload_manifest,
+        )
 
         # ── Stage 8: stopping ──────────────────────────────────────────
         await _emit_progress(
@@ -1681,15 +1887,23 @@ async def run_student_deployment_lifecycle(
         # Displaced residents are auto-restored in the finally (below), which
         # covers this success path AND every failure return.
 
-        # Unified serving/quality gate (shared with external mode): serving
-        # validates, quality routes per run status + parseable rate.
-        _apply_serving_quality_gate(
+        if (
+            not settings.STUDENT_LATENCY_TEST_CONCURRENCIES
+            or skipped
+            or len(benchmarks) != len(settings.STUDENT_LATENCY_TEST_CONCURRENCIES)
+        ):
+            await _fail(
+                "benchmark_failed",
+                f"failed_concurrencies={skipped}",
+                deployment_id=deployment_id,
+            )
+            return
+
+        _mark_serving_validated(
             project_id,
             student_model_id,
             workspace_root,
-            settings,
             run_id=eval_run_id,
-            run_record=run_record,
         )
         await _emit_completed(
             project_id,

@@ -27,7 +27,7 @@ import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 import { Button, Spinner, Text } from "@kui/react";
 import { useMutation } from "@tanstack/react-query";
-import { Copy, Check, X } from "lucide-react";
+import { Copy, Check, Download, X } from "lucide-react";
 
 import { ApiError } from "@/api/client";
 import { generateActionRequest, logActionRequestCopy } from "@/api/nim";
@@ -52,6 +52,8 @@ interface ActionRequestPanelProps {
    * Student-scoped endpoint.
    */
   mutationFn?: () => Promise<ActionRequestGenerateResponse>;
+  /** Same-origin streamed artifact URL for a gated deployment handoff. */
+  deploymentBundleHref?: string;
   onClose?: () => void;
 }
 
@@ -80,12 +82,25 @@ const HANDOFF_SECTION_HEADINGS: ReadonlyArray<string> = [
  * only enhancement that does not modify the string the SME pastes into
  * their infrastructure tooling.
  *
- * For other Action Request types (``tao_setup``, ``nim_setup``,
- * ``student_nim_deploy``, etc.) we return the raw string unchanged so
- * the existing flat-text rendering applies.
+ * Other Action Request types (``tao_setup``, ``nim_setup``,
+ * ``student_nim_deploy``, etc.) retain the existing flat-text rendering.
  */
 function renderBodyWithHeadings(body: string, requestType: string): ReactNode {
-  if (requestType !== "deployment_handoff") return body;
+  if (requestType !== "deployment_handoff") {
+    return (
+      <Text
+        kind="body/regular/sm"
+        style={{
+          color: "inherit",
+          fontFamily: "inherit",
+          fontSize: "inherit",
+          lineHeight: "inherit",
+        }}
+      >
+        {body}
+      </Text>
+    );
+  }
   const lines = body.split("\n");
   return lines.map((line, idx) => {
     const trimmed = line.trim();
@@ -93,17 +108,35 @@ function renderBodyWithHeadings(body: string, requestType: string): ReactNode {
     const trailingNewline = idx < lines.length - 1 ? "\n" : "";
     if (isHeading) {
       return (
-        <span key={idx}>
-          <span style={{ color: "var(--text-primary)", fontWeight: 600 }}>{line}</span>
+        <Text
+          key={idx}
+          kind="body/semibold/sm"
+          style={{
+            color: "var(--text-primary)",
+            fontFamily: "inherit",
+            fontSize: "inherit",
+            lineHeight: "inherit",
+          }}
+        >
+          {line}
           {trailingNewline}
-        </span>
+        </Text>
       );
     }
     return (
-      <span key={idx}>
+      <Text
+        key={idx}
+        kind="body/regular/sm"
+        style={{
+          color: "inherit",
+          fontFamily: "inherit",
+          fontSize: "inherit",
+          lineHeight: "inherit",
+        }}
+      >
         {line}
         {trailingNewline}
-      </span>
+      </Text>
     );
   });
 }
@@ -126,6 +159,11 @@ const CONFLICT_EXPLANATIONS: ReadonlyArray<{
     match: "quality_status_not_validated",
     message:
       "Quality validation has not completed for this Student yet. Run a TAO evaluation first.",
+  },
+  {
+    match: "serving_benchmark_requires_aiperf",
+    message:
+      "This serving result predates the required real Test Pool AIPerf workload. Revalidate with AIPerf before requesting production deployment.",
   },
   {
     match: "serving_status_not_validated",
@@ -156,6 +194,7 @@ export function ActionRequestPanel({
   requestType,
   context,
   mutationFn,
+  deploymentBundleHref,
   onClose,
 }: ActionRequestPanelProps) {
   const { copied, copy } = useCopyToClipboard();
@@ -194,13 +233,29 @@ export function ActionRequestPanel({
   // render loses the onSuccess state update and leaves the spinner stuck.
   const { mutate: generate } = generateMutation;
   useEffect(() => {
-    generate();
+    // React StrictMode deliberately replays mount effects in development.
+    // Generating an Action Request is an audited POST, so one visible panel
+    // open must still produce exactly one request and one AuditEvent. Defer
+    // the dispatch to the next task: StrictMode cancels its first simulated
+    // mount before that task runs, while the retained mount dispatches once.
+    const timerId = window.setTimeout(() => generate(), 0);
+    return () => window.clearTimeout(timerId);
   }, [generate]);
 
   async function handleCopy() {
     if (!result) return;
     // Log the copy only when the clipboard write actually succeeded.
     if (await copy(result.rendered_text)) logCopyMutation.mutate();
+  }
+
+  function handleBundleDownload() {
+    if (!deploymentBundleHref) return;
+    const link = document.createElement("a");
+    link.href = deploymentBundleHref;
+    link.download = "";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
   }
 
   if (generateMutation.isPending) {
@@ -246,17 +301,14 @@ export function ActionRequestPanel({
                 {explanation ??
                   "The backend rejected this request as not yet ready for handoff."}
               </Text>
-              <pre
-                className="text-xs leading-snug whitespace-pre-wrap break-all m-0"
-                style={{
-                  color: "var(--text-muted)",
-                  fontFamily:
-                    'ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace',
-                }}
-                data-testid="action-request-conflict-detail"
-              >
-                {error.body}
-              </pre>
+              <Text asChild kind="mono/sm" style={{ color: "var(--text-muted)" }}>
+                <pre
+                  className="leading-snug whitespace-pre-wrap break-all m-0"
+                  data-testid="action-request-conflict-detail"
+                >
+                  {error.body}
+                </pre>
+              </Text>
             </div>
           </div>
           {onClose && (
@@ -331,7 +383,21 @@ export function ActionRequestPanel({
       </div>
 
       <div className="flex items-center gap-3">
-        <Button kind="primary" className="nvidia-green-button" onClick={handleCopy}>
+        {deploymentBundleHref && (
+          <Button
+            kind="primary"
+            className="nvidia-green-button"
+            onClick={handleBundleDownload}
+            data-testid="download-nim-deployment-bundle"
+          >
+            <Download size={14} /> Download portable NIM deployment bundle
+          </Button>
+        )}
+        <Button
+          kind={deploymentBundleHref ? "secondary" : "primary"}
+          className={deploymentBundleHref ? undefined : "nvidia-green-button"}
+          onClick={handleCopy}
+        >
           {copied ? (
             <>
               <Check size={14} /> Copied

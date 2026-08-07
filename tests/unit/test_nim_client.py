@@ -45,7 +45,7 @@ class TestBuildAuthHeaders:
 
 
 class TestBuildEndpointAuthHeaders:
-    """The tolerant service-side builder used by every outbound NIM path."""
+    """The service-side auth resolver used by every outbound NIM path."""
 
     def test_bearer(self):
         assert build_endpoint_auth_headers("bearer", "k") == {
@@ -57,10 +57,15 @@ class TestBuildEndpointAuthHeaders:
         # configured NVIDIA_API_KEY is never leaked to a no-auth endpoint.
         assert build_endpoint_auth_headers("none", "k") == {}
 
-    def test_missing_credential_returns_empty(self):
-        # Hosted with no key configured — return {} instead of raising.
-        assert build_endpoint_auth_headers("bearer", None) == {}
-        assert build_endpoint_auth_headers("bearer", "") == {}
+    def test_missing_bearer_credential_blocks_dispatch(self):
+        # None is distinct from a legitimate no-auth {} endpoint and is
+        # consumed by chat_completions without opening a network connection.
+        assert build_endpoint_auth_headers("bearer", None) is None
+        assert build_endpoint_auth_headers("bearer", "") is None
+
+    def test_unknown_mode_raises(self):
+        with pytest.raises(ValueError, match="Unknown auth_mode"):
+            build_endpoint_auth_headers("oauth2", "token")
 
 
 # ── list_models ─────────────────────────────────────────────────────────────
@@ -187,6 +192,26 @@ class TestListModels:
 
 
 class TestChatCompletions:
+    @pytest.mark.asyncio
+    async def test_missing_bearer_credential_never_dispatches(self, monkeypatch):
+        """A hosted endpoint without a key fails locally, before HTTP."""
+        mock_fn = AsyncMock()
+        monkeypatch.setattr(
+            "vlm_feedback_loop.services.nim_client.resilient_request", mock_fn
+        )
+
+        result = await chat_completions(
+            "https://integrate.api.nvidia.com/v1",
+            None,
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            deadline_s=120.0,
+        )
+
+        assert result.success is False
+        assert "credential is not configured" in (result.error or "")
+        mock_fn.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_success_extracts_fields(self, monkeypatch):
         mock_result = HttpResult(
@@ -356,6 +381,29 @@ class TestCreateEmbeddings:
         )
         assert result.success is False
         assert "Unexpected response" in result.error
+
+    @pytest.mark.asyncio
+    async def test_malformed_data_item_returns_error_instead_of_raising(
+        self, monkeypatch
+    ):
+        """A reachable but incompatible NIM remains an actionable probe failure."""
+        mock_result = HttpResult(
+            status_code=200,
+            body={"data": [{"index": 0, "not_embedding": [0.1]}]},
+            error_class=None,
+            attempts=1,
+        )
+        monkeypatch.setattr(
+            "vlm_feedback_loop.services.nim_client.resilient_request",
+            AsyncMock(return_value=mock_result),
+        )
+
+        result = await create_embeddings(
+            "http://host:8000/v1", {}, "model", ["test"], 10.0
+        )
+
+        assert result.success is False
+        assert result.error == "Unexpected response format from /embeddings"
 
     @pytest.mark.asyncio
     async def test_request_body_format(self, monkeypatch):

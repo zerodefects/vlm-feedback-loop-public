@@ -101,6 +101,53 @@ describe("TeacherModelPicker", () => {
     expect(values).toEqual(["mc-mistral"]);
   });
 
+  it("keeps the selected unavailable Teacher visible without substituting another model", () => {
+    const cosmosUnavailable: ModelConfigResponse = {
+      ...BASE_CONFIG,
+      availability: { available: false, reason: "endpoint_unhealthy" },
+    };
+    renderPicker({
+      teacherConfigs: [cosmosUnavailable, MISTRAL_CONFIG],
+      currentTeacherId: "mc-cosmos",
+      onChange: () => {},
+      projectId: "p123",
+    });
+
+    const select = screen.getByTestId(
+      "teacher-model-picker-select",
+    ) as HTMLSelectElement;
+    expect(select.value).toBe("mc-cosmos");
+    expect(select.selectedOptions[0]).toHaveTextContent(
+      "nvidia/cosmos-reason2-8b (unavailable)",
+    );
+    expect(select.selectedOptions[0]).toBeDisabled();
+    expect(Array.from(select.options).map((option) => option.value)).toEqual([
+      "mc-cosmos",
+      "mc-mistral",
+    ]);
+    expect(screen.getByTestId("teacher-model-picker-configure-link")).toHaveAttribute(
+      "href",
+      "/projects/p123/settings/nim",
+    );
+  });
+
+  it("keeps an orphaned selected Teacher visible instead of naming the first available model", () => {
+    renderPicker({
+      teacherConfigs: [MISTRAL_CONFIG],
+      currentTeacherId: "mc-retired",
+      onChange: () => {},
+      projectId: "p",
+    });
+
+    const select = screen.getByTestId(
+      "teacher-model-picker-select",
+    ) as HTMLSelectElement;
+    expect(select.value).toBe("mc-retired");
+    expect(select.selectedOptions[0]).toHaveTextContent(
+      "Selected Teacher (unavailable)",
+    );
+  });
+
   it("shows the configure-endpoint empty-state when every entry is unavailable", () => {
     const cosmosUnavailable: ModelConfigResponse = {
       ...BASE_CONFIG,

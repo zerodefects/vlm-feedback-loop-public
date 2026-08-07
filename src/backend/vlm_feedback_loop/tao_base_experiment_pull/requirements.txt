@@ -1,14 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Requirements for scripts/pull_base_experiments.py (Blueprint
-# self-service base-experiment provisioning).
+# Requirements for the packaged TAO base-experiment pull helper.
 #
 # Installed in an isolated, cached uv environment so the FastAPI process does
 # not take on TAO's NGC tooling. The backend and CLI invoke this automatically:
 #
 #   uv run --isolated --no-project --with-requirements \
-#     scripts/pull_base_experiments_requirements.txt -- python ...
+#     <package>/tao_base_experiment_pull/requirements.txt -- python ...
 #
 # `vlm-feedback-loop tao-pull-base-experiments --skip-install` instead uses
 # the current interpreter when an air-gapped host manages dependencies

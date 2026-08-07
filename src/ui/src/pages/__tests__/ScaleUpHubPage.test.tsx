@@ -60,7 +60,7 @@ vi.mock("@/api/nim", () => ({
   logActionRequestCopy: vi.fn().mockResolvedValue({ audit_event_id: "ae-1" }),
 }));
 
-vi.mock("@/pages/ProjectSetupLayout", () => ({
+vi.mock("@/pages/setup-context", () => ({
   useSetupContext: vi.fn(),
 }));
 
@@ -68,12 +68,22 @@ installEventSourceMock();
 
 import { fetchScaleUpGate } from "@/api/evaluation";
 import { listStudentBaseModelConfigs, runTrainingPreflight } from "@/api/training";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { generateActionRequest, logActionRequestCopy } from "@/api/nim";
+import { useSetupContext } from "@/pages/setup-context";
 
 const mockFetchGate = fetchScaleUpGate as ReturnType<typeof vi.fn>;
 const mockListStudentBases = listStudentBaseModelConfigs as ReturnType<typeof vi.fn>;
 const mockRunTrainingPreflight = runTrainingPreflight as ReturnType<typeof vi.fn>;
+const mockGenerateActionRequest = generateActionRequest as ReturnType<typeof vi.fn>;
+const mockLogActionRequestCopy = logActionRequestCopy as ReturnType<typeof vi.fn>;
 const mockSetup = useSetupContext as ReturnType<typeof vi.fn>;
+
+const writeTextMock = vi.fn(() => Promise.resolve());
+Object.defineProperty(navigator, "clipboard", {
+  value: { writeText: writeTextMock },
+  writable: true,
+  configurable: true,
+});
 
 const PROJECT = makeProjectResponse({
   project_id: "pid-1",
@@ -95,6 +105,7 @@ let qc: QueryClient;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  writeTextMock.mockClear();
   qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   mockSetup.mockReturnValue({
     projectId: "pid-1",
@@ -112,10 +123,19 @@ beforeEach(() => {
         provisioning_required: false,
         remediation: null,
       },
+      {
+        check_name: "min_test_pool_size",
+        passed: true,
+        message: "Test Pool has 2 held-out evaluation examples (need 2).",
+        model_config_id: null,
+        provisioning_required: false,
+        remediation: null,
+      },
     ],
     data_summary: {
       verified_training_count: 3,
       test_pool_count: 2,
+      required_test_pool_count: 2,
       auto_labeled_eligible_count: 0,
       auto_labeled_included_count: 0,
       excluded_test_pool_count: 2,
@@ -233,14 +253,49 @@ describe("ScaleUpHubPage", () => {
   });
 
   it("keeps Train a Student navigation available when TAO is not ready", async () => {
+    mockListStudentBases.mockResolvedValueOnce({
+      items: [
+        {
+          model_config_id: "student-1",
+          tao_base_experiment_id: "base-1",
+          tao_base_experiment_pull_status: "pull_complete",
+        },
+      ],
+    });
+    mockRunTrainingPreflight.mockResolvedValueOnce({
+      status: "failed",
+      checks: [
+        {
+          check_name: "tao_reachable",
+          passed: false,
+          message: "TAO_API_BASE_URL is not configured.",
+          model_config_id: null,
+          provisioning_required: false,
+          remediation: null,
+        },
+      ],
+      data_summary: {
+        verified_training_count: 3,
+        test_pool_count: 2,
+        required_test_pool_count: 2,
+        auto_labeled_eligible_count: 0,
+        auto_labeled_included_count: 0,
+        excluded_test_pool_count: 2,
+        excluded_auto_labeled_count: 0,
+        usable_training_count: 3,
+      },
+      resolved_presets: {},
+    });
     mockFetchGate.mockResolvedValue({
       gate_status: "ready",
       criteria: [],
       evaluated_at: "2026-04-16T00:00:00Z",
     });
     renderPage();
-    const btn = await screen.findByTestId("train-a-student");
+    await screen.findByText(/Student Training: infrastructure setup required/);
+    const btn = screen.getByTestId("train-a-student");
     expect(btn).not.toBeDisabled();
+    expect(btn).not.toHaveClass("nvidia-green-button");
     fireEvent.click(btn);
     await screen.findByTestId("training-page");
   });
@@ -275,13 +330,123 @@ describe("ScaleUpHubPage", () => {
       ),
     );
     expect(screen.getByTestId("readiness-capability")).toHaveTextContent(
-      "3 usable training examples; TAO preflight passed.",
+      "3 usable training examples; 2 held out for evaluation; TAO preflight passed.",
     );
+    expect(screen.getByTestId("train-a-student")).toHaveClass("nvidia-green-button");
     expect(mockRunTrainingPreflight).toHaveBeenCalledWith(
       "pid-1",
       ["student-unavailable", "student-ready"],
       true,
     );
+  });
+
+  it("keeps a model-specific method mismatch out of TAO setup", async () => {
+    mockFetchGate.mockResolvedValue({
+      gate_status: "ready",
+      criteria: [],
+      evaluated_at: "2026-04-16T00:00:00Z",
+    });
+    mockListStudentBases.mockResolvedValueOnce({
+      items: [
+        {
+          model_config_id: "student-super",
+          tao_base_experiment_id: "base-super",
+          tao_base_experiment_pull_status: "pull_complete",
+        },
+      ],
+    });
+    mockRunTrainingPreflight.mockResolvedValueOnce({
+      status: "failed",
+      checks: [
+        {
+          check_name: "training_mode_compatible",
+          passed: false,
+          message: "Cosmos 3 Super requires Full-weight training.",
+          model_config_id: "student-super",
+          provisioning_required: false,
+          remediation: "Choose Full-weight.",
+        },
+      ],
+      data_summary: {
+        verified_training_count: 180,
+        test_pool_count: 120,
+        required_test_pool_count: 60,
+        auto_labeled_eligible_count: 0,
+        auto_labeled_included_count: 0,
+        excluded_test_pool_count: 120,
+        excluded_auto_labeled_count: 0,
+        usable_training_count: 180,
+      },
+      resolved_presets: {},
+    });
+
+    renderPage();
+    expect(
+      await screen.findByText("Student Training: ready to configure"),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("readiness-capability")).toHaveTextContent(
+      "Select a compatible model and training method",
+    );
+    expect(screen.queryByTestId("tao-action-request")).not.toBeInTheDocument();
+    expect(screen.getByTestId("train-a-student")).not.toBeDisabled();
+  });
+
+  it("generates, copies, and audits the TAO setup request exactly once", async () => {
+    mockFetchGate.mockResolvedValue({
+      gate_status: "ready",
+      criteria: [],
+      evaluated_at: "2026-04-16T00:00:00Z",
+    });
+    mockListStudentBases.mockResolvedValueOnce({
+      items: [
+        {
+          model_config_id: "student-1",
+          tao_base_experiment_id: "base-1",
+          tao_base_experiment_pull_status: "pull_complete",
+        },
+      ],
+    });
+    mockRunTrainingPreflight.mockResolvedValueOnce({
+      status: "failed",
+      checks: [
+        {
+          check_name: "tao_reachable",
+          passed: false,
+          message: "TAO endpoint is not configured.",
+          model_config_id: null,
+          provisioning_required: false,
+          remediation: "Configure TAO and retry.",
+        },
+      ],
+      data_summary: {
+        verified_training_count: 3,
+        test_pool_count: 2,
+        required_test_pool_count: 2,
+        auto_labeled_eligible_count: 0,
+        auto_labeled_included_count: 0,
+        excluded_test_pool_count: 2,
+        excluded_auto_labeled_count: 0,
+        usable_training_count: 3,
+      },
+      resolved_presets: {},
+    });
+
+    renderPage();
+    fireEvent.click(await screen.findByTestId("request-tao-setup"));
+    const request = await screen.findByTestId("action-request-ready");
+    expect(request).toHaveTextContent("TAO Setup Request");
+    expect(mockGenerateActionRequest).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy to Clipboard" }));
+    await screen.findByRole("button", { name: "Copied" });
+    expect(writeTextMock).toHaveBeenCalledWith("TAO Setup Request\n...");
+    await waitFor(() =>
+      expect(mockLogActionRequestCopy).toHaveBeenCalledWith("pid-1", {
+        request_type: "tao_setup",
+        rendered_text: "TAO Setup Request\n...",
+      }),
+    );
+    expect(mockLogActionRequestCopy).toHaveBeenCalledTimes(1);
   });
 
   // ── Readiness cards ───────────────────────────────────────────────
@@ -325,6 +490,7 @@ describe("ScaleUpHubPage", () => {
       data_summary: {
         verified_training_count: 0,
         test_pool_count: 0,
+        required_test_pool_count: 1,
         auto_labeled_eligible_count: 0,
         auto_labeled_included_count: 0,
         excluded_test_pool_count: 0,
@@ -562,8 +728,41 @@ describe("ScaleUpHubPage", () => {
       criteria: [],
       evaluated_at: "2026-04-16T00:00:00Z",
     });
+    mockRunTrainingPreflight.mockResolvedValueOnce({
+      status: "failed",
+      checks: [
+        {
+          check_name: "verified_train_examples",
+          passed: false,
+          message: "No Verified training examples yet. Continue labeling.",
+          model_config_id: null,
+          provisioning_required: false,
+          remediation: null,
+        },
+        {
+          check_name: "min_test_pool_size",
+          passed: false,
+          message:
+            "Test Pool has 0 of 60 required held-out evaluation examples. Continue labeling to grow the pool.",
+          model_config_id: null,
+          provisioning_required: false,
+          remediation: null,
+        },
+      ],
+      data_summary: {
+        verified_training_count: 0,
+        test_pool_count: 0,
+        required_test_pool_count: 60,
+        auto_labeled_eligible_count: 0,
+        auto_labeled_included_count: 0,
+        excluded_test_pool_count: 0,
+        excluded_auto_labeled_count: 0,
+        usable_training_count: 0,
+      },
+      resolved_presets: {},
+    });
     renderPage();
-    await screen.findByText(/Student Training: no training data/);
+    await screen.findByText(/Student Training: more Verified data needed/);
     expect(
       screen.getByText(/No Verified training examples yet\. Continue labeling\./),
     ).toBeInTheDocument();

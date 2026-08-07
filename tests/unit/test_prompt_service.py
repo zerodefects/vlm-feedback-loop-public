@@ -15,11 +15,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from conftest import make_settings
 from support import fake_nim_success, fake_prepare_result
 from vlm_feedback_loop._defaults import DEFAULTS
 from vlm_feedback_loop.model_catalog_constants import (
     COSMOS_REASON2_8B,
-    MISTRAL_LARGE_3,
+    MISTRAL_MEDIUM_3_5,
     NEMOTRON_3_NANO_OMNI_REASONING,
 )
 
@@ -716,9 +717,10 @@ class TestInvokeTeacher:
     """AC: Full Teacher invocation pipeline with mocked NIM."""
 
     @pytest.mark.asyncio
-    async def test_success_basic_invocation(self):
+    async def test_success_basic_invocation(self, tmp_path):
         from vlm_feedback_loop.services.prompt_service import invoke_teacher
 
+        settings = make_settings(tmp_path / "workspace")
         prepare_mock = AsyncMock(return_value=fake_prepare_result(1))
         with (
             patch(
@@ -751,6 +753,7 @@ class TestInvokeTeacher:
                 labeling_presets=LABELING_PRESETS,
                 visual_budget_presets=VISUAL_BUDGET_PRESETS,
                 query_storage_ref="/fake/img1.jpg",
+                settings=settings,
             )
 
         assert result.invocation_status == "success"
@@ -760,14 +763,10 @@ class TestInvokeTeacher:
         assert result.structured_generation_attempted is True
         assert result.prompt_hash is not None
         assert len(result.prompt_hash) == 64
-        # Regression guard for the prepare_images signature: inline-only
-        # transport takes exactly the storage refs — no endpoint_mode/settings
-        # args (those belonged to the removed NVCF asset path). This keeps
-        # callers from re-introducing them.
         prepare_mock.assert_called_once()
-        args, _ = prepare_mock.call_args
+        args, kwargs = prepare_mock.call_args
         assert args[0] == ["/fake/img1.jpg"]
-        assert len(args) == 1, "prepare_images takes only storage_refs now"
+        assert kwargs["settings"] is settings
 
     @pytest.mark.asyncio
     async def test_unsupported_thinking_toggle_is_not_sent(self):
@@ -1393,7 +1392,7 @@ class TestInvokeTeacherInlineIclImageInjection:
                 guidance_fields=FIXTURE_FIELDS,
                 generation_order=FIXTURE_GENERATION_ORDER,
                 derived_json_schema=FIXTURE_DERIVED_JSON_SCHEMA,
-                model_name=MISTRAL_LARGE_3,
+                model_name=MISTRAL_MEDIUM_3_5,
                 model_config=_make_model_config(max_images_per_request=5),
                 endpoint_base_url="https://test.nvidia.com/v1",
                 auth_headers={"Authorization": "Bearer test"},

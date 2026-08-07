@@ -20,11 +20,19 @@ import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
 import { trainingKeys } from "@/api/query-keys";
 import { cancelTAOJob, getTAOJob } from "@/api/training";
 import { formatTimestamp } from "@/lib/format-date";
-import { runStatusRefetchInterval } from "@/lib/run-status-polling";
+import {
+  isTAOJobPollingSettled,
+  runStatusRefetchInterval,
+} from "@/lib/run-status-polling";
 import { formatDuration, formatEta } from "@/lib/training/formatters";
+import {
+  humanizeFailureReason,
+  humanizeHaltedReason,
+  splitClassifiedFailure,
+} from "@/lib/training/failure-display";
+import { isAutoSkippedReason } from "@/lib/training/statusDisplay";
 import { TrainingStatusBadge } from "@/components/training/TrainingStatusBadge";
 import {
-  TERMINAL_TAO_STATUSES,
   type TAOJob,
   type TAOJobAction,
   type TAOJobStatus,
@@ -37,6 +45,10 @@ interface JobCardProps {
   suiteJob: TrainingSuiteJob;
   /** Quantization scheme label for display when applicable. */
   quantizationScheme?: string | null;
+  waitingForArtifactFinalization?: boolean;
+  blockedByArtifactFailure?: boolean;
+  /** Open the project-scoped Student serving workflow after a local NIM failure. */
+  onOpenCompare?: () => void;
   "data-testid"?: string;
 }
 
@@ -63,58 +75,13 @@ function logsAction(logsRef: string | null | undefined): {
   return { kind: "copy", value: trimmed };
 }
 
-// Friendly display labels for the well-known TAO artifact keys. Names can
-// be arbitrary TAO file paths (e.g. evaluate_results.tar.gz), so unknown
-// keys pass through unchanged.
-const ARTIFACT_LABELS: Record<string, string> = {
-  best_model: "Best model",
-  latest_model: "Latest model",
-  training_config: "Training config",
-  metrics_ref: "Metrics",
-};
-
-function renderArtifacts(outputs: TAOJob["outputs"]) {
-  const rows: Array<{ key: string; label: string; value: string }> = [];
-  if (!outputs) return rows;
-  if (Array.isArray(outputs.artifacts)) {
-    for (const a of outputs.artifacts) {
-      const name = a.name ?? a.kind ?? "artifact";
-      const ref = a.artifact_ref ?? a.tao_file_path ?? a.uri ?? a.checksum ?? "(ref)";
-      rows.push({
-        key: name,
-        label: ARTIFACT_LABELS[name] ?? name,
-        value: String(ref),
-      });
-    }
-  }
-  if (outputs.metrics_ref) {
-    rows.push({
-      key: "metrics_ref",
-      label: ARTIFACT_LABELS.metrics_ref,
-      value: String(outputs.metrics_ref),
-    });
-  }
-  if (outputs.evaluation_source === "student_nim_local") {
-    rows.push({
-      key: "evaluation_source",
-      label: "Evaluation source",
-      value: "Merged checkpoint · local Student NIM",
-    });
-  }
-  if (outputs.evaluation_run_id) {
-    rows.push({
-      key: "evaluation_run_id",
-      label: "Evaluation run",
-      value: String(outputs.evaluation_run_id),
-    });
-  }
-  return rows;
-}
-
 export function JobCard({
   projectId,
   suiteJob,
   quantizationScheme = null,
+  waitingForArtifactFinalization = false,
+  blockedByArtifactFailure = false,
+  onOpenCompare,
   "data-testid": testid,
 }: JobCardProps) {
   const queryClient = useQueryClient();
@@ -128,7 +95,7 @@ export function JobCard({
     queryKey: trainingKeys.job(projectId, suiteJob.tao_job_id),
     queryFn: () => getTAOJob(projectId, suiteJob.tao_job_id),
     refetchInterval: runStatusRefetchInterval({
-      isSettled: (j: TAOJob | undefined) => !!j && TERMINAL_TAO_STATUSES.has(j.status),
+      isSettled: isTAOJobPollingSettled,
       activeMs: 3000,
     }),
   });
@@ -137,6 +104,16 @@ export function JobCard({
   // fall back to the suite snapshot. SSE/refetch keeps these in sync.
   const status: TAOJobStatus = job?.status ?? suiteJob.status;
   const chainHaltedReason = job?.chain_halted_reason ?? suiteJob.chain_halted_reason;
+  const outputsFetchStatus = job?.outputs_fetch_status ?? suiteJob.outputs_fetch_status;
+  const outputsFetchError =
+    job?.outputs_fetch_error_ref ?? suiteJob.outputs_fetch_error_ref;
+  const isFinalizing =
+    status === "succeeded" &&
+    (outputsFetchStatus === "pending" || outputsFetchStatus === "in_progress");
+  const artifactFetchFailed = status === "succeeded" && outputsFetchStatus === "failed";
+  const isStudentNimFailure =
+    status === "failed" && job?.training_backend === "student_nim_local";
+  const isAutoSkipped = status === "canceled" && isAutoSkippedReason(chainHaltedReason);
 
   const cancelMut = useMutation({
     mutationFn: () => cancelTAOJob(projectId, suiteJob.tao_job_id),
@@ -152,6 +129,7 @@ export function JobCard({
   const hasFooterActions =
     logs.kind !== "none" ||
     (status === "failed" && !chainHaltedReason) ||
+    artifactFetchFailed ||
     status === "paused";
 
   function handleCopyLogsRef() {
@@ -179,19 +157,27 @@ export function JobCard({
         <TrainingStatusBadge
           status={status}
           chainHaltedReason={chainHaltedReason}
+          outputsFetchStatus={outputsFetchStatus}
           data-testid={`training-job-status-${suiteJob.tao_job_id}`}
         />
       </div>
 
       {/* Status-specific content ---------------------------------------- */}
       {status === "running" && <RunningBody job={job} />}
-      {status === "succeeded" && <CompletedBody job={job} />}
+      {status === "succeeded" && isFinalizing && <FinalizingArtifactsBody />}
+      {status === "succeeded" && artifactFetchFailed && (
+        <ArtifactFetchFailedBody error={outputsFetchError} />
+      )}
+      {status === "succeeded" && !isFinalizing && !artifactFetchFailed && (
+        <CompletedBody job={job} />
+      )}
       {status === "failed" && !chainHaltedReason && <FailedBody job={job} />}
       {status === "failed" && chainHaltedReason && (
         <HaltedBody reason={chainHaltedReason} />
       )}
       {status === "paused" && <PausedBody job={job} />}
-      {status === "canceled" && <CanceledBody job={job} />}
+      {isAutoSkipped && <AutoSkippedBody />}
+      {status === "canceled" && !isAutoSkipped && <CanceledBody job={job} />}
       {status === "deleted" && (
         <Text kind="body/regular/xs" style={{ color: "var(--text-muted)" }}>
           Job removed from TAO. Record preserved locally for audit.
@@ -200,7 +186,13 @@ export function JobCard({
       {(status === "not_started" ||
         status === "submitting" ||
         status === "submitted" ||
-        status === "queued") && <QueuedBody status={status} />}
+        status === "queued") && (
+        <QueuedBody
+          status={status}
+          waitingForArtifactFinalization={waitingForArtifactFinalization}
+          blockedByArtifactFailure={blockedByArtifactFailure}
+        />
+      )}
 
       {/* Footer actions row — do not reserve space when no action exists. */}
       {hasFooterActions && (
@@ -231,7 +223,20 @@ export function JobCard({
               </Button>
             </Tooltip>
           )}
-          {status === "failed" && !chainHaltedReason && (
+          {status === "failed" &&
+            !chainHaltedReason &&
+            isStudentNimFailure &&
+            onOpenCompare && (
+              <Button
+                kind="secondary"
+                onClick={onOpenCompare}
+                data-testid="training-job-open-compare"
+              >
+                Open Compare &amp; Benchmark
+              </Button>
+            )}
+          {((status === "failed" && !chainHaltedReason && !isStudentNimFailure) ||
+            artifactFetchFailed) && (
             <Button
               kind="secondary"
               onClick={() => setShowReportIssue((v) => !v)}
@@ -264,7 +269,7 @@ export function JobCard({
         </Text>
       )}
 
-      {showReportIssue && (
+      {showReportIssue && !isStudentNimFailure && (
         <div className="glass-inner-panel rounded-[14px] p-3">
           <ActionRequestPanel
             projectId={projectId}
@@ -317,10 +322,22 @@ function MetricsGrid({
   );
 }
 
-function QueuedBody({ status }: { status: TAOJobStatus }) {
+function QueuedBody({
+  status,
+  waitingForArtifactFinalization,
+  blockedByArtifactFailure,
+}: {
+  status: TAOJobStatus;
+  waitingForArtifactFinalization: boolean;
+  blockedByArtifactFailure: boolean;
+}) {
   const msg =
     status === "not_started"
-      ? "Waiting for a predecessor to complete."
+      ? blockedByArtifactFailure
+        ? "Blocked because the previous job's artifacts could not be processed."
+        : waitingForArtifactFinalization
+          ? "Waiting for the previous job's artifacts to finish processing."
+          : "Waiting for a predecessor to complete."
       : status === "submitting"
         ? "Sending to TAO..."
         : "Waiting for TAO to start...";
@@ -330,6 +347,36 @@ function QueuedBody({ status }: { status: TAOJobStatus }) {
       <Text kind="body/regular/sm" style={{ color: "var(--text-muted)" }}>
         {msg}
       </Text>
+    </div>
+  );
+}
+
+function FinalizingArtifactsBody() {
+  return (
+    <div
+      className="flex items-center gap-2"
+      data-testid="training-job-finalizing-artifacts"
+    >
+      <MiniSpinner />
+      <Text kind="body/regular/sm" style={{ color: "var(--text-muted)" }}>
+        TAO completed. The Blueprint is retrieving and processing artifacts before the
+        next job can start.
+      </Text>
+    </div>
+  );
+}
+
+function ArtifactFetchFailedBody({ error }: { error: string | null }) {
+  return (
+    <div className="flex flex-col gap-1" data-testid="training-job-artifact-failed">
+      <Text kind="body/regular/sm" className="text-error">
+        TAO completed, but the Blueprint could not retrieve or process its artifacts.
+      </Text>
+      {error && (
+        <Text kind="body/regular/xs" className="opacity-80">
+          {humanizeFailureReason(error)}
+        </Text>
+      )}
     </div>
   );
 }
@@ -378,9 +425,10 @@ function CompletedBody({ job }: { job: TAOJob | undefined }) {
   const completed = formatTimestamp(job?.completed_at);
   const duration = formatDuration(job?.started_at, job?.completed_at);
   const metrics = job?.progress?.metrics_latest ?? null;
-  const artifacts = renderArtifacts(job?.outputs ?? null);
   const hasMetrics = !!metrics && Object.keys(metrics).length > 0;
-  if (!completed && !duration && !hasMetrics && artifacts.length === 0) return null;
+  const localNimEvaluation = job?.outputs?.evaluation_source === "student_nim_local";
+  const evaluationRunId = job?.outputs?.evaluation_run_id;
+  if (!completed && !duration && !hasMetrics && !localNimEvaluation) return null;
 
   return (
     <div className="flex flex-col gap-2">
@@ -398,63 +446,21 @@ function CompletedBody({ job }: { job: TAOJob | undefined }) {
         metrics={metrics}
         testId="training-job-completed-metrics"
       />
-      {artifacts.length > 0 && (
-        <div className="flex flex-col gap-0.5" data-testid="training-job-outputs">
+      {localNimEvaluation && (
+        <div className="flex flex-col gap-0.5" data-testid="training-job-result">
           <Text kind="label/bold/xs" style={{ color: "var(--text-muted)" }}>
-            Outputs
+            Result
           </Text>
-          {artifacts.map((a) => (
-            <div key={a.key} className="flex items-baseline gap-2">
-              <Text kind="body/regular/xs" style={{ color: "var(--text-muted)" }}>
-                {a.label}
-              </Text>
-              <Text kind="body/regular/xs">{a.value}</Text>
-            </div>
-          ))}
+          <Text kind="body/regular/xs">Local Student NIM evaluation</Text>
+          {typeof evaluationRunId === "string" && evaluationRunId && (
+            <Text kind="body/regular/xs" style={{ color: "var(--text-muted)" }}>
+              Evaluation run: {evaluationRunId}
+            </Text>
+          )}
         </div>
       )}
     </div>
   );
-}
-
-/**
- * Split a classified TAO failure message into its raw provider message
- * and the friendly remediation hint.
- *
- * ``tao_job_service.classify_tao_failure`` formats actionable failures
- * as ``"<raw provider message> — <friendly hint with next step>"``. The
- * em-dash separator is the canonical delimiter; when it's missing (the
- * failure didn't match a known pattern) we treat the whole string as
- * the raw message and emit no hint. Plain ``null`` falls back to a
- * generic placeholder.
- */
-export function splitClassifiedFailure(err: string | null | undefined): {
-  primary: string;
-  hint: string | null;
-} {
-  if (!err) return { primary: "TAO job failed.", hint: null };
-  const sepIdx = err.indexOf(" — ");
-  if (sepIdx < 0) return { primary: err, hint: null };
-  return { primary: err.slice(0, sepIdx), hint: err.slice(sepIdx + 3) };
-}
-
-// Friendly display labels for the well-known bare-token error_refs (same
-// pattern as ARTIFACT_LABELS). Unmatched bare tokens fall back to
-// underscore→space + sentence case so no raw snake_case reaches the SME;
-// full-sentence provider messages pass through untouched.
-const FAILURE_REASON_LABELS: Record<string, string> = {
-  submission_interrupted:
-    "Submission interrupted — the backend restarted before TAO confirmed this job.",
-};
-
-export function humanizeFailureReason(reason: string): string {
-  const mapped = FAILURE_REASON_LABELS[reason];
-  if (mapped) return mapped;
-  if (/^[a-z0-9]+(?:_[a-z0-9]+)+$/.test(reason)) {
-    const spaced = reason.replace(/_/g, " ");
-    return spaced.charAt(0).toUpperCase() + spaced.slice(1);
-  }
-  return reason;
 }
 
 function FailedBody({ job }: { job: TAOJob | undefined }) {
@@ -500,7 +506,20 @@ function HaltedBody({ reason }: { reason: string }) {
       style={{ color: "var(--warning-amber, #f59e0b)" }}
       data-testid="training-job-halted-body"
     >
-      {reason.startsWith("Chain halted") ? reason : `Chain halted: ${reason}`}
+      {humanizeHaltedReason(reason)}
+    </Text>
+  );
+}
+
+function AutoSkippedBody() {
+  return (
+    <Text
+      kind="body/regular/sm"
+      style={{ color: "var(--text-secondary)" }}
+      data-testid="training-job-not-required-body"
+    >
+      TAO evaluation was intentionally not run. Continue in Compare &amp; Benchmark for
+      local Student NIM quality and serving validation.
     </Text>
   );
 }

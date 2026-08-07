@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from vlm_feedback_loop.services.background import BackgroundTaskManager, run_in_thread
 from vlm_feedback_loop.services.locks import (
     acquire_project_lock,
-    clear_lock_state,
+    release_all_locks,
 )
 from vlm_feedback_loop.services.priority import ForegroundPriorityDispatch
 from vlm_feedback_loop.services.sse import SSEManager
@@ -599,14 +599,14 @@ class TestForegroundPriority:
 
         with contextlib.suppress(RuntimeError):
             async with dispatch.foreground():
-                assert dispatch.foreground_active is True
+                assert not dispatch._bg_gate.is_set()
                 asyncio.create_task(bg_work())
                 await asyncio.sleep(0.05)
                 assert not bg_done.is_set()  # held while foreground active
                 raise RuntimeError("handler blew up")
 
         # Even though the handler raised, the gate must reopen.
-        assert dispatch.foreground_active is False
+        assert dispatch._bg_gate.is_set()
         await asyncio.sleep(0.05)
         assert bg_done.is_set()
 
@@ -626,7 +626,7 @@ class TestForegroundPriority:
         seen: list[bool] = []
 
         async def _fake_create_proposal(*args, **kwargs):
-            seen.append(priority_dispatch.foreground_active)
+            seen.append(not priority_dispatch._bg_gate.is_set())
             return "not found: short-circuit after recording"
 
         monkeypatch.setattr(proposals_router, "create_proposal", _fake_create_proposal)
@@ -639,7 +639,7 @@ class TestForegroundPriority:
 
         assert seen == [True], "router must be foreground-active during the call"
         # And the gate is reopened afterward.
-        assert priority_dispatch.foreground_active is False
+        assert priority_dispatch._bg_gate.is_set()
 
 
 # ── CPU Thread Pool ──────────────────────────────────────────────────────────
@@ -690,7 +690,7 @@ class TestSingleProcessLock:
             fcntl.flock(f2.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         f2.close()
 
-        clear_lock_state()
+        release_all_locks()
 
     def test_project_locked_error_message(self, tmp_project_dir):
         """A lock held by ANOTHER process raises ProjectLockedError with
@@ -727,13 +727,13 @@ class TestSingleProcessLock:
         finally:
             holder.kill()
             holder.wait()
-        clear_lock_state()
+        release_all_locks()
 
     def test_same_process_reacquire_is_idempotent(self, tmp_project_dir):
         fd1 = acquire_project_lock(tmp_project_dir)
         fd2 = acquire_project_lock(tmp_project_dir)
         assert fd1 == fd2
-        clear_lock_state()
+        release_all_locks()
 
     def test_no_override_parameter(self):
         """No override/force path exists."""

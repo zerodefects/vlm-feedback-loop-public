@@ -26,8 +26,12 @@ import logging
 import math
 from typing import TYPE_CHECKING, Any
 
+from vlm_feedback_loop.services.authorized_file import open_authorized_image
+
 if TYPE_CHECKING:
     from PIL.Image import Image
+
+    from vlm_feedback_loop.config import Settings
 
 logger = logging.getLogger("vlm_feedback_loop.phash")
 
@@ -119,7 +123,7 @@ def compute_phash(img: Image) -> str:
     gray: Any = converted.resize((_N, _N), resample=3)  # 3 = LANCZOS
 
     # 2. Extract pixels as 32×32 float matrix
-    pixels_flat: list[Any] = list(gray.getdata())
+    pixels_flat: list[Any] = list(gray.get_flattened_data())
     pixels: list[list[float]] = [
         [float(pixels_flat[r * _N + c]) for c in range(_N)] for r in range(_N)
     ]
@@ -149,7 +153,10 @@ def compute_phash(img: Image) -> str:
     return f"{hash_int:016x}"
 
 
-def compute_phash_from_path(storage_ref: str) -> str | None:
+def compute_phash_from_path(
+    storage_ref: str,
+    settings: Settings | None = None,
+) -> str | None:
     """Compute pHash from a filesystem path.
 
     Returns ``None`` on any failure — pHash failure MUST NOT fail ingestion.
@@ -157,7 +164,16 @@ def compute_phash_from_path(storage_ref: str) -> str | None:
     try:
         from PIL import Image as PILImage
 
-        with PILImage.open(storage_ref) as img:
+        if settings is None:
+            from vlm_feedback_loop.config import get_settings
+
+            settings = get_settings()
+
+        with (
+            open_authorized_image(storage_ref, settings) as opened,
+            opened.open_binary() as stream,
+            PILImage.open(stream) as img,
+        ):
             return compute_phash(img)
     except Exception:
         logger.warning("pHash computation failed for %s", storage_ref, exc_info=True)

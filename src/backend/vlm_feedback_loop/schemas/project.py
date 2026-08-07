@@ -76,15 +76,6 @@ class ProjectUpdate(BaseModel):
     scaleup_accept_rate_window: int | None = Field(default=None, ge=0)
     scaleup_min_test_pool_size: int | None = Field(default=None, ge=0)
 
-    # FTU acknowledgment.
-    # Normally set by ``POST /v1/projects/{id}:mark_setup_completed`` —
-    # exposing the field here keeps ``ProjectUpdate`` (Pydantic
-    # ``extra="forbid"``) accepting it for completeness/audit replays.
-    # Direct PATCH bypasses the idempotency guard in
-    # ``project_service.mark_setup_completed``; prefer the dedicated
-    # endpoint in onboarding/edit-mode flows.
-    setup_completed_at: str | None = None
-
 
 # ── Response schemas ─────────────────────────────────────────────────────────
 

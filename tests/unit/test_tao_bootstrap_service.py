@@ -5,16 +5,24 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from sqlalchemy.orm import Session
 
 from conftest import make_settings
-from vlm_feedback_loop.db.engine import init_deployment_db, open_project_db
+from vlm_feedback_loop.db.engine import (
+    DatabaseMigrationError,
+    init_deployment_db,
+    open_project_db,
+)
 from vlm_feedback_loop.db.models.model_config import ModelConfig
+from vlm_feedback_loop.services import tao_bootstrap_service
 from vlm_feedback_loop.services.project_service import create_project
 from vlm_feedback_loop.services.tao_bootstrap_service import (
     iter_project_dirs,
     patch_model_configs_across_projects,
+    patch_model_pull_status_across_projects,
 )
 
 
@@ -27,7 +35,7 @@ def workspace(tmp_workspace):
 
 
 class TestIterProjectDirs:
-    """Yield every project dir that has a project.db; skip incomplete ones."""
+    """Yield active project dirs with a project.db."""
 
     def test_iter_project_dirs_yields_only_dirs_with_project_db(self, workspace):
         # No projects yet → empty.
@@ -44,6 +52,17 @@ class TestIterProjectDirs:
         result = list(iter_project_dirs(workspace))
         names = sorted(r.name for r in result)
         assert names == [p.project_id]
+
+    def test_iter_project_dirs_skips_archived_projects(self, workspace):
+        """Deployment-wide TAO work must not mutate paused project state."""
+        settings = make_settings(workspace)
+        active = create_project(name="Active", description=None, settings=settings)
+        archived = create_project(name="Archived", description=None, settings=settings)
+        (workspace / "projects" / archived.project_id / ".archived").touch()
+
+        assert [entry.name for entry in iter_project_dirs(workspace)] == [
+            active.project_id
+        ]
 
 
 class TestPatchModelConfigsAcrossProjects:
@@ -110,3 +129,83 @@ class TestPatchModelConfigsAcrossProjects:
             )
             assert row.tao_base_experiment_id == "uuid-stable"
             assert row.tao_base_experiment_pull_status == "pull_complete"
+
+    def test_incompatible_legacy_project_does_not_block_healthy_projects(
+        self, workspace, monkeypatch, caplog
+    ):
+        """Preserved pre-v1 data must not block deployment-wide TAO patching."""
+        settings = make_settings(workspace)
+        healthy = create_project(name="Healthy", description=None, settings=settings)
+        legacy_dir = workspace / "projects" / "legacy-pre-v1"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "project.db").touch()
+
+        real_open = tao_bootstrap_service.open_project_db
+
+        def open_with_legacy_failure(project_dir):
+            if project_dir == legacy_dir:
+                raise DatabaseMigrationError("unsupported pre-public revision '061'")
+            return real_open(project_dir)
+
+        monkeypatch.setattr(
+            tao_bootstrap_service, "open_project_db", open_with_legacy_failure
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger="vlm_feedback_loop.services.tao_bootstrap_service",
+        ):
+            patched = patch_model_configs_across_projects(
+                workspace,
+                base_experiment_map={"nvidia/cosmos-reason2-2b": "uuid-2b-from-tao"},
+            )
+
+        assert patched == [(workspace / "projects" / healthy.project_id, 1)]
+        warning = next(
+            record.getMessage()
+            for record in caplog.records
+            if "legacy-pre-v1" in record.getMessage()
+        )
+        assert "DatabaseMigrationError" in warning
+        assert "TAO base-experiment identity patch" in warning
+
+    def test_pull_status_patch_also_isolates_incompatible_project(
+        self, workspace, monkeypatch, caplog
+    ):
+        """A legacy sibling cannot block visible provisioning status updates."""
+        settings = make_settings(workspace)
+        healthy = create_project(name="Healthy", description=None, settings=settings)
+        legacy_dir = workspace / "projects" / "legacy-pre-v1"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "project.db").touch()
+
+        real_open = tao_bootstrap_service.open_project_db
+
+        def open_with_legacy_failure(project_dir):
+            if project_dir == legacy_dir:
+                raise DatabaseMigrationError("unsupported pre-public revision '061'")
+            return real_open(project_dir)
+
+        monkeypatch.setattr(
+            tao_bootstrap_service, "open_project_db", open_with_legacy_failure
+        )
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger="vlm_feedback_loop.services.tao_bootstrap_service",
+        ):
+            patched = patch_model_pull_status_across_projects(
+                workspace,
+                model_names=["nvidia/cosmos-reason2-2b"],
+                pull_status="pulling",
+                preserve_pull_complete=False,
+            )
+
+        assert patched == [(workspace / "projects" / healthy.project_id, 1)]
+        warning = next(
+            record.getMessage()
+            for record in caplog.records
+            if "legacy-pre-v1" in record.getMessage()
+        )
+        assert "DatabaseMigrationError" in warning
+        assert "TAO base-experiment pull-status patch" in warning

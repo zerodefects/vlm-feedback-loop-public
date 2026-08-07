@@ -20,6 +20,7 @@ import os
 import sys
 from pathlib import Path
 
+import httpx
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -151,6 +152,15 @@ async def test_full_pipeline_smoke_skips_cleanly_without_key(
     """
     if hosted_nim_available:
         pytest.skip("hosted NIM available; live success path covers this")
+    # The spawned backend must agree with the parent-process gate.  Without
+    # this assertion the fixture can silently fall through to the operator's
+    # canonical ~/.vlm_feedback_loop/.env and turn this negative-path test
+    # into a real hosted inference/embedding run.
+    async with httpx.AsyncClient(base_url="http://127.0.0.1:8000") as client:
+        environment = (await client.get("/v1/environment")).raise_for_status().json()
+    assert environment["nvidia_api_key_configured"] is False
+    assert environment["hosted_nim_available"] is False
+    assert environment["recommended_embedding_mode"] == "none"
     images = _resolve_image_paths(min_count=10)
     if not images:
         pytest.skip("no usable image directory")

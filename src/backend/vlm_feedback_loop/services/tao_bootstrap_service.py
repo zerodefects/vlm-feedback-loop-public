@@ -19,28 +19,57 @@ argparse code.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from vlm_feedback_loop.db.engine import open_project_db
 from vlm_feedback_loop.db.models.model_config import ModelConfig
-from vlm_feedback_loop.services.project_service import projects_root
+from vlm_feedback_loop.services.project_service import (
+    ARCHIVED_MARKER_NAME,
+    projects_root,
+)
+
+logger = logging.getLogger("vlm_feedback_loop.services.tao_bootstrap_service")
 
 
 def iter_project_dirs(workspace_root: Path) -> Iterator[Path]:
-    """Yield every ``{workspace_root}/projects/<uuid>`` directory.
+    """Yield every active ``{workspace_root}/projects/<uuid>`` directory.
 
     A directory is yielded only when ``project.db`` exists inside it,
-    so partial / aborted project creations are skipped.
+    so partial / aborted project creations are skipped. Archived projects
+    are paused product state: skip their marker before opening the database so
+    startup recovery and deployment-wide TAO patches cannot migrate or mutate
+    a project that the SME intentionally took out of service.
     """
     projects_dir = projects_root(workspace_root)
     if not projects_dir.exists():
         return
     for entry in sorted(projects_dir.iterdir()):
-        if entry.is_dir() and (entry / "project.db").exists():
+        if (
+            entry.is_dir()
+            and not (entry / ARCHIVED_MARKER_NAME).exists()
+            and (entry / "project.db").exists()
+        ):
             yield entry
+
+
+def _open_project_for_bulk_patch(project_dir: Path, *, operation: str) -> Engine | None:
+    """Open one project without letting an incompatible sibling stop a bulk patch."""
+    try:
+        return open_project_db(project_dir)
+    except Exception as exc:
+        logger.warning(
+            "Skipping project %s during %s: %s: %s",
+            project_dir.name,
+            operation,
+            type(exc).__name__,
+            exc,
+        )
+        return None
 
 
 def patch_model_configs_across_projects(
@@ -64,7 +93,11 @@ def patch_model_configs_across_projects(
     """
     results: list[tuple[Path, int]] = []
     for project_dir in iter_project_dirs(workspace_root):
-        engine = open_project_db(project_dir)
+        engine = _open_project_for_bulk_patch(
+            project_dir, operation="TAO base-experiment identity patch"
+        )
+        if engine is None:
+            continue
         patched = 0
         with Session(engine) as session:
             rows = (
@@ -102,7 +135,11 @@ def patch_model_pull_status_across_projects(
         return results
 
     for project_dir in iter_project_dirs(workspace_root):
-        engine = open_project_db(project_dir)
+        engine = _open_project_for_bulk_patch(
+            project_dir, operation="TAO base-experiment pull-status patch"
+        )
+        if engine is None:
+            continue
         patched = 0
         with Session(engine) as session:
             rows = (

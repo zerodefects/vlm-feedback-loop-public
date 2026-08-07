@@ -70,7 +70,10 @@ from vlm_feedback_loop.services.prompt_service import (
     ModelConfigInput,
     invoke_teacher,
 )
-from vlm_feedback_loop.services.run_config import snapshot_run_config
+from vlm_feedback_loop.services.run_config import (
+    create_runtime_config_snapshot,
+    snapshot_run_config,
+)
 from vlm_feedback_loop.services.run_queries import (
     find_run,
     list_runs_page,
@@ -83,10 +86,8 @@ from vlm_feedback_loop.services.teacher_rejection import (
     finalize_canceled,
     finalize_runtime_rejection,
     finalize_unhandled_exception,
+    mark_operation_ignored_if_canceling,
     record_runtime_rejections,
-)
-from vlm_feedback_loop.services.token_budget_service import (
-    token_budget_invoke_kwargs,
 )
 
 logger = logging.getLogger("vlm_feedback_loop.evaluation_service")
@@ -96,6 +97,12 @@ logger = logging.getLogger("vlm_feedback_loop.evaluation_service")
 # Per-run cancellation events.  Populated when a run enters ``running``,
 # cleared on terminal state.
 _cancel_events: dict[str, asyncio.Event] = {}
+
+# Auto-Evaluate may be considered by several short mutation paths (label save,
+# project settings, and Guidance edits). Serialize its read-trigger/start
+# sequence per project so two near-simultaneous mutations cannot create two
+# automatic runs from the same persisted trigger.
+_auto_start_locks: dict[str, asyncio.Lock] = {}
 
 # The per-run runtime-rejection registries and their record/finalize
 # lifecycle live in ``services.teacher_rejection`` — one implementation
@@ -118,6 +125,7 @@ class EvalExampleResult:
     schema_valid_core: bool
     field_matches: list[FieldMatchResult] | None
     exact_match_pass: bool | None
+    ignored_due_to_run_cancellation: bool = False
 
 
 def _resolve_eval_concurrency(
@@ -171,6 +179,7 @@ async def _invoke_for_evaluation(
     run_config: dict[str, Any],
     engine: Any,
     settings: Settings,
+    retry_of_inference_invocation_id: str | None = None,
 ) -> EvalExampleResult:
     """Invoke the Teacher for one pool example and score the result.
 
@@ -206,6 +215,7 @@ async def _invoke_for_evaluation(
     storage_ref = storage_refs.get(example_key)
 
     # ── 1. Persist pending OperationRecord BEFORE the NIM call ──────────
+    ignored_due_to_run_cancellation = False
     with Session(engine) as session:
         session.add(
             OperationRecord(
@@ -220,6 +230,7 @@ async def _invoke_for_evaluation(
                 invocation_status="pending",
                 label_tier="proposal",
                 evaluation_run_id=run_id,
+                retry_of_inference_invocation_id=retry_of_inference_invocation_id,
             )
         )
         session.commit()
@@ -264,6 +275,12 @@ async def _invoke_for_evaluation(
         guidance_fields=guidance_fields,
         generation_order=run_config["generation_order"],
         derived_json_schema=run_config["derived_json_schema"],
+        output_field_mode=run_config["inference_contract"].get(
+            "output_field_mode", "all"
+        ),
+        icl_field_mode=run_config["inference_contract"].get(
+            "icl_field_mode", "core_only"
+        ),
         model_name=model_name,
         model_config=mc_input,
         endpoint_base_url=run_config["endpoint_base_url"],
@@ -272,51 +289,16 @@ async def _invoke_for_evaluation(
         generation_preset_key=run_config["gen_preset_key"],
         thinking_on=run_config["thinking_on"],
         visual_budget_preset_key=run_config["vb_preset_key"],
-        **token_budget_invoke_kwargs(settings),
-        icl_max_examples=(
-            run_config.get("icl_max_examples") or settings.ICL_MAX_EXAMPLES
-        ),
-        # Uniformity rule for the adaptive-depth gates: with no per-run
-        # override these MUST be the deployment defaults the interactive loop
-        # and batch labeling pass (settings ICL_SIM_GAP / ICL_ABS_THRESHOLD),
-        # so a default eval measures the SAME ICL selection the loop runs
-        # with. Leaving them None turns similarity gating OFF (fixed-K
-        # attach-all), so the gate-certifying eval scores an ICL depth
-        # nothing in production runs — on a depth-sensitive teacher the
-        # divergence is catastrophic (measured: attach-all-46 scored 0.033 EM
-        # while the production loop ran ~0.8 on the same pool). Explicit None
-        # checks, not ``or``: 0.0 and -1.0 are valid overrides. To express
-        # ungated fixed-K diagnostically, pass icl_sim_gap=2.0 (cosine
-        # similarities span [-1, 1], so a 2.0 gap never stops).
-        icl_sim_gap=(
-            run_config["icl_sim_gap"]
-            if run_config.get("icl_sim_gap") is not None
-            else settings.ICL_SIM_GAP
-        ),
-        icl_abs_threshold=(
-            run_config["icl_abs_threshold"]
-            if run_config.get("icl_abs_threshold") is not None
-            else settings.ICL_ABS_THRESHOLD
-        ),
+        **run_config["invoke_settings"],
+        icl_max_examples=run_config["icl_max_examples"],
+        icl_sim_gap=run_config["icl_sim_gap"],
+        icl_abs_threshold=run_config["icl_abs_threshold"],
         scope_id=run_id,  # deterministic per-example seed
         deadline_s=float(settings.HTTP_DEADLINE_BACKGROUND_S),
         max_retries=settings.HTTP_MAX_RETRIES,
         query_storage_ref=storage_ref,
-    )
-
-    # ── 3b. Run-level runtime capability rejections ──────────────────────
-    # If this call hit a 4xx capability rejection, record it and signal the
-    # run's cancel event so sibling concurrent tasks break out. Phase G
-    # finalizes the run as ``failed`` with the capability-specific
-    # ``status_reason``. We still persist this invocation's OperationRecord
-    # for audit (continuing on through validation/write-artifact/update is
-    # cheap and leaves a breadcrumb).
-    record_runtime_rejections(
-        run_id,
-        teacher_result,
-        sgm_effective=run_config["sgm_effective"],
+        image_transport_max_longest_edge=run_config["image_transport_max_longest_edge"],
         settings=settings,
-        cancel_event=_cancel_events.get(run_id),
     )
 
     # ── 4. Validate the response against SchemaCore ──────────────────────
@@ -387,7 +369,23 @@ async def _invoke_for_evaluation(
                 visual_budget_fallback_used=False,
                 exact_match_pass=exact_match_pass,
             )
+            ignored_due_to_run_cancellation = mark_operation_ignored_if_canceling(
+                session, record, run_id
+            )
             session.commit()
+
+    # The outcome transaction orders the invocation against a durable user
+    # cancellation. Only authoritative outcomes may fail the whole run for a
+    # capability rejection; ignored audit outcomes leave cancellation in
+    # control of the terminal state.
+    if not ignored_due_to_run_cancellation:
+        record_runtime_rejections(
+            run_id,
+            teacher_result,
+            sgm_effective=run_config["sgm_effective"],
+            settings=settings,
+            cancel_event=_cancel_events.get(run_id),
+        )
 
     return EvalExampleResult(
         example_key=example_key,
@@ -397,6 +395,7 @@ async def _invoke_for_evaluation(
         schema_valid_core=validation_report.schema_valid_core,
         field_matches=field_matches,
         exact_match_pass=exact_match_pass,
+        ignored_due_to_run_cancellation=ignored_due_to_run_cancellation,
     )
 
 
@@ -485,6 +484,62 @@ async def start_evaluation_run(
                 return f"not found: ModelConfig {target_model_config_id}"
         elif not project.teacher_model_config_id:
             return "No Teacher model configured"
+        snap_model_config_id = target_model_config_id or project.teacher_model_config_id
+        assert snap_model_config_id is not None
+
+        snap_gen_preset = (
+            generation_preset_key or project.labeling_generation_preset_key
+        )
+        snap_vb_preset = visual_budget_preset_key or project.visual_budget_preset_key
+
+        # ── Validate request BEFORE any side effects ────────────────────
+        # The supersede step below sets an in-flight run's in-memory cancel
+        # event, which a DB rollback cannot undo. Reject an invalid request
+        # here so a bad preset key can never cancel a running evaluation
+        # without starting a replacement.
+        if snap_gen_preset not in settings.LABELING_PRESETS:
+            return (
+                f"invalid generation_preset_key {snap_gen_preset!r}: "
+                f"not in {sorted(settings.LABELING_PRESETS)}"
+            )
+        if snap_vb_preset not in settings.VISUAL_BUDGET_PRESETS:
+            return (
+                f"invalid visual_budget_preset_key {snap_vb_preset!r}: "
+                f"not in {sorted(settings.VISUAL_BUDGET_PRESETS)}"
+            )
+
+        contract_dict = dict(target_inference_contract or TEACHER_CONTRACT.model_dump())
+        contract_icl_max = contract_dict.get("icl_max_examples")
+        effective_icl_max = (
+            icl_max_examples
+            if icl_max_examples is not None
+            else (
+                contract_icl_max
+                if contract_icl_max is not None
+                else settings.ICL_MAX_EXAMPLES
+            )
+        )
+        contract_dict["icl_max_examples"] = effective_icl_max
+        effective_icl_sim_gap = (
+            icl_sim_gap if icl_sim_gap is not None else settings.ICL_SIM_GAP
+        )
+        effective_icl_abs_threshold = (
+            icl_abs_threshold
+            if icl_abs_threshold is not None
+            else settings.ICL_ABS_THRESHOLD
+        )
+        runtime_config_snapshot = create_runtime_config_snapshot(
+            session,
+            project_id,
+            snap_model_config_id,
+            settings=settings,
+            generation_preset_key=snap_gen_preset,
+            visual_budget_preset_key=snap_vb_preset,
+            icl_max_examples=effective_icl_max,
+            icl_candidate_limit=icl_candidate_limit,
+            icl_sim_gap=effective_icl_sim_gap,
+            icl_abs_threshold=effective_icl_abs_threshold,
+        )
 
         # ── Pool snapshot ───────────────────────────────────────────────
         pool = create_pool_snapshot(
@@ -499,28 +554,6 @@ async def start_evaluation_run(
         icl_count = count_icl_eligible_edits(
             session, project_id, project.active_guidance_id
         )
-
-        # ── Validate request BEFORE any side effects ────────────────────
-        # The supersede step below sets an in-flight run's in-memory cancel
-        # event, which a DB rollback cannot undo. Reject an invalid request
-        # here so a bad preset key can never cancel a running evaluation
-        # without starting a replacement.
-        if (
-            generation_preset_key is not None
-            and generation_preset_key not in settings.LABELING_PRESETS
-        ):
-            return (
-                f"invalid generation_preset_key {generation_preset_key!r}: "
-                f"not in {sorted(settings.LABELING_PRESETS)}"
-            )
-        if (
-            visual_budget_preset_key is not None
-            and visual_budget_preset_key not in settings.VISUAL_BUDGET_PRESETS
-        ):
-            return (
-                f"invalid visual_budget_preset_key {visual_budget_preset_key!r}: "
-                f"not in {sorted(settings.VISUAL_BUDGET_PRESETS)}"
-            )
 
         # ── Supersede any running gate-basis evaluation ─────────────────
         # Newest-config-wins (§7.1) exists so a gate-basis run can never
@@ -573,7 +606,6 @@ async def start_evaluation_run(
             thinking_mode = "on" if thinking_on else "off"
         else:
             thinking_mode = "on" if project.thinking_default_on else "off"
-        contract_dict = target_inference_contract or TEACHER_CONTRACT.model_dump()
 
         run_id = generate_uuid4()
         now = utc_now()
@@ -583,14 +615,6 @@ async def start_evaluation_run(
         pool_id = pool.pool_id
         pool_member_count = pool.member_count
         snap_guidance_id = project.active_guidance_id
-        snap_model_config_id = target_model_config_id or project.teacher_model_config_id
-        # Preset keys were validated before the supersede step above; a per-run
-        # override wins over the project default.
-        snap_gen_preset = (
-            generation_preset_key or project.labeling_generation_preset_key
-        )
-        snap_vb_preset = visual_budget_preset_key or project.visual_budget_preset_key
-
         run_record = RunRecord(
             run_id=run_id,
             project_id=project_id,
@@ -606,6 +630,7 @@ async def start_evaluation_run(
             visual_budget_preset_key=snap_vb_preset,
             structured_generation_mode_effective=effective_sgm,
             inference_contract=contract_dict,
+            runtime_config_snapshot=runtime_config_snapshot,
             icl_eligible_count_at_start=icl_count,
             examples_total=pool_member_count,
             # Evaluation provenance
@@ -628,11 +653,7 @@ async def start_evaluation_run(
             project_id,
             run_id,
             settings,
-            icl_max_examples=icl_max_examples,
-            icl_candidate_limit=icl_candidate_limit,
             eval_concurrency=eval_concurrency,
-            icl_sim_gap=icl_sim_gap,
-            icl_abs_threshold=icl_abs_threshold,
         ),
     )
 
@@ -665,9 +686,9 @@ def _persist_progress_counters(
     REST is authoritative: ``_run_to_dict`` derives ``progress.processed``
     from these RunRecord columns, so without mid-run writes every REST
     read (page load, SSE reconnect, polling scripts) reports 0 until the
-    run terminalizes. Phase G still recomputes the authoritative counts
-    from OperationRecords at finalization; retried examples simply
-    overwrite their bucket here because ``results`` is keyed by example.
+    run terminalizes. Phase G uses the same per-example result map at
+    finalization; retried examples simply overwrite their bucket here.
+    Outcomes classified as cancellation-ignored never enter this map.
     """
     succeeded = schema_invalid = timed_out = endpoint_err = 0
     for r in results.values():
@@ -703,21 +724,14 @@ async def _execute_evaluation(
     run_id: str,
     settings: Settings,
     *,
-    icl_max_examples: int | None = None,
-    icl_candidate_limit: int | None = None,
     eval_concurrency: int | None = None,
-    icl_sim_gap: float | None = None,
-    icl_abs_threshold: float | None = None,
 ) -> None:
     """Background coroutine that runs the evaluation pipeline.
 
-    Diagnostic kwargs (all runtime-only, not persisted; lost on backend
-    restart with ``backend_restart_interrupted``):
+    The semantic diagnostic controls are persisted in the run's runtime
+    snapshot. The sole runtime-only override is execution width; evaluation
+    runs fail rather than resume after a backend restart.
 
-    - ``icl_max_examples``: overrides ``settings.ICL_MAX_EXAMPLES``.
-    - ``icl_candidate_limit``: restricts the ICL candidate POOL to the first
-      N Edits in temporal (``labeled_at`` ascending) order before selection
-      runs — pool-growth simulation. None means the full pool.
     - ``eval_concurrency``: explicit override of the provider-aware
       ``EVAL_CONCURRENCY_HOSTED`` / ``EVAL_CONCURRENCY_SELF_HOSTED`` default.
       Hosted endpoints already default to 1 (under the shared per-account
@@ -828,15 +842,15 @@ async def _execute_evaluation(
             icl_mode = run.icl_mode or "enabled"
 
             run_config: dict[str, Any] = snapshot_run_config(
-                session, project_id, run, example_keys=member_keys
+                session,
+                project_id,
+                run,
+                example_keys=member_keys,
+                settings=settings,
             )
             run_config.update(
                 {
                     "icl_mode": icl_mode,
-                    "icl_max_examples": icl_max_examples,
-                    "icl_candidate_limit": icl_candidate_limit,
-                    "icl_sim_gap": icl_sim_gap,
-                    "icl_abs_threshold": icl_abs_threshold,
                     "ground_truth": ground_truth,
                 }
             )
@@ -886,6 +900,8 @@ async def _execute_evaluation(
                     engine=engine,
                     settings=settings,
                 )
+                if result.ignored_due_to_run_cancellation:
+                    return
                 results[example_key] = result
                 processed = len(results)
 
@@ -914,7 +930,11 @@ async def _execute_evaluation(
         # per-example ``endpoint_error`` outcome so the example is
         # retried sequentially in Phase C.
         for key, outcome in zip(member_keys, gathered, strict=True):
-            if isinstance(outcome, BaseException) and key not in results:
+            if (
+                isinstance(outcome, BaseException)
+                and key not in results
+                and not cancel_event.is_set()
+            ):
                 logger.error(
                     "Eval task raised unhandled %s for %s in run %s — "
                     "synthesizing endpoint_error so Phase C retries it",
@@ -939,6 +959,7 @@ async def _execute_evaluation(
         if await _maybe_finalize_runtime_rejection(engine, project_id, run_id):
             return
         if cancel_event.is_set():
+            _persist_progress_counters(engine, run_id, results)
             await _finalize_canceled(engine, project_id, run_id)
             return
 
@@ -946,7 +967,10 @@ async def _execute_evaluation(
         # ``rate_limited`` is the 429-exhausted variant of ``endpoint_error``;
         # both are retryable in Phase C (concurrency=1 mitigates rate-limit
         # pressure naturally compared to the concurrent burst).
-        async def _retry_invoke(key: str) -> EvalExampleResult:
+        async def _retry_invoke(
+            key: str,
+            retry_of_inference_invocation_id: str | None,
+        ) -> EvalExampleResult:
             """One sequential retry of an example, with the same protection as
             the Phase B ``gather`` inspection: a retry that raises generically
             MUST mark the example as persistently failed (so the run finalizes
@@ -961,6 +985,9 @@ async def _execute_evaluation(
                     run_config=run_config,
                     engine=engine,
                     settings=settings,
+                    retry_of_inference_invocation_id=(
+                        retry_of_inference_invocation_id or None
+                    ),
                 )
             except BaseException as exc:
                 logger.error(
@@ -989,7 +1016,13 @@ async def _execute_evaluation(
             if cancel_event.is_set():
                 break
             await priority_dispatch.wait_for_background()
-            results[key] = await _retry_invoke(key)
+            if cancel_event.is_set():
+                break
+            prior_invocation_id = results[key].invocation_id
+            retry_result = await _retry_invoke(key, prior_invocation_id)
+            if cancel_event.is_set() or retry_result.ignored_due_to_run_cancellation:
+                break
+            results[key] = retry_result
             _persist_progress_counters(engine, run_id, results)
             # A retry replaces an existing outcome; len(results) is the
             # number of examples with an outcome.
@@ -1036,16 +1069,30 @@ async def _execute_evaluation(
                 max_passes,
                 extra={"component": "evaluation_service", "project_id": project_id},
             )
-            await asyncio.sleep(backoff_s)
+            try:
+                await asyncio.wait_for(cancel_event.wait(), timeout=backoff_s)
+                break
+            except TimeoutError:
+                pass
             for key in still_rate_limited:
                 if cancel_event.is_set():
                     break
                 await priority_dispatch.wait_for_background()
-                results[key] = await _retry_invoke(key)
+                if cancel_event.is_set():
+                    break
+                prior_invocation_id = results[key].invocation_id
+                retry_result = await _retry_invoke(key, prior_invocation_id)
+                if (
+                    cancel_event.is_set()
+                    or retry_result.ignored_due_to_run_cancellation
+                ):
+                    break
+                results[key] = retry_result
 
         if await _maybe_finalize_runtime_rejection(engine, project_id, run_id):
             return
         if cancel_event.is_set():
+            _persist_progress_counters(engine, run_id, results)
             await _finalize_canceled(engine, project_id, run_id)
             return
 
@@ -1297,7 +1344,7 @@ async def _finalize_canceled(
     engine: Any,
     project_id: str,
     run_id: str,
-) -> None:
+) -> bool:
     """Transition a canceling run to canceled and emit SSE.
 
     Thin wrapper over ``teacher_rejection.finalize_canceled`` (the one
@@ -1305,15 +1352,14 @@ async def _finalize_canceled(
     evaluation-specific parameters bound, then pops this module's cancel-event
     registry, which the shared helper never touches.
     """
-    await finalize_canceled(
+    applied = await finalize_canceled(
         engine,
         project_id,
         run_id,
-        run_type="evaluation_run",
         event_name="evaluation_completed",
-        terminal_statuses=TERMINAL_STATUSES,
     )
     _cancel_events.pop(run_id, None)
+    return applied
 
 
 async def _maybe_finalize_runtime_rejection(
@@ -1618,6 +1664,90 @@ def compute_trigger_status(
         "icl_growth": icl_growth,
         "updated_at": utc_now(),
     }
+
+
+async def maybe_start_auto_evaluation(
+    project_id: str,
+    settings: Settings,
+) -> dict[str, Any] | str | None:
+    """Start one gate-basis evaluation when an enabled trigger is active.
+
+    This is the backend-authoritative bridge between the persisted
+    ``auto_evaluate_enabled`` setting and the three §7.1 trigger families.
+    Callers invoke it immediately after a mutation that can activate a
+    trigger. It creates only the durable queued RunRecord; inference remains
+    in the normal background task, so the originating SME mutation is never
+    blocked on a Teacher request.
+
+    An existing queued/running/canceling gate-basis run suppresses another
+    automatic start. Manual starts retain their documented newest-config-wins
+    behavior in ``start_evaluation_run``.
+    """
+    lock = _auto_start_locks.setdefault(project_id, asyncio.Lock())
+    async with lock:
+        trigger_status = compute_trigger_status(project_id, settings)
+        if isinstance(trigger_status, str):
+            return trigger_status
+        if not trigger_status["auto_evaluate_enabled"]:
+            return None
+
+        active_triggers = [
+            name
+            for name in (
+                "first_pool_threshold",
+                "configuration_change",
+                "icl_growth",
+            )
+            if trigger_status[name]["is_active"]
+        ]
+        if not active_triggers:
+            return None
+
+        engine = get_project_engine(project_id, settings.WORKSPACE_ROOT)
+        if engine is None:
+            return f"not found: Project {project_id}"
+        with Session(engine) as session:
+            project = session.query(Project).filter_by(project_id=project_id).one()
+            active_run = (
+                session.query(RunRecord)
+                .filter(
+                    RunRecord.project_id == project_id,
+                    RunRecord.run_type == "evaluation_run",
+                    RunRecord.student_model_config_id.is_(None),
+                    RunRecord.status.in_(["queued", "running", "canceling"]),
+                )
+                .order_by(RunRecord.created_at.desc())
+                .first()
+            )
+        # The same persisted trigger remains active until its run completes.
+        # Do not restart that run after every subsequent label save. A newly
+        # changed Teacher/Guidance/control snapshot is different:
+        # newest-config-wins requires the normal start path to supersede the
+        # stale queued/running run. A cancel already in progress is never
+        # duplicated.
+        if active_run is not None and (
+            active_run.status == "canceling"
+            or not detect_config_changes(project, active_run)
+        ):
+            return None
+
+        result = await start_evaluation_run(project_id, settings=settings)
+        if isinstance(result, str):
+            logger.warning(
+                "Auto-Evaluate could not start for project %s (%s): %s",
+                project_id,
+                ",".join(active_triggers),
+                result,
+            )
+            return result
+
+        logger.info(
+            "Auto-Evaluate queued run %s for project %s (%s)",
+            result["run_id"],
+            project_id,
+            ",".join(active_triggers),
+        )
+        return {**result, "auto_trigger_types": active_triggers}
 
 
 def detect_config_changes(
@@ -1990,6 +2120,8 @@ def compute_scaleup_gate(
                 "exact_match_rate",
                 0.0,
             )
+            evaluated_model = session.get(ModelConfig, last_eval.model_config_id)
+            changed_fields = detect_config_changes(project, last_eval)
             passed = overall_em >= em_threshold
             criteria.append(
                 {
@@ -2005,7 +2137,20 @@ def compute_scaleup_gate(
                             else "Continue labeling or refine Guidance."
                         )
                     ),
-                    "details": None,
+                    # The gate intentionally uses the most recent completed
+                    # Teacher evaluation even after project settings change.
+                    # Preserve that historical attribution so the UI never
+                    # presents this score as if the mutable current Teacher
+                    # produced it.
+                    "details": {
+                        "evaluation_run_id": last_eval.run_id,
+                        "evaluated_model_config_id": last_eval.model_config_id,
+                        "evaluated_model_name": (
+                            evaluated_model.model_name if evaluated_model else None
+                        ),
+                        "current_configuration_differs": bool(changed_fields),
+                        "changed_fields": changed_fields,
+                    },
                 }
             )
 

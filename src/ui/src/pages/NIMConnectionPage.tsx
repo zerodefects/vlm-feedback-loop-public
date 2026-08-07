@@ -15,22 +15,28 @@
 
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Button, Text } from "@kui/react";
+import { Button, Select, Spinner, Text } from "@kui/react";
 import { ArrowLeft, ArrowRight, Check, Copy, Terminal, X } from "lucide-react";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { markSetupCompleted } from "@/api/projects";
-import { testNgcCredential, testNvidiaCredential } from "@/api/nim";
+import {
+  configureSelfHostedEmbedding,
+  configureSelfHostedTeacher,
+  testNgcCredential,
+  testNvidiaCredential,
+} from "@/api/nim";
 import { setSecret, type SecretName } from "@/api/secrets";
+import { parseApiErrorDetail } from "@/api/client";
 import { fetchModelConfigs } from "@/api/model-configs";
-import { modelConfigKeys } from "@/api/query-keys";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { environmentKeys, modelConfigKeys, projectKeys } from "@/api/query-keys";
+import { useEnvironmentSetupContext } from "@/pages/setup-context";
 import { ServiceRow } from "@/components/ServiceRow";
 import { SegmentedControl } from "@/components/SegmentedControl";
 import { ConnectionTestPanel } from "@/components/ConnectionTestPanel";
 import { ActionRequestPanel } from "@/components/ActionRequestPanel";
-import { PreflightResultPanel } from "@/components/PreflightResultPanel";
+import { LocalEmbeddingDeploymentPanel } from "@/components/LocalEmbeddingDeploymentPanel";
 import { CredentialInput } from "@/components/CredentialInput";
 import { ApplyControls, type ApplyControlsValue } from "@/components/ApplyControls";
 import { LocalTeacherDeploymentPanel } from "@/components/LocalTeacherDeploymentPanel";
@@ -38,9 +44,15 @@ import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
 import { usePersistedKeyProbe } from "@/hooks/usePersistedKeyProbe";
 import { formatDetectedLine } from "@/lib/environment";
 import { localTeacherDisplayName } from "@/lib/model-display";
-import type { EnvironmentResponse, MissingPrerequisite } from "@/types/nim";
+import type {
+  ConnectionTestResponse,
+  EnvironmentResponse,
+  MissingPrerequisite,
+} from "@/types/nim";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+const HOSTED_TEACHER_ROSTER = "Mistral Medium, Step, and Nemotron";
 
 function getServiceDescription(
   mode: string,
@@ -51,13 +63,13 @@ function getServiceDescription(
   // get*, not just the technical mode name.
   if (mode === "hosted") {
     if (role === "teacher") {
-      return "Mistral Large 3, Qwen, Cosmos, Nemotron — top quality, no setup beyond a free API key";
+      return `${HOSTED_TEACHER_ROSTER} — top quality, no setup beyond a free API key`;
     }
     return "build.nvidia.com hosted embeddings — works on any machine";
   }
   if (mode === "local") {
     if (role === "embeddings") {
-      return "NeMo Retriever VL on your GPU — no rate limits, doesn't compete with the Teacher";
+      return "NeMo Retriever VL on your GPU — local, no rate limits · one NIM per GPU";
     }
     const recommendedName = env.recommended_local_teacher_model_name;
     const gpu = env.gpus[0];
@@ -67,8 +79,10 @@ function getServiceDescription(
     if (recommendedName) return localTeacherDisplayName(recommendedName);
     return gpu ? `On this machine · ${gpu.name}` : "On this machine";
   }
-  // The backend never returns "none" here (recommendations always pick
-  // hosted or local). Defensive fallback.
+  if (role === "embeddings") {
+    return "No embedding endpoint — image review remains diverse through pHash";
+  }
+  // Defensive fallback for an unavailable Teacher.
   return "No endpoint available";
 }
 
@@ -84,9 +98,16 @@ function getMinLocalTeacherGpuGb(
 
 type OverrideMode = "hosted" | "self_hosted" | "local";
 
+interface PendingSelfHostedTeacher {
+  baseUrl: string;
+  matchingModelConfigIds: string[];
+  selectedModelConfigId: string;
+}
+
 export function NIMConnectionPage() {
-  const { projectId, project, environment } = useSetupContext();
+  const { projectId, project, environment } = useEnvironmentSetupContext();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   // Project-scoped catalog lookup supplies the exact ModelConfig identities
   // for the local Teacher chooser. The environment API is deployment-scoped
@@ -105,6 +126,16 @@ export function NIMConnectionPage() {
     null,
   );
   const [showActionRequest, setShowActionRequest] = useState(false);
+  const [pendingSelfHostedTeacher, setPendingSelfHostedTeacher] =
+    useState<PendingSelfHostedTeacher | null>(null);
+  const [pendingSelfHostedEmbeddingUrl, setPendingSelfHostedEmbeddingUrl] = useState<
+    string | null
+  >(null);
+  const [selfHostedTeacherError, setSelfHostedTeacherError] = useState<string | null>(
+    null,
+  );
+  const [savePending, setSavePending] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   // Missing-prereqs → recommendation transition: SME can opt to bypass
   // the missing-prerequisites landing and go straight to hosted.
   const [bypassMissingPrereqs, setBypassMissingPrereqs] = useState(false);
@@ -146,6 +177,54 @@ export function NIMConnectionPage() {
   function handleNvidiaCredentialChange(): void {
     clearPendingCredential("NVIDIA_API_KEY");
   }
+
+  function handleSelfHostedTeacherTestSuccess(
+    result: ConnectionTestResponse,
+    _credential: string,
+    baseUrl?: string,
+  ): void {
+    const servedModels = new Set(result.models ?? []);
+    const matchingConfigs = modelConfigs.filter(
+      (config) =>
+        config.eligible_roles.includes("teacher") &&
+        config.supports_image_input &&
+        servedModels.has(config.model_name),
+    );
+    if (!baseUrl || matchingConfigs.length === 0) {
+      setPendingSelfHostedTeacher(null);
+      setSelfHostedTeacherError(
+        "Connected, but the endpoint did not report a vision Teacher in this project's model catalog.",
+      );
+      return;
+    }
+    const selected =
+      matchingConfigs.find(
+        (config) => config.model_config_id === project.teacher_model_config_id,
+      ) ?? matchingConfigs[0];
+    setSelfHostedTeacherError(null);
+    setPendingSelfHostedTeacher({
+      baseUrl,
+      matchingModelConfigIds: matchingConfigs.map((config) => config.model_config_id),
+      selectedModelConfigId: selected.model_config_id,
+    });
+  }
+
+  function clearSelfHostedTeacherTest(): void {
+    setPendingSelfHostedTeacher(null);
+    setSelfHostedTeacherError(null);
+  }
+
+  function handleSelfHostedEmbeddingTestSuccess(
+    _result: ConnectionTestResponse,
+    _credential: string,
+    baseUrl?: string,
+  ): void {
+    setPendingSelfHostedEmbeddingUrl(baseUrl ?? null);
+  }
+
+  function clearSelfHostedEmbeddingTest(): void {
+    setPendingSelfHostedEmbeddingUrl(null);
+  }
   const [applyValue, setApplyValue] = useState<ApplyControlsValue>({
     persist: false,
   });
@@ -153,7 +232,8 @@ export function NIMConnectionPage() {
   // mounts (parallel of the FTU setup-choice path). If the persisted key is
   // bad, surface it via a red banner at the top of the card so the SME
   // sees the diagnosis without first clicking through the override UI
-  // to discover it via PreflightResultPanel's container-pull check.
+  // to discover it only after a local deployment request reaches its
+  // container-pull check.
   const [persistedNgcRejected, setPersistedNgcRejected] = useState<string | null>(null);
   const [persistedNvidiaRejected, setPersistedNvidiaRejected] = useState<string | null>(
     null,
@@ -161,20 +241,42 @@ export function NIMConnectionPage() {
 
   const env = environment;
 
+  // Effective mode per service = user override (if expanded) else recommended.
+  // Derive this before the persisted-key probes: merely having an unused key
+  // configured must not cause an outbound credential check. Besides avoiding
+  // needless network traffic, that keeps a deliberately local-only workflow
+  // local when an old hosted key remains in the canonical environment.
+  const effectiveTeacherMode: string =
+    expandedService === "teacher" && teacherOverride
+      ? teacherOverride
+      : env.recommended_teacher_mode;
+  const effectiveEmbeddingsMode: string =
+    expandedService === "embeddings" && embeddingsOverride
+      ? embeddingsOverride
+      : env.recommended_embedding_mode;
+  const usesHostedService =
+    effectiveTeacherMode === "hosted" || effectiveEmbeddingsMode === "hosted";
+  const usesSystemManagedLocalService =
+    env.local_deploy_available &&
+    (effectiveTeacherMode === "local" || effectiveEmbeddingsMode === "local");
+
   // ── Proactive persisted-key probes ──────────────────────────────────
-  // Same hook as NIMNvidiaKeyPage's on-mount probes. Surfaces
-  // persisted-but-bad keys as a top-of-card banner so the SME can fix
-  // them in one place rather than discovering the failure mid-deploy.
+  // Same hook as NIMNvidiaKeyPage's on-mount probes, narrowed to credentials
+  // required by the currently effective configuration. Surfaces a relevant
+  // persisted-but-bad key before deployment without contacting an unused
+  // hosted or registry service.
   usePersistedKeyProbe({
+    enabled: usesSystemManagedLocalService,
     configured: env.ngc_api_key_configured,
-    probe: () => testNgcCredential(),
+    probe: (signal) => testNgcCredential(undefined, signal),
     fallbackError: "NGC key validation failed.",
     onRejected: setPersistedNgcRejected,
   });
 
   usePersistedKeyProbe({
+    enabled: usesHostedService,
     configured: env.nvidia_api_key_configured,
-    probe: () => testNvidiaCredential(),
+    probe: (signal) => testNvidiaCredential(undefined, signal),
     fallbackError: "NVIDIA key validation failed.",
     onRejected: setPersistedNvidiaRejected,
   });
@@ -202,6 +304,7 @@ export function NIMConnectionPage() {
     if (expandedService === "teacher") {
       setExpandedService(null);
       setTeacherOverride(null);
+      clearSelfHostedTeacherTest();
     } else {
       setExpandedService("teacher");
       setTeacherOverride(
@@ -212,10 +315,16 @@ export function NIMConnectionPage() {
     }
   }
 
+  function handleTeacherModeChange(mode: OverrideMode): void {
+    setTeacherOverride(mode);
+    if (mode !== "self_hosted") clearSelfHostedTeacherTest();
+  }
+
   function handleEmbeddingsConfigure() {
     if (expandedService === "embeddings") {
       setExpandedService(null);
       setEmbeddingsOverride(null);
+      clearSelfHostedEmbeddingTest();
     } else {
       setExpandedService("embeddings");
       setEmbeddingsOverride(
@@ -224,6 +333,11 @@ export function NIMConnectionPage() {
           : (env.recommended_embedding_mode as OverrideMode),
       );
     }
+  }
+
+  function handleEmbeddingsModeChange(mode: OverrideMode): void {
+    setEmbeddingsOverride(mode);
+    if (mode !== "self_hosted") clearSelfHostedEmbeddingTest();
   }
 
   // ── Derived helper lines (recommendation state) ──────────────────────
@@ -237,17 +351,6 @@ export function NIMConnectionPage() {
     env.local_deploy_available &&
     !anyTeacherModelFits &&
     minLocalTeacherGpuGb !== null;
-
-  // Effective mode per service = user override (if expanded) else recommended.
-  // Inline credential prompts reflect what the *effective* configuration needs.
-  const effectiveTeacherMode: string =
-    expandedService === "teacher" && teacherOverride
-      ? teacherOverride
-      : env.recommended_teacher_mode;
-  const effectiveEmbeddingsMode: string =
-    expandedService === "embeddings" && embeddingsOverride
-      ? embeddingsOverride
-      : env.recommended_embedding_mode;
 
   // An expanded override that itself renders the credential input suppresses
   // the inline prompt for that credential (the API Key lives inside the
@@ -282,7 +385,12 @@ export function NIMConnectionPage() {
       <div className="mx-auto w-full max-w-[1600px] flex flex-col gap-6">
         {/* Header */}
         <div>
-          <Text kind="title/xl" style={{ color: "var(--text-primary)" }}>
+          <Text
+            kind="title/xl"
+            role="heading"
+            aria-level={1}
+            style={{ color: "var(--text-primary)" }}
+          >
             NIM Configuration
           </Text>
           <Text
@@ -332,7 +440,7 @@ export function NIMConnectionPage() {
             tracked treatment reads too clinical for the SME-friendly
             intent of the recommendation state. */}
         {detectedLine && (
-          <span className="glass-caption">
+          <Text kind="label/semibold/xs" className="glass-caption">
             <Check
               size={12}
               style={{
@@ -343,7 +451,7 @@ export function NIMConnectionPage() {
               }}
             />
             Detected · {detectedLine}
-          </span>
+          </Text>
         )}
 
         {/* Service rows */}
@@ -364,7 +472,7 @@ export function NIMConnectionPage() {
               <div className="flex flex-col gap-4">
                 <ModeToggle
                   value={teacherOverride}
-                  onChange={setTeacherOverride}
+                  onChange={handleTeacherModeChange}
                   localAvailable={env.local_deploy_available}
                   idPrefix="teacher"
                 />
@@ -379,7 +487,54 @@ export function NIMConnectionPage() {
                 )}
                 {teacherOverride === "self_hosted" && (
                   <>
-                    <ConnectionTestPanel mode="self_hosted" apiKeyConfigured={false} />
+                    <ConnectionTestPanel
+                      mode="self_hosted"
+                      apiKeyConfigured={false}
+                      onTestSuccess={handleSelfHostedTeacherTestSuccess}
+                      onCredentialChange={clearSelfHostedTeacherTest}
+                    />
+                    {selfHostedTeacherError && (
+                      <Text kind="body/regular/sm" role="alert" className="text-error">
+                        {selfHostedTeacherError}
+                      </Text>
+                    )}
+                    {pendingSelfHostedTeacher && (
+                      <div className="flex max-w-4xl flex-col gap-2">
+                        <Text
+                          kind="label/bold/sm"
+                          style={{ color: "var(--text-primary)" }}
+                        >
+                          Teacher served by this endpoint
+                        </Text>
+                        <Select
+                          aria-label="Self-hosted Teacher model"
+                          items={pendingSelfHostedTeacher.matchingModelConfigIds.map(
+                            (modelConfigId) => {
+                              const config = modelConfigs.find(
+                                (item) => item.model_config_id === modelConfigId,
+                              );
+                              return {
+                                value: modelConfigId,
+                                children: config?.model_name ?? modelConfigId,
+                              };
+                            },
+                          )}
+                          value={pendingSelfHostedTeacher.selectedModelConfigId}
+                          onValueChange={(selectedModelConfigId) =>
+                            setPendingSelfHostedTeacher((current) =>
+                              current ? { ...current, selectedModelConfigId } : current,
+                            )
+                          }
+                        />
+                        <Text
+                          kind="body/regular/sm"
+                          style={{ color: "var(--text-secondary)" }}
+                        >
+                          Save verifies this exact model again, binds the endpoint, and
+                          refreshes its capability controls.
+                        </Text>
+                      </div>
+                    )}
                     <div className="glass-info flex max-w-4xl flex-wrap items-center justify-between gap-4 px-4 py-3">
                       <div className="flex flex-col gap-1">
                         <Text
@@ -440,7 +595,7 @@ export function NIMConnectionPage() {
               <div className="flex flex-col gap-4">
                 <ModeToggle
                   value={embeddingsOverride}
-                  onChange={setEmbeddingsOverride}
+                  onChange={handleEmbeddingsModeChange}
                   localAvailable={env.local_deploy_available}
                   idPrefix="embeddings"
                 />
@@ -453,12 +608,29 @@ export function NIMConnectionPage() {
                   />
                 )}
                 {embeddingsOverride === "self_hosted" && (
-                  <ConnectionTestPanel mode="self_hosted" apiKeyConfigured={false} />
+                  <>
+                    <ConnectionTestPanel
+                      mode="self_hosted"
+                      apiKeyConfigured={false}
+                      probeKind="embeddings"
+                      onTestSuccess={handleSelfHostedEmbeddingTestSuccess}
+                      onCredentialChange={clearSelfHostedEmbeddingTest}
+                    />
+                    {pendingSelfHostedEmbeddingUrl && (
+                      <Text
+                        kind="body/regular/sm"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        Save obtains another finite 2,048-dimensional embedding before
+                        switching all projects to this endpoint.
+                      </Text>
+                    )}
+                  </>
                 )}
                 {embeddingsOverride === "local" && (
-                  <PreflightResultPanel
+                  <LocalEmbeddingDeploymentPanel
                     projectId={projectId}
-                    role="embedding"
+                    environment={env}
                     onSwitchToHosted={() => setEmbeddingsOverride("hosted")}
                   />
                 )}
@@ -491,7 +663,7 @@ export function NIMConnectionPage() {
                 at the bottom of the panel below the NGC input. */}
             {showGpuInsufficientNote && minLocalTeacherGpuGb !== null && (
               <Text kind="body/regular/sm" style={{ color: "var(--text-muted)" }}>
-                Note: GPU insufficient for local Teacher (need &gt;
+                Note: GPU insufficient for local Teacher (need at least{" "}
                 {minLocalTeacherGpuGb} GB). Teacher will run via hosted NIM.
               </Text>
             )}
@@ -525,9 +697,9 @@ export function NIMConnectionPage() {
                     kind="body/regular/sm"
                     style={{ color: "var(--text-secondary)" }}
                   >
-                    Hosted models on build.nvidia.com give you instant access to Mistral
-                    Large 3, Qwen, Cosmos and Nemotron. No GPU needed for the Teacher
-                    itself. Takes 30 seconds to grab a key.
+                    Hosted models on build.nvidia.com give you instant access to{" "}
+                    {HOSTED_TEACHER_ROSTER}. No GPU needed for the Teacher itself. Takes
+                    30 seconds to grab a key.
                   </Text>
                 </div>
                 <CredentialInput
@@ -587,11 +759,13 @@ export function NIMConnectionPage() {
           />
         )}
 
-        {/* All-local rationale — all-local variant */}
+        {/* All-local rationale — each post-onboarding panel owns an explicit
+            deploy action. Save only applies newly tested credentials, so this
+            copy must not imply that navigation or Save starts containers. */}
         {effectiveTeacherMode === "local" && effectiveEmbeddingsMode === "local" && (
           <Text kind="body/regular/sm" style={{ color: "var(--text-muted)" }}>
-            Both deploy while you set up Guidance. First startup may take several
-            minutes while NIM builds runtime artifacts.
+            Deploy each local service from its configuration panel. First startup may
+            take several minutes while NIM builds runtime artifacts.
           </Text>
         )}
 
@@ -603,15 +777,29 @@ export function NIMConnectionPage() {
           <Button kind="secondary" onClick={() => navigate(`/projects/${projectId}`)}>
             <ArrowLeft size={14} /> Cancel
           </Button>
+          {saveError && (
+            <Text kind="body/regular/sm" role="alert" className="text-error">
+              {saveError}
+            </Text>
+          )}
           <Button
             kind="primary"
             className="nvidia-green-button"
-            // Always enabled even when no key was entered — the SME may
-            // have opened the screen just to verify config, then close
-            // it. The Save action is a no-op if no credential is
-            // pending.
+            // A self-hosted choice is not durable until the URL and exact
+            // catalog model have passed the connection test. Other modes may
+            // be saved with no new credential when the SME is only reviewing
+            // an already-configured deployment.
+            disabled={
+              savePending ||
+              (effectiveTeacherMode === "self_hosted" &&
+                pendingSelfHostedTeacher === null) ||
+              (effectiveEmbeddingsMode === "self_hosted" &&
+                pendingSelfHostedEmbeddingUrl === null)
+            }
             onClick={() => {
               void (async () => {
+                setSavePending(true);
+                setSaveError(null);
                 try {
                   // Apply EVERY just-tested key (NVIDIA and/or NGC). The
                   // backend installs each in the runtime-override layer
@@ -620,15 +808,28 @@ export function NIMConnectionPage() {
                   // whole map — not a single slot — is what stops the
                   // second-tested key from dropping the first.
                   for (const [name, value] of Object.entries(pendingCredentials)) {
-                    try {
-                      await setSecret({
-                        name: name as SecretName,
-                        value,
-                        persist: applyValue.persist,
-                      });
-                    } catch (err: unknown) {
-                      console.warn(`setSecret(${name}) on Save failed:`, err);
-                    }
+                    await setSecret({
+                      name: name as SecretName,
+                      value,
+                      persist: applyValue.persist,
+                    });
+                  }
+                  if (
+                    effectiveTeacherMode === "self_hosted" &&
+                    pendingSelfHostedTeacher
+                  ) {
+                    await configureSelfHostedTeacher(projectId, {
+                      base_url: pendingSelfHostedTeacher.baseUrl,
+                      model_config_id: pendingSelfHostedTeacher.selectedModelConfigId,
+                    });
+                  }
+                  if (
+                    effectiveEmbeddingsMode === "self_hosted" &&
+                    pendingSelfHostedEmbeddingUrl
+                  ) {
+                    await configureSelfHostedEmbedding({
+                      base_url: pendingSelfHostedEmbeddingUrl,
+                    });
                   }
                   // Re-stamp setup acknowledgment. Post-onboarding the
                   // field is already non-null, so this is a guaranteed
@@ -644,15 +845,40 @@ export function NIMConnectionPage() {
                   } catch (err: unknown) {
                     console.warn("markSetupCompleted on Save failed:", err);
                   }
-                } finally {
-                  // Return to the project — ProjectIndexRedirect routes
-                  // to labeling.
+                  await Promise.all([
+                    queryClient.invalidateQueries({
+                      queryKey: projectKeys.detail(projectId),
+                    }),
+                    queryClient.invalidateQueries({
+                      queryKey: modelConfigKeys.list(projectId),
+                    }),
+                    queryClient.invalidateQueries({
+                      queryKey: environmentKeys.assessment(),
+                    }),
+                  ]);
                   navigate(`/projects/${projectId}`);
+                } catch (err: unknown) {
+                  setSaveError(
+                    parseApiErrorDetail(err) ??
+                      (err instanceof Error
+                        ? err.message
+                        : "Failed to save NIM configuration."),
+                  );
+                } finally {
+                  setSavePending(false);
                 }
               })();
             }}
           >
-            Save <ArrowRight size={14} />
+            {savePending ? (
+              <>
+                <Spinner aria-label="Saving NIM configuration" /> Saving…
+              </>
+            ) : (
+              <>
+                Save <ArrowRight size={14} />
+              </>
+            )}
           </Button>
         </div>
       </div>
@@ -730,7 +956,12 @@ function MissingPrerequisitesView({
     <div className="flex flex-1 flex-col gap-6 p-6">
       <div className="mx-auto w-full max-w-[1600px] flex flex-col gap-6">
         <div>
-          <Text kind="title/xl" style={{ color: "var(--text-primary)" }}>
+          <Text
+            kind="title/xl"
+            role="heading"
+            aria-level={1}
+            style={{ color: "var(--text-primary)" }}
+          >
             NIM Configuration
           </Text>
           <Text
@@ -747,7 +978,9 @@ function MissingPrerequisitesView({
         </div>
 
         {detectedLine && (
-          <span className="glass-caption">Detected · {detectedLine}</span>
+          <Text kind="label/semibold/xs" className="glass-caption">
+            Detected · {detectedLine}
+          </Text>
         )}
 
         <div className="glass-inner-panel flex flex-col gap-4 rounded-[14px] px-4 py-4">
@@ -787,9 +1020,9 @@ function MissingPrerequisitesView({
               Run the setup script to install prerequisites:
             </Text>
             <div className="glass-terminal flex items-center justify-between gap-3 rounded-md px-3 py-2">
-              <code style={{ color: "var(--text-primary)", fontSize: 13 }}>
-                {setupCommand}
-              </code>
+              <Text kind="body/regular/sm" style={{ color: "var(--text-primary)" }}>
+                <code style={{ fontSize: 13 }}>{setupCommand}</code>
+              </Text>
               <Button kind="secondary" onClick={() => void copy(setupCommand)}>
                 {copied ? (
                   <>

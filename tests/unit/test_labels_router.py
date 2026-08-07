@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, patch
 # Service-level patch targets
 _LABEL_SVC = "vlm_feedback_loop.services.label_service"
 _RATIONALE_SVC = "vlm_feedback_loop.services.rationale_service"
+_EVALUATION_SVC = "vlm_feedback_loop.services.evaluation_service"
 
 PID = "proj-router-test"
 EK = "ex_000"
@@ -105,6 +106,26 @@ class TestSaveLabelEndpoint:
 
         assert resp.status_code == 200
         assert lock_seen
+
+    def test_successful_save_checks_backend_auto_evaluate_triggers(
+        self, test_app_client
+    ):
+        """The committed label/pool mutation drives backend Auto-Evaluate."""
+        with (
+            patch(f"{_LABEL_SVC}.save_label", return_value=self._SAMPLE_RESPONSE),
+            patch(
+                f"{_EVALUATION_SVC}.maybe_start_auto_evaluation",
+                new_callable=AsyncMock,
+            ) as maybe_start,
+        ):
+            resp = test_app_client.post(
+                f"/v1/projects/{PID}/labels",
+                json=self._SAMPLE_REQUEST,
+            )
+
+        assert resp.status_code == 200
+        maybe_start.assert_awaited_once()
+        assert maybe_start.await_args.args[0] == PID
 
     def test_save_invocation_not_found_returns_404(self, test_app_client):
         with patch(f"{_LABEL_SVC}.save_label") as mock:

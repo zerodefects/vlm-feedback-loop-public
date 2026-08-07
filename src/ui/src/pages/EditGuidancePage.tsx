@@ -14,7 +14,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button, Modal, Text } from "@kui/react";
 import { Info } from "lucide-react";
 
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useSetupContext } from "@/pages/setup-context";
 import { scrollToFirstError } from "@/lib/scroll-to-first-error";
 import type { EditPreviewResponse } from "@/types/guidance";
 import {
@@ -158,9 +158,21 @@ export function EditGuidancePage() {
   if (!guidanceId)
     return (
       <div className="flex flex-1 items-center justify-center">
-        <Text kind="body/regular/sm" style={{ color: "var(--text-muted)" }}>
-          No active guidance. Create one first.
-        </Text>
+        <div className="glass-card glass-card--elevated flex flex-col items-center gap-4 p-8 text-center">
+          <Text kind="title/sm" style={{ color: "var(--text-primary)" }}>
+            No active Guidance
+          </Text>
+          <Text kind="body/regular/sm" style={{ color: "var(--text-muted)" }}>
+            Create and activate Guidance before editing it.
+          </Text>
+          <Button
+            kind="primary"
+            className="nvidia-green-button"
+            onClick={() => navigate(`/projects/${projectId}/create-guidance`)}
+          >
+            Create Guidance
+          </Button>
+        </div>
       </div>
     );
   if (isLoading || !initialized)
@@ -219,7 +231,7 @@ export function EditGuidancePage() {
               if (!open) setConfirmDialog(null);
             }}
             dismissible
-            slotHeading={<span>Update schema and re-label?</span>}
+            slotHeading={<Text kind="title/sm">Update schema and re-label?</Text>}
             slotFooter={
               <div className="flex justify-end gap-3">
                 <Button kind="secondary" onClick={() => setConfirmDialog(null)}>
@@ -247,9 +259,13 @@ export function EditGuidancePage() {
                 style={{ color: "var(--text-secondary)", display: "block" }}
               >
                 {describeSemanticChanges(confirmDialog.changes) && (
-                  <span data-testid="confirm-change-description">
+                  <Text
+                    kind="body/regular/sm"
+                    style={{ color: "inherit" }}
+                    data-testid="confirm-change-description"
+                  >
                     {describeSemanticChanges(confirmDialog.changes)}{" "}
-                  </span>
+                  </Text>
                 )}
                 Your {confirmDialog.verified_count} labeled images will return to
                 Unlabeled for re-labeling under the new schema.
@@ -273,9 +289,21 @@ export function EditGuidancePage() {
                   What happens next:
                 </Text>
                 <ul className="mt-1 list-disc pl-5 space-y-1">
-                  <li>Your prior labels are preserved as read-only reference.</li>
-                  <li>The model re-proposes labels under the new schema.</li>
-                  <li>Prior edits are reviewed first to rebuild context quickly.</li>
+                  <li>
+                    <Text kind="body/regular/sm" style={{ color: "inherit" }}>
+                      Your prior labels are preserved as read-only reference.
+                    </Text>
+                  </li>
+                  <li>
+                    <Text kind="body/regular/sm" style={{ color: "inherit" }}>
+                      The model re-proposes labels under the new schema.
+                    </Text>
+                  </li>
+                  <li>
+                    <Text kind="body/regular/sm" style={{ color: "inherit" }}>
+                      Prior edits are reviewed first to rebuild context quickly.
+                    </Text>
+                  </li>
                 </ul>
               </div>
             </div>

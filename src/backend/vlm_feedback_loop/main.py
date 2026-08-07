@@ -9,21 +9,25 @@ import logging
 import os
 from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
+from typing import Any, cast
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
+from vlm_feedback_loop import __version__
 from vlm_feedback_loop.config import Settings, get_settings, init_settings
 from vlm_feedback_loop.db.base import utc_now
-from vlm_feedback_loop.db.engine import open_project_db
+from vlm_feedback_loop.db.engine import (
+    close_deployment_db_resources,
+    open_project_db,
+)
 from vlm_feedback_loop.db.models.run import ACTIVE_RUN_STATUSES, RunRecord
 from vlm_feedback_loop.services.background import background_manager
 from vlm_feedback_loop.services.locks import (
     ProjectLockedError,
     acquire_project_lock,
-    release_all_locks,
 )
 from vlm_feedback_loop.services.pagination import InvalidCursorError
 from vlm_feedback_loop.services.project_service import (
@@ -31,6 +35,7 @@ from vlm_feedback_loop.services.project_service import (
     NotArchivedError,
     ProjectArchivedError,
     ProjectBusyError,
+    close_project_resources,
     projects_root,
     set_project_engine,
 )
@@ -42,6 +47,53 @@ logger = logging.getLogger("vlm_feedback_loop.main")
 # ── Startup recovery ────────────────────────────────────────────────────────
 
 
+def _reconstruct_canceled_batch_counters(
+    session: Session,
+    run: RunRecord,
+    settings: Settings,
+) -> dict[str, int]:
+    """Count authoritative terminal items before finalizing restart cancel."""
+    from vlm_feedback_loop.services.batch_label_service import (
+        reconcile_batch_items,
+        summarize_batch_outcomes,
+    )
+    from vlm_feedback_loop.services.run_config import snapshot_run_config
+
+    if not isinstance(run.metrics, dict):
+        raise RuntimeError("missing batch input snapshot")
+    raw_input_keys = run.metrics.get("input_keys")
+    if not isinstance(raw_input_keys, list):
+        raise RuntimeError("invalid batch input snapshot")
+    untyped_input_keys = cast("list[Any]", raw_input_keys)
+    if not all(isinstance(key, str) for key in untyped_input_keys):
+        raise RuntimeError("invalid batch input snapshot")
+    input_keys = list(cast("list[str]", untyped_input_keys))
+    if len(input_keys) != len(set(input_keys)) or run.examples_total != len(input_keys):
+        raise RuntimeError("ambiguous batch input snapshot")
+    run_config = snapshot_run_config(
+        session,
+        run.project_id,
+        run,
+        example_keys=input_keys,
+        settings=settings,
+    )
+    outcomes = reconcile_batch_items(
+        session,
+        run.project_id,
+        run.run_id,
+        input_keys,
+        run_config=run_config,
+        mode="canceled_recovery",
+    )
+    counts = summarize_batch_outcomes(outcomes)
+    return {
+        "examples_succeeded": counts.succeeded,
+        "examples_schema_invalid": counts.schema_invalid,
+        "examples_timeout": counts.timeout,
+        "examples_endpoint_error": counts.endpoint_error,
+    }
+
+
 def _recover_interrupted_runs(settings: Settings) -> list[tuple[str, str]]:
     """Scan all project DBs for non-terminal runs and apply recovery.
 
@@ -51,11 +103,12 @@ def _recover_interrupted_runs(settings: Settings) -> list[tuple[str, str]]:
       then auto-resumed from the next unprocessed example.
       The (project_id, run_id) pairs to resume are returned so the async
       lifespan can dispatch the executor once the event loop is running.
-    - Batch runs in canceling → canceled (terminal). The in-memory cancel
-      event does not survive a restart, so a run left in canceling would
-      otherwise wedge forever and block project archive; the operator's cancel
-      intent is honored by finalizing it.
-    - Batch runs in paused → unchanged
+    - Batch runs in canceling with persisted cancel intent and coherent item
+      lineage → canceled with exact authoritative partial counters. Missing
+      intent or invalid lineage → failed. Every outcome prevents a restart
+      from leaving the run wedged in a non-terminal state.
+    - Batch runs in paused → unchanged after any legacy runtime snapshot is
+      materialized, so later catalog edits cannot alter an explicit Resume.
     """
     projects_dir = projects_root(settings.WORKSPACE_ROOT)
     resume_targets: list[tuple[str, str]] = []
@@ -87,7 +140,7 @@ def _recover_interrupted_runs(settings: Settings) -> list[tuple[str, str]]:
         with Session(engine) as session:
             non_terminal = (
                 session.query(RunRecord)
-                .filter(RunRecord.status.in_(ACTIVE_RUN_STATUSES))
+                .filter(RunRecord.status.in_(ACTIVE_RUN_STATUSES | {"paused"}))
                 .all()
             )
 
@@ -99,6 +152,29 @@ def _recover_interrupted_runs(settings: Settings) -> list[tuple[str, str]]:
                     run.completed_at = now
                     logger.info("Recovery: eval run %s → failed", run.run_id)
                 elif run.run_type == "batch_label_run":
+                    try:
+                        from vlm_feedback_loop.services.run_config import (
+                            ensure_runtime_config_snapshot,
+                        )
+
+                        with session.begin_nested():
+                            ensure_runtime_config_snapshot(
+                                session,
+                                run.project_id,
+                                run,
+                                settings,
+                            )
+                            session.flush()
+                    except Exception:
+                        run.status = "failed"
+                        run.status_reason = "batch_recovery_state_invalid"
+                        run.completed_at = now
+                        logger.exception(
+                            "Recovery: batch run %s has no recoverable runtime "
+                            "configuration",
+                            run.run_id,
+                        )
+                        continue
                     if run.status in ("queued", "running"):
                         run.status = "queued"
                         run.recovered_from_restart = True
@@ -112,12 +188,34 @@ def _recover_interrupted_runs(settings: Settings) -> list[tuple[str, str]]:
                             run.run_id,
                         )
                     elif run.status == "canceling":
-                        run.status = "canceled"
-                        run.status_reason = "canceled_on_restart"
+                        if run.cancel_requested_at:
+                            try:
+                                # Isolate malformed durable state to this run;
+                                # later recovery candidates must still start.
+                                with session.begin_nested():
+                                    counts = _reconstruct_canceled_batch_counters(
+                                        session, run, settings
+                                    )
+                            except Exception:
+                                run.status = "failed"
+                                run.status_reason = "batch_recovery_state_invalid"
+                                logger.exception(
+                                    "Recovery: batch run %s has invalid durable state",
+                                    run.run_id,
+                                )
+                            else:
+                                run.status = "canceled"
+                                run.status_reason = "canceled_on_restart"
+                                for field, value in counts.items():
+                                    setattr(run, field, value)
+                        else:
+                            run.status = "failed"
+                            run.status_reason = "backend_restart_interrupted"
                         run.completed_at = now
                         logger.info(
-                            "Recovery: batch run %s → canceled (was canceling)",
+                            "Recovery: batch run %s → %s (was canceling)",
                             run.run_id,
+                            run.status,
                         )
                     # paused stays paused — no action
 
@@ -131,8 +229,10 @@ def _recover_interrupted_runs(settings: Settings) -> list[tuple[str, str]]:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None]:  # noqa: ARG001 — FastAPI lifespan signature
-    """Application startup / shutdown lifecycle."""
+async def _application_lifespan(
+    app: FastAPI,  # noqa: ARG001 — FastAPI lifespan signature
+) -> AsyncGenerator[None]:
+    """Run startup and hold the application context until shutdown."""
     settings = get_settings()
 
     # Configure structured logging before any log output
@@ -282,19 +382,54 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:  # noqa: ARG001 — Fa
 
     yield
 
-    # Shutdown: cancel background tasks, close SSE, release locks
-    logger.info("VLM Feedback Loop backend shutting down")
-    await background_manager.cancel_all(grace_seconds=5.0)
-    await sse_manager.close_all()
-    release_all_locks()
-    logger.info("Shutdown complete")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    """Own teardown even when startup or an earlier cleanup step fails."""
+    primary_exception: BaseException | None = None
+    try:
+        async with _application_lifespan(app):
+            yield
+    except BaseException as exc:
+        primary_exception = exc
+        raise
+    finally:
+        # Cancel borrowers before disposing their process-scoped engines.
+        logger.info("VLM Feedback Loop backend shutting down")
+        cleanup_failure: BaseException | None = None
+        try:
+            await background_manager.cancel_all(grace_seconds=5.0)
+        except BaseException as exc:
+            cleanup_failure = exc
+            logger.exception("Background-task shutdown failed")
+        try:
+            await sse_manager.close_all()
+        except BaseException as exc:
+            cleanup_failure = cleanup_failure or exc
+            logger.exception("SSE shutdown failed")
+        try:
+            close_project_resources()
+        except BaseException as exc:
+            cleanup_failure = cleanup_failure or exc
+            logger.exception("Project-database shutdown failed")
+        try:
+            close_deployment_db_resources()
+        except BaseException as exc:
+            cleanup_failure = cleanup_failure or exc
+            logger.exception("Deployment-database shutdown failed")
+        logger.info("Shutdown complete")
+
+        # A cleanup failure should fail an otherwise clean shutdown, but it
+        # must never obscure the startup/request exception that caused teardown.
+        if primary_exception is None and cleanup_failure is not None:
+            raise cleanup_failure
 
 
 # ── Application ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Interactive VLM Feedback Loop",
-    version="0.1.0",
+    version=__version__,
     lifespan=lifespan,
 )
 
@@ -496,6 +631,11 @@ def run_server(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--env-file", default=None, help="Path to .env file")
     parser.add_argument("--host", default=None, help="Bind host")
     parser.add_argument("--port", type=int, default=None, help="Bind port")
+    parser.add_argument(
+        "--print-backend-url",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     cli_args = parser.parse_args(argv)
 
     if cli_args.host:
@@ -503,11 +643,24 @@ def run_server(argv: Sequence[str] | None = None) -> None:
 
     # Pre-load settings so fail-fast happens before Uvicorn starts.
     settings = init_settings(cli_env_file=cli_args.env_file)
+    port = cli_args.port if cli_args.port is not None else settings.BIND_PORT
+
+    if cli_args.print_backend_url:
+        # dev.sh asks the authoritative runner for the URL Vite should proxy.
+        # Wildcard binds are reachable locally through loopback; IPv6 literals
+        # need brackets when rendered as a URL.
+        proxy_host = settings.BIND_HOST
+        if proxy_host in {"0.0.0.0", "::"}:
+            proxy_host = "127.0.0.1"
+        elif ":" in proxy_host and not proxy_host.startswith("["):
+            proxy_host = f"[{proxy_host}]"
+        print(f"http://{proxy_host}:{port}")
+        return
 
     uvicorn.run(
         "vlm_feedback_loop.main:app",
         host=settings.BIND_HOST,
-        port=cli_args.port or settings.BIND_PORT,
+        port=port,
         reload=False,
     )
 

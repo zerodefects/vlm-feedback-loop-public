@@ -35,14 +35,25 @@ RUN pnpm run build
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2: runtime — nginx:alpine serving /app/dist
 # ─────────────────────────────────────────────────────────────────────────────
-FROM nginx:1.27-alpine AS runtime
+FROM nginx:1.30.4-alpine AS runtime
 
-# SPA fallback + long-cache for hashed asset bundles
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# SPA fallback + long-cache for hashed asset bundles.  The runtime binds the
+# unprivileged port 3000, so keep the nginx master and workers unprivileged as
+# well; only the immutable image build needs root ownership changes.
+COPY --chown=nginx:nginx nginx.conf /etc/nginx/conf.d/default.conf
 
 # Replace the default html root with the built Vite bundle
 RUN rm -rf /usr/share/nginx/html/*
-COPY --from=builder /app/dist /usr/share/nginx/html
+COPY --from=builder --chown=nginx:nginx /app/dist /usr/share/nginx/html
+
+# The stock nginx entrypoint and runtime create the PID and client-proxy temp
+# files in these locations.  Make only those runtime paths writable before
+# dropping privileges; the application bundle remains read-only at runtime.
+RUN mkdir -p /var/cache/nginx \
+    && chown -R nginx:nginx /var/cache/nginx /run \
+    && sed -i '/^user  nginx;$/d' /etc/nginx/nginx.conf
+
+USER nginx
 
 EXPOSE 3000
 

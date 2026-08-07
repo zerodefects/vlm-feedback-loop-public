@@ -173,10 +173,15 @@ describe("ProjectListPage", () => {
     // Counts render with the numeric value emphasized in a nested span, so
     // assert on the whole card's text rather than a single text node.
     const card = screen.getByText("Damage Inspection").closest('[role="button"]');
-    expect(card?.textContent).toMatch(/Verified: 142/);
-    expect(card?.textContent).toMatch(/Unlabeled: 358/);
-    expect(card?.textContent).toMatch(/Auto-Labeled: 580/);
-    expect(card?.textContent).toMatch(/Omitted: 12/);
+    expect(card?.textContent).toMatch(/Verified:\s142/);
+    expect(card?.textContent).toMatch(/Unlabeled:\s358/);
+    expect(card?.textContent).toContain("Auto-Labeled:\u00a0580");
+    expect(card?.textContent).toMatch(/Omitted:\s12/);
+    const metrics = card?.querySelectorAll(".project-count-metric") ?? [];
+    expect(metrics).toHaveLength(4);
+    for (const metric of metrics) {
+      expect(metric).toHaveClass("whitespace-nowrap");
+    }
   });
 
   // --- Null description ---
@@ -227,17 +232,16 @@ describe("ProjectListPage", () => {
     });
 
     const card = screen.getByText("Fresh Project").closest('[role="button"]');
-    expect(card?.textContent).toMatch(/Verified: 0/);
-    expect(card?.textContent).toMatch(/Unlabeled: 0/);
-    // Auto-Labeled and Omitted are hidden when zero. Only the
-    // Verified + Unlabeled baseline counts should render on a fresh
-    // project.
-    expect(screen.queryByText(/Auto-Labeled/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/Omitted/i)).not.toBeInTheDocument();
+    expect(card?.textContent).toMatch(/Verified:\s0/);
+    expect(card?.textContent).toMatch(/Unlabeled:\s0/);
+    // All four workflow tiers remain visible at zero so an SME can compare
+    // project cards without counts appearing and disappearing as state moves.
+    expect(card?.textContent).toContain("Auto-Labeled:\u00a00");
+    expect(card?.textContent).toMatch(/Omitted:\s0/);
+    expect(card?.querySelectorAll(".project-count-metric")).toHaveLength(4);
   });
 
-  // --- Auto-Labeled conditional rendering ---
-  // (zero → hidden is pinned by the zero-counts test above)
+  // --- Auto-Labeled rendering ---
 
   it("renders the Auto-Labeled segment when count is positive", async () => {
     mockFetchProjectList.mockResolvedValue({
@@ -259,7 +263,7 @@ describe("ProjectListPage", () => {
     });
 
     const card = screen.getByText("With AutoLabels").closest('[role="button"]');
-    expect(card?.textContent).toMatch(/Auto-Labeled: 42/);
+    expect(card?.textContent).toContain("Auto-Labeled:\u00a042");
   });
 
   // --- pending_relabel NOT displayed ---
@@ -317,6 +321,105 @@ describe("ProjectListPage", () => {
       expect(screen.queryByTestId("nv-modal-heading")).not.toBeInTheDocument();
     });
     expect(mockCreateProject).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["populated", [makeListItem({ project_id: "p5", name: "Existing" })]],
+    ["empty", []],
+  ])(
+    "returns keyboard focus to the Create Project trigger after dismissal in the %s state",
+    async (_state, items) => {
+      mockFetchProjectList.mockResolvedValue({ items, next_cursor: null });
+      const { Wrapper } = createWrapper();
+      const user = userEvent.setup();
+
+      render(<ProjectListPage />, { wrapper: Wrapper });
+
+      const trigger = await screen.findByRole("button", { name: /Create Project/i });
+      await user.click(trigger);
+      expect(await screen.findByRole("dialog")).toBeVisible();
+
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      await waitFor(() => expect(trigger).toHaveFocus());
+    },
+  );
+
+  it("shows the required-name error before attempting project creation", async () => {
+    mockFetchProjectList.mockResolvedValue({
+      items: [],
+      next_cursor: null,
+    });
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<ProjectListPage />, { wrapper: Wrapper });
+
+    await user.click(await screen.findByRole("button", { name: /Create Project/i }));
+    await user.click(
+      screen.getByRole("button", { name: "Create Project", exact: true }),
+    );
+
+    expect(screen.getByText("Project name is required.")).toBeVisible();
+    expect(mockCreateProject).not.toHaveBeenCalled();
+  });
+
+  it("shows a friendly backend detail without raw API framing", async () => {
+    mockFetchProjectList.mockResolvedValue({
+      items: [makeListItem({ project_id: "p5", name: "Existing" })],
+      next_cursor: null,
+    });
+    const { ApiError } = await import("@/api/client");
+    mockCreateProject.mockRejectedValue(
+      new ApiError(
+        422,
+        JSON.stringify({ detail: "A project with this name already exists." }),
+      ),
+    );
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<ProjectListPage />, { wrapper: Wrapper });
+    await screen.findByText("Existing");
+    await user.click(screen.getByRole("button", { name: /Create Project/i }));
+    await user.type(screen.getByRole("textbox", { name: "Name" }), "Existing");
+    await user.click(
+      screen.getByRole("button", { name: "Create Project", exact: true }),
+    );
+
+    const error = await screen.findByTestId("create-project-error");
+    expect(error).toHaveAttribute("role", "alert");
+    expect(error).toHaveTextContent("A project with this name already exists.");
+    expect(error).not.toHaveTextContent("API 422");
+    expect(error).not.toHaveTextContent('{"detail"');
+  });
+
+  it("blocks duplicate project creation while the first request is pending", async () => {
+    mockFetchProjectList.mockResolvedValue({
+      items: [makeListItem({ project_id: "p5", name: "Existing" })],
+      next_cursor: null,
+    });
+    mockCreateProject.mockReturnValue(new Promise(() => undefined));
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<ProjectListPage />, { wrapper: Wrapper });
+    await screen.findByText("Existing");
+    await user.click(screen.getByRole("button", { name: /Create Project/i }));
+    await user.type(screen.getByRole("textbox", { name: "Name" }), "Pending");
+    await user.click(
+      screen.getByRole("button", { name: "Create Project", exact: true }),
+    );
+
+    const pending = await screen.findByRole("button", { name: "Creating..." });
+    expect(pending).toBeDisabled();
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    expect(cancel).toBeDisabled();
+    expect(screen.getByTestId("nv-modal-heading")).toBeVisible();
+    await user.click(pending);
+    await user.click(cancel);
+    expect(screen.getByTestId("nv-modal-heading")).toBeVisible();
+    expect(mockCreateProject).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -408,7 +511,7 @@ describe("ProjectListPage", () => {
         next_cursor: null,
       });
       mockFetchProject.mockResolvedValueOnce({ project_id: "locked-1" });
-      const { Wrapper } = createWrapper();
+      const { Wrapper, queryClient } = createWrapper();
       const user = userEvent.setup();
 
       render(<ProjectListPage />, { wrapper: Wrapper });
@@ -423,37 +526,14 @@ describe("ProjectListPage", () => {
 
       await waitFor(() => {
         expect(mockNavigate).toHaveBeenCalledWith("/projects/locked-1");
+      });
+      expect(queryClient.getQueryData(["project", "locked-1"])).toEqual({
+        project_id: "locked-1",
       });
       // Lock dialog must NOT appear
       expect(
         screen.queryByText(/already open in another process/i),
       ).not.toBeInTheDocument();
-    });
-
-    it("persists lastActiveScreen in localStorage on successful open", async () => {
-      mockFetchProjectList.mockResolvedValue({
-        items: [lockedProject],
-        next_cursor: null,
-      });
-      mockFetchProject.mockResolvedValueOnce({ project_id: "locked-1" });
-      localStorage.removeItem("lastActiveScreen:locked-1");
-      const { Wrapper } = createWrapper();
-      const user = userEvent.setup();
-
-      render(<ProjectListPage />, { wrapper: Wrapper });
-      await waitFor(() => {
-        expect(screen.getByText("Locked Project")).toBeInTheDocument();
-      });
-      await user.click(
-        screen.getByRole("button", { name: /Open project Locked Project/i }),
-      );
-
-      await waitFor(() => {
-        expect(mockNavigate).toHaveBeenCalledWith("/projects/locked-1");
-      });
-      expect(localStorage.getItem("lastActiveScreen:locked-1")).toBe(
-        "/projects/locked-1",
-      );
     });
   });
 

@@ -740,7 +740,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.print_help()
         sys.exit(1)
 
-    args.func(args)
+    from vlm_feedback_loop.db.engine import close_deployment_db_resources
+
+    try:
+        args.func(args)
+    finally:
+        close_deployment_db_resources()
 
 
 if __name__ == "__main__":

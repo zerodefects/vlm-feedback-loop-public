@@ -23,13 +23,17 @@ const entries: BrowseEntry[] = [
   },
 ];
 
-function renderAt(currentPath: string, rootPath = "/", onNavigate = vi.fn()) {
+function renderAt(
+  currentPath: string,
+  rootPath = "/",
+  onNavigate = vi.fn(),
+  listedEntries = entries,
+) {
   render(
     <FileBrowser
-      entries={entries}
+      entries={listedEntries}
       rootPath={rootPath}
       currentPath={currentPath}
-      parentPath={currentPath === rootPath ? null : rootPath}
       selectedPaths={new Set()}
       onNavigate={onNavigate}
       onToggleSelect={vi.fn()}
@@ -76,5 +80,31 @@ describe("FileBrowser breadcrumb", () => {
 
     await user.click(screen.getByRole("button", { name: "images" }));
     expect(onNavigate).toHaveBeenCalledWith("/data/images");
+  });
+});
+
+describe("FileBrowser selection controls", () => {
+  it("names directory and file checkboxes for assistive technology", () => {
+    renderAt("/data/images", "/data/images", vi.fn(), [
+      {
+        name: "class-a",
+        path: "/data/images/class-a",
+        type: "directory",
+        size_bytes: 0,
+      },
+      {
+        name: "sample.png",
+        path: "/data/images/sample.png",
+        type: "file",
+        size_bytes: 1024,
+      },
+    ]);
+
+    expect(
+      screen.getByRole("checkbox", { name: "Select directory class-a" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", { name: "Select file sample.png" }),
+    ).toBeInTheDocument();
   });
 });

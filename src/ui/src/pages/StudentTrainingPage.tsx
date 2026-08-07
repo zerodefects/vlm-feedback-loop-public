@@ -30,12 +30,16 @@ import { PageContainer } from "@/components/common/PageContainer";
 import { SectionCard } from "@/components/common/SectionCard";
 import { SectionHeading } from "@/components/common/SectionHeading";
 import { SegmentedControl } from "@/components/SegmentedControl";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useSetupContext } from "@/pages/setup-context";
 import { BaseModelSelector } from "@/components/training/BaseModelSelector";
 import { QuantizationCheckboxes } from "@/components/training/QuantizationCheckboxes";
 import { TrainingAdvancedExpander } from "@/components/training/TrainingAdvancedExpander";
-import { formatModelDisplayName } from "@/lib/model-display";
+import { formatModelDisplayName, quantizationDisplayName } from "@/lib/model-display";
 import { hasReadyTaoBaseExperiment } from "@/lib/training/baseModelReadiness";
+import {
+  isTrainingConfigurationCheck,
+  isTrainingDataReadinessCheck,
+} from "@/lib/training/preflight";
 import { PRESET_HELP, PRESET_LABEL } from "@/lib/training/presetCopy";
 import type { QuantizationScheme, TrainingPreset } from "@/types/training";
 
@@ -43,6 +47,9 @@ const PRESETS: TrainingPreset[] = ["quick", "standard", "high_quality", "max_qua
 const VALIDATION_QUANTIZATION: QuantizationScheme[] = ["FP8_DYNAMIC"];
 const COMPARISON_QUANTIZATION: QuantizationScheme[] = ["FP8_DYNAMIC", "W4A16"];
 const RECOMMENDED_VERIFIED_IMAGES = 150;
+// Super's only qualified training path is Full-weight. Keep it out of the
+// LoRA-only UI until Full-weight is qualified across the supported matrix.
+const HIDDEN_TRAINING_BASE_MODELS = new Set(["nvidia/cosmos3-super-reasoner"]);
 
 type TrainingIntent = "validate" | "compare";
 
@@ -98,6 +105,7 @@ export function StudentTrainingPage() {
   const [intent, setIntent] = useState<TrainingIntent>("validate");
   const [selectedBaseIds, setSelectedBaseIds] = useState<string[] | null>(null);
   const [preset, setPreset] = useState<TrainingPreset>("quick");
+  const enableLora = true;
   const [includeAutoLabeled, setIncludeAutoLabeled] = useState(true);
   const [quantSchemes, setQuantSchemes] = useState<QuantizationScheme[]>(
     VALIDATION_QUANTIZATION,
@@ -114,11 +122,15 @@ export function StudentTrainingPage() {
 
   const baseModelOptions = useMemo<BaseModelOption[]>(
     () =>
-      (studentBases?.items ?? []).map((model) => ({
-        modelConfigId: model.model_config_id,
-        modelName: model.model_name,
-        provisioned: hasReadyTaoBaseExperiment(model),
-      })),
+      (studentBases?.items ?? [])
+        .filter(
+          (model) => !HIDDEN_TRAINING_BASE_MODELS.has(model.model_name.toLowerCase()),
+        )
+        .map((model) => ({
+          modelConfigId: model.model_config_id,
+          modelName: model.model_name,
+          provisioned: hasReadyTaoBaseExperiment(model),
+        })),
     [studentBases],
   );
 
@@ -147,9 +159,17 @@ export function StudentTrainingPage() {
       projectId,
       effectiveSelectedIds,
       includeAutoLabeled,
+      enableLora,
+      quantSchemes,
     ),
     queryFn: () =>
-      runTrainingPreflight(projectId, effectiveSelectedIds, includeAutoLabeled),
+      runTrainingPreflight(
+        projectId,
+        effectiveSelectedIds,
+        includeAutoLabeled,
+        enableLora,
+        quantSchemes,
+      ),
     enabled: effectiveSelectedIds.length > 0,
     retry: false,
   });
@@ -160,6 +180,7 @@ export function StudentTrainingPage() {
         student_base_model_config_ids: effectiveSelectedIds,
         training_preset: preset,
         include_auto_labeled: includeAutoLabeled,
+        enable_lora: enableLora,
         export_field_mode: "all",
         quantization_schemes: quantSchemes,
         idempotency_key: idempotencyKey,
@@ -168,15 +189,19 @@ export function StudentTrainingPage() {
       navigate(`../training/${suite.training_suite_id}`);
     },
     onError: (error) => {
+      setConfirmationOpen(false);
       setSubmitError(friendlySubmitError(error));
     },
   });
 
   const selectedModelDescriptors = useMemo(
     () =>
-      baseModelOptions.filter((model) =>
-        effectiveSelectedIds.includes(model.modelConfigId),
-      ),
+      effectiveSelectedIds.flatMap((modelConfigId) => {
+        const model = baseModelOptions.find(
+          (option) => option.modelConfigId === modelConfigId,
+        );
+        return model ? [model] : [];
+      }),
     [baseModelOptions, effectiveSelectedIds],
   );
 
@@ -186,13 +211,17 @@ export function StudentTrainingPage() {
   const excludedCount =
     (dataSummary?.excluded_test_pool_count ?? 0) +
     (dataSummary?.excluded_auto_labeled_count ?? 0);
+  const dataFailures =
+    preflight?.checks.filter(
+      (check) => !check.passed && isTrainingDataReadinessCheck(check.check_name),
+    ) ?? [];
   const taoFailures =
     preflight?.checks.filter(
-      (check) => !check.passed && check.check_name !== "verified_train_examples",
+      (check) =>
+        !check.passed &&
+        !isTrainingDataReadinessCheck(check.check_name) &&
+        !isTrainingConfigurationCheck(check.check_name),
     ) ?? [];
-  const dataFailure = preflight?.checks.find(
-    (check) => check.check_name === "verified_train_examples" && !check.passed,
-  );
   const workflowBusy = submitMutation.isPending;
   const canStart =
     effectiveSelectedIds.length > 0 &&
@@ -290,6 +319,7 @@ export function StudentTrainingPage() {
       <SectionCard>
         <SectionHeading>TRAINING INTENSITY</SectionHeading>
         <select
+          aria-label="Training intensity"
           className={`glass-input w-full max-w-md ${
             workflowBusy ? "cursor-not-allowed opacity-70" : ""
           }`}
@@ -318,6 +348,18 @@ export function StudentTrainingPage() {
         />
       </SectionCard>
 
+      <SectionCard data-testid="training-method-card">
+        <SectionHeading>TRAINING METHOD</SectionHeading>
+        <div className="flex flex-col gap-1">
+          <Text kind="label/bold/sm" data-testid="training-method-lora">
+            LoRA
+          </Text>
+          <Text kind="body/regular/sm" style={{ color: "var(--text-muted)" }}>
+            Parameter-efficient fine-tuning with a smaller training footprint.
+          </Text>
+        </div>
+      </SectionCard>
+
       <SectionCard data-testid="training-data-card">
         <SectionHeading>TRAINING DATA</SectionHeading>
         {preflightLoading && !dataSummary ? (
@@ -338,7 +380,9 @@ export function StudentTrainingPage() {
             <DataCountRow
               label="Test Pool"
               value={dataSummary?.test_pool_count ?? 0}
-              detail="Excluded from training · used only for evaluation"
+              detail={`Excluded from training · ${
+                dataSummary?.test_pool_count ?? 0
+              } of ${dataSummary?.required_test_pool_count ?? 1} required for evaluation`}
               testId="training-data-test-pool-count"
             />
             <div
@@ -391,16 +435,21 @@ export function StudentTrainingPage() {
             </div>
           </>
         )}
-        {dataFailure && (
+        {dataFailures.map((check) => (
           <Text
+            key={check.check_name}
             kind="body/regular/sm"
             className="block"
             style={{ color: "var(--warning-amber, #f59e0b)" }}
-            data-testid="no-verified-warning"
+            data-testid={
+              check.check_name === "verified_train_examples"
+                ? "no-verified-warning"
+                : "test-pool-minimum-warning"
+            }
           >
-            {dataFailure.message}
+            {check.message}
           </Text>
-        )}
+        ))}
         {dataSummary && totalVerified < RECOMMENDED_VERIFIED_IMAGES && (
           <div
             className="glass-inner-panel rounded-[14px] p-4 flex items-start gap-3"
@@ -420,7 +469,7 @@ export function StudentTrainingPage() {
         )}
       </SectionCard>
 
-      <SectionCard>
+      <SectionCard data-testid="training-quantization-card">
         <SectionHeading>QUANTIZATION</SectionHeading>
         <Text
           kind="body/regular/sm"
@@ -580,7 +629,6 @@ export function StudentTrainingPage() {
               kind="primary"
               className="nvidia-green-button"
               onClick={() => {
-                setConfirmationOpen(false);
                 submitMutation.mutate();
               }}
               disabled={workflowBusy}
@@ -606,10 +654,13 @@ export function StudentTrainingPage() {
             label="Preset"
             value={`${PRESET_LABEL[preset]} (resolved per selected model)`}
           />
+          <ConfirmationRow label="Method" value="LoRA" />
           <ConfirmationRow
             label="Variants"
             value={`Full precision${
-              quantSchemes.length > 0 ? ` + ${quantSchemes.join(" + ")}` : ""
+              quantSchemes.length > 0
+                ? ` + ${quantSchemes.map(quantizationDisplayName).join(" + ")}`
+                : ""
             }`}
           />
           <ConfirmationRow
@@ -642,8 +693,8 @@ export function StudentTrainingPage() {
             className="block"
             style={{ color: "var(--text-muted)" }}
           >
-            Training consumes remote TAO infrastructure. You can monitor the suite after
-            leaving this page.
+            Training consumes remote TAO infrastructure and may incur compute, storage,
+            and egress charges. You can monitor the suite after leaving this page.
           </Text>
         </div>
       </Modal>

@@ -16,12 +16,16 @@ import { ApiError } from "@/api/client";
 
 import {
   fetchEnvironment,
+  fetchNimEndpoints,
+  configureSelfHostedEmbedding,
+  configureSelfHostedTeacher,
   testConnection,
   runPreflight,
   deployLocalNim,
   generateActionRequest,
   logActionRequestCopy,
   parseLocalNimGpuConflict,
+  stopLocalNim,
 } from "@/api/nim";
 import type {
   ActionRequestGenerateRequest,
@@ -37,6 +41,18 @@ describe("fetchEnvironment", () => {
     await fetchEnvironment();
     expect(lastCall().url).toBe("/v1/environment");
   });
+
+  it("requests an explicit machine re-probe when asked", async () => {
+    await fetchEnvironment(true);
+    expect(lastCall().url).toBe("/v1/environment?refresh_hardware=true");
+  });
+});
+
+describe("fetchNimEndpoints", () => {
+  it("GETs the project-scoped endpoint catalog", async () => {
+    await fetchNimEndpoints("proj-1");
+    expect(lastCall().url).toBe("/v1/projects/proj-1/nim_endpoints");
+  });
 });
 
 describe("testConnection", () => {
@@ -48,6 +64,31 @@ describe("testConnection", () => {
     await testConnection(body);
     const { url, init } = lastCall();
     expect(url).toBe("/v1/nim/test_connection");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual(body);
+  });
+});
+
+describe("configureSelfHostedTeacher", () => {
+  it("POSTs the verified endpoint and exact catalog model", async () => {
+    const body = {
+      base_url: "http://nim.internal:8000/v1",
+      model_config_id: "mc-1",
+    };
+    await configureSelfHostedTeacher("proj-1", body);
+    const { url, init } = lastCall();
+    expect(url).toBe("/v1/projects/proj-1/nim_endpoints:configure_self_hosted_teacher");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual(body);
+  });
+});
+
+describe("configureSelfHostedEmbedding", () => {
+  it("POSTs the live-verified deployment-scoped endpoint", async () => {
+    const body = { base_url: "http://embedding.internal:8000/v1" };
+    await configureSelfHostedEmbedding(body);
+    const { url, init } = lastCall();
+    expect(url).toBe("/v1/embedding_deployment_config:configure_self_hosted");
     expect(init?.method).toBe("POST");
     expect(JSON.parse(init?.body as string)).toEqual(body);
   });
@@ -72,6 +113,15 @@ describe("deployLocalNim", () => {
     expect(url).toBe("/v1/projects/proj-1/local_nim/deploy");
     expect(init?.method).toBe("POST");
     expect(JSON.parse(init?.body as string)).toEqual(body);
+  });
+});
+
+describe("stopLocalNim", () => {
+  it("POSTs the project-owned deployment stop action", async () => {
+    await stopLocalNim("proj-1", "dep-1");
+    const { url, init } = lastCall();
+    expect(url).toBe("/v1/projects/proj-1/local_nim/deployments/dep-1:stop");
+    expect(init?.method).toBe("POST");
   });
 });
 

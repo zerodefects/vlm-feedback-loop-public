@@ -9,15 +9,17 @@
  * Students deploy bare) and the serving column (latency × concurrency
  * matrix). The action button at the bottom flips between:
  *
- *   - ``[Benchmark]``         — when ``serving_status !== "validated"`` and
- *                               NIM preflight has not failed.
+ *   - ``[Benchmark]``         — when current AIPerf serving validation is
+ *                               absent and NIM preflight has not failed.
  *   - ``[Deploy for serving validation]`` — when
  *     ``nim_preflight_status="failed"``.
  *                               Expands a ``student_nim_deploy`` Action Request
  *                               so infrastructure can stand up an evaluation
  *                               NIM container externally.
  *   - ``[Request Production Deployment]`` — when both ``quality_status``
- *                               and ``serving_status`` are ``"validated"``.
+ *                               and ``serving_status`` are ``"validated"``
+ *                               and the serving run satisfies the current
+ *                               AIPerf workload contract.
  *                               Expands a ``deployment_handoff`` Action Request
  *                               via the gated Student-scoped endpoint. The
  *                               "Production" qualifier disambiguates this from
@@ -32,11 +34,13 @@
  */
 
 import { useState } from "react";
-import { Badge, Button, Text } from "@kui/react";
+import { Badge, Button, Spinner, Text } from "@kui/react";
 
 import { ActionRequestPanel } from "@/components/ActionRequestPanel";
-import { requestDeploymentHandoff } from "@/api/students";
-import { formatDeltaPoints, formatPct } from "@/lib/format-percent";
+import { InfoBanner } from "@/components/common/InfoBanner";
+import { deploymentBundleUrl, requestDeploymentHandoff } from "@/api/students";
+import { formatDeltaPoints, formatMetricPct } from "@/lib/format-percent";
+import { quantizationDisplayName } from "@/lib/model-display";
 import type {
   EvaluationMetrics,
   EvaluationRunResponse,
@@ -73,6 +77,8 @@ export interface StudentVariantCardProps {
 
   coreFields: SchemaFieldResponse[];
   metricSelection: MetricSelection;
+  perFieldMatchThreshold: number;
+  minPerValueF1Threshold: number;
   concurrencies: number[];
 
   selected: boolean;
@@ -101,16 +107,6 @@ export interface StudentVariantCardProps {
       auto-restore it after. Multi-GPU hosts have no contention; the
       preview is suppressed. */
   singleGpuHost?: boolean;
-  /** Friendly Teacher name (e.g. "Cosmos Reason2 8B"). Used in the
-      displacement-preview message. Falls back to "your Teacher" when
-      omitted. */
-  teacherLabel?: string;
-
-  /** Visual weight of [Request Production Deployment]. The parent
-      demotes all but the best-quality dual-validated variant to
-      ``"secondary"`` so exactly one full-strength green CTA reads as
-      "the" action when several variants qualify. */
-  handoffEmphasis?: "primary" | "secondary";
 }
 
 export function StudentVariantCard({
@@ -122,6 +118,8 @@ export function StudentVariantCard({
   teacherOverallExactMatch,
   coreFields,
   metricSelection,
+  perFieldMatchThreshold,
+  minPerValueF1Threshold,
   concurrencies,
   selected,
   onToggleSelected,
@@ -134,8 +132,6 @@ export function StudentVariantCard({
   benchmarkError,
   onBenchmark,
   singleGpuHost = false,
-  teacherLabel,
-  handoffEmphasis = "primary",
 }: StudentVariantCardProps) {
   // Inline panel state — only one of the two AR panels is open at a time
   // per card (the deploy-fallback and deployment-handoff panels are
@@ -154,16 +150,30 @@ export function StudentVariantCard({
 
   // Action button selection gates.
   const preflightFailed = student.nim_preflight_status === "failed";
+  const servingBenchmarkCurrent = student.serving_benchmark_current === true;
   const dualValidated =
-    student.quality_status === "validated" && student.serving_status === "validated";
-  const benchmarking = benchmarkStage != null;
+    student.quality_status === "validated" &&
+    student.serving_status === "validated" &&
+    servingBenchmarkCurrent;
+  // ``serving_status=pending`` is durable backend authority that the
+  // Student NIM lifecycle is already running. The local queue/stage state is
+  // intentionally ephemeral, so a refreshed or reopened Compare screen must
+  // still suppress the deploy CTA instead of inviting a duplicate request.
+  const serverPending = student.serving_status === "pending";
+  const benchmarking = benchmarkStage != null || serverPending;
   // `partial` quality is informational; production handoff still
   // requires `validated`. Card shows a yellow badge + helper line so
   // operators immediately see "the model serves but did not produce
   // parseable output on every example."
   const isPartialQuality = student.quality_status === "partial";
+  const isPendingQuality = student.quality_status === "pending";
 
-  const showBenchmark = !preflightFailed && student.serving_status !== "validated";
+  const legacyServingValidation =
+    student.serving_status === "validated" && !servingBenchmarkCurrent;
+  const showBenchmark =
+    !preflightFailed &&
+    student.serving_status !== "pending" &&
+    !servingBenchmarkCurrent;
   const showFallbackRequestDeploy = preflightFailed && !dualValidated;
   const showHandoffRequestDeploy = dualValidated;
 
@@ -191,31 +201,36 @@ export function StudentVariantCard({
             aria-label={`Select ${baseModelLabel} for benchmarking`}
           />
           <Text kind="label/bold/sm">
-            Student: {baseModelLabel}
-            {student.quantization_method
-              ? ` · ${student.quantization_method}`
-              : " · BF16 (baseline)"}
+            Student: {baseModelLabel} ·{" "}
+            {quantizationDisplayName(student.quantization_method)}
           </Text>
         </label>
         <Text kind="label/regular/xs" style={{ color: "var(--text-muted)" }}>
           {student.gpu_count != null && student.gpu_type
-            ? `${student.gpu_count}× ${student.gpu_type}`
-            : "GPU: —"}
+            ? `Benchmark hardware: ${student.gpu_count}× ${student.gpu_type}`
+            : "Benchmark hardware: —"}
           {student.nim_model_profile_selected
             ? ` · profile ${student.nim_model_profile_selected}`
             : ""}
         </Text>
       </div>
 
-      {/* Partial quality badge. Only renders when
-          quality_status="partial".
-          The existing UI signals (deployment button enabled/disabled,
-          quality column metrics) are sufficient for the other three
-          states; partial is the one that needs an explicit visual cue
-          so operators immediately understand "the model serves but did
-          not produce parseable output on every example." Yellow/solid
-          badge per CLAUDE.md KUI-first rule. */}
-      {isPartialQuality ? (
+      {/* Pending makes the cold-start action explicit; partial explains that
+          serving worked without enough parseable results for production.
+          Validated needs no extra badge and failed uses its dedicated card. */}
+      {isPendingQuality ? (
+        <div
+          className="flex items-center gap-2"
+          data-testid="quality-status-pending-row"
+        >
+          <Badge color="gray" kind="solid" data-testid="quality-status-badge-pending">
+            Quality: Pending
+          </Badge>
+          <Text kind="label/regular/xs" style={{ color: "var(--text-muted)" }}>
+            Run the first NIM validation to measure quality and serving performance.
+          </Text>
+        </div>
+      ) : isPartialQuality ? (
         <div
           className="flex items-center gap-2"
           data-testid="quality-status-partial-row"
@@ -250,6 +265,8 @@ export function StudentVariantCard({
             overall={overall}
             coreFields={coreFields}
             metricSelection={metricSelection}
+            perFieldMatchThreshold={perFieldMatchThreshold}
+            minPerValueF1Threshold={minPerValueF1Threshold}
             data-testid-prefix={`variant-${student.student_model_id}`}
           />
         )}
@@ -264,7 +281,7 @@ export function StudentVariantCard({
         >
           Serving
         </Text>
-        {benchmarking && benchmarkStage ? (
+        {benchmarkStage ? (
           <BenchmarkStageStrip
             stage={benchmarkStage}
             elapsedMs={benchmarkElapsedMs}
@@ -272,7 +289,15 @@ export function StudentVariantCard({
             evaluationProgress={benchmarkEvalProgress ?? null}
             startupBudgetS={benchmarkStartupBudgetS}
           />
-        ) : student.serving_status === "validated" && servingRun ? (
+        ) : serverPending ? (
+          <div className="flex items-center gap-2" data-testid="benchmark-reconciled">
+            <Spinner size="small" aria-label="Serving validation in progress" />
+            <Text kind="body/regular/sm" style={{ color: "var(--text-primary)" }}>
+              Serving validation is running. Live stage details resume when events
+              arrive.
+            </Text>
+          </div>
+        ) : servingRun ? (
           <ServingMatrix run={servingRun} concurrencies={concurrencies} />
         ) : preflightFailed ? (
           <Text
@@ -301,6 +326,15 @@ export function StudentVariantCard({
             {benchmarkError}
           </Text>
         )}
+
+        {legacyServingValidation && !benchmarking && (
+          <InfoBanner
+            tone="warning"
+            heading="AIPerf revalidation required"
+            body="This historical serving result predates the required real Test Pool AIPerf workload. Re-run validation before requesting production deployment."
+            data-testid="serving-aiperf-revalidation-required"
+          />
+        )}
       </div>
 
       {/*
@@ -308,10 +342,11 @@ export function StudentVariantCard({
        * the GPU for ~6 minutes — the lifecycle stops the resident
        * Teacher (step 0) and best-effort auto-restores it after step
        * 9. Surface this honestly above the [Benchmark] CTA so the
-       * SME isn't surprised mid-flow. Conditional phrasing ("If your
-       * Teacher is running locally…") avoids needing a
-       * LocalNimDeployment query just to refine wording. Suppressed
-       * during an active benchmark + on multi-GPU hosts.
+       * SME isn't surprised mid-flow. The project-selected Teacher may be
+       * hosted while a different local Teacher or embedding resident owns the
+       * GPU, so this message names the actual resource class rather than the
+       * selected Teacher config. Suppressed during an active benchmark and on
+       * multi-GPU hosts.
        */}
       {!benchmarking && showBenchmark && singleGpuHost && (
         <Text
@@ -319,8 +354,8 @@ export function StudentVariantCard({
           style={{ color: "var(--text-muted)" }}
           data-testid="benchmark-displacement-preview"
         >
-          Benchmarking takes the GPU for ~6 minutes. If {teacherLabel ?? "your Teacher"}{" "}
-          is running locally, it pauses during the benchmark and resumes automatically
+          Benchmarking takes the GPU for ~6 minutes. If another local NIM is using this
+          GPU, the Blueprint pauses it during the benchmark and best-effort restores it
           afterward.
         </Text>
       )}
@@ -335,7 +370,11 @@ export function StudentVariantCard({
               disabled={busy}
               data-testid={`benchmark-button-${student.student_model_id}`}
             >
-              Benchmark
+              {isPendingQuality
+                ? "Deploy and benchmark"
+                : legacyServingValidation
+                  ? "Revalidate with AIPerf"
+                  : "Benchmark"}
             </Button>
           )}
           {showFallbackRequestDeploy && (
@@ -350,10 +389,8 @@ export function StudentVariantCard({
           )}
           {showHandoffRequestDeploy && (
             <Button
-              kind={handoffEmphasis}
-              className={
-                handoffEmphasis === "primary" ? "nvidia-green-button" : undefined
-              }
+              kind="primary"
+              className="nvidia-green-button"
               onClick={() => setHandoffOpen((v) => !v)}
               data-testid={`request-deployment-handoff-${student.student_model_id}`}
               aria-pressed={handoffOpen}
@@ -388,6 +425,10 @@ export function StudentVariantCard({
           mutationFn={() =>
             requestDeploymentHandoff(projectId, student.student_model_id)
           }
+          deploymentBundleHref={deploymentBundleUrl(
+            projectId,
+            student.student_model_id,
+          )}
           onClose={() => setHandoffOpen(false)}
         />
       )}
@@ -403,7 +444,7 @@ interface ExactMatchRowProps {
 }
 
 function ExactMatchRow({ value, delta, deltaLabel, testid }: ExactMatchRowProps) {
-  const formatted = formatPct(value);
+  const formatted = formatMetricPct(value);
   return (
     <div className="flex items-baseline gap-2">
       <Text

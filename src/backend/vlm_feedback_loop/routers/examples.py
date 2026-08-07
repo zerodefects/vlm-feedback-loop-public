@@ -10,9 +10,9 @@ import mimetypes
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
 
 from vlm_feedback_loop.config import Settings
+from vlm_feedback_loop.routers.file_response import FileDescriptorResponse
 from vlm_feedback_loop.routers.projects import get_current_settings, require_project
 from vlm_feedback_loop.schemas.example import (
     EmbeddingStatusResponse,
@@ -29,6 +29,7 @@ from vlm_feedback_loop.schemas.example import (
     VerifiedLabelResponse,
 )
 from vlm_feedback_loop.services import example_service, filesystem_service
+from vlm_feedback_loop.services.authorized_file import open_authorized_image
 from vlm_feedback_loop.services.image_transport import EXT_TO_MIME
 from vlm_feedback_loop.services.pagination import InvalidCursorError
 
@@ -121,7 +122,7 @@ async def ingest_examples(
             trigger_ingest_processing,
         )
 
-        trigger_ingest_processing(project_id, settings.WORKSPACE_ROOT)
+        trigger_ingest_processing(project_id, settings.WORKSPACE_ROOT, settings)
 
         # Trigger CLIP embedding computation.
         from vlm_feedback_loop.services.clip_embedding_service import (
@@ -141,7 +142,7 @@ def serve_example_image(
     project_id: str,
     example_key: str,
     settings: Settings = Depends(get_current_settings),
-) -> FileResponse:
+) -> FileDescriptorResponse:
     """Stream an image from its persisted storage_ref.
 
     MUST NOT accept arbitrary filesystem paths — only the ``storage_ref``
@@ -157,28 +158,23 @@ def serve_example_image(
 
     path = Path(example.storage_ref)
 
-    # Enforce IMAGE_ROOT on the read path, not just on browse. On a
-    # network-accessible deployment this prevents a storage_ref repointed
-    # outside the root — via a crafted
-    # ingest or remap — from turning by-reference serving into arbitrary host
-    # file read. No-op on the default loopback posture (IMAGE_ROOT unset).
-    root_err = filesystem_service.check_path_allowed(path, settings)
-    if root_err is not None:
-        raise HTTPException(status_code=403, detail=root_err)
-
-    if not path.is_file():
+    try:
+        opened = open_authorized_image(example.storage_ref, settings)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
+    except FileNotFoundError:
         raise HTTPException(
             status_code=404,
             detail=f"Image file not found at stored path: {example.storage_ref}",
-        )
+        ) from None
 
     ext = path.suffix.lower()
     media_type = EXT_TO_MIME.get(ext)
     if media_type is None:
         media_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
 
-    return FileResponse(
-        path=str(path),
+    return FileDescriptorResponse(
+        opened,
         media_type=media_type,
         filename=path.name,
     )

@@ -12,13 +12,11 @@ export {
   stampClientIds,
   stripClientIds,
   responseFieldsToInput,
-  recalcDisplayOrders,
   describeSemanticChanges,
 } from "./field-utils";
 
 // Components (one per file)
 export { MarkerIcon } from "./MarkerIcon";
-export { ErrorRow } from "./InlineErrors";
 export { ValidationNotices } from "./ValidationNotices";
 
 // Shared card components

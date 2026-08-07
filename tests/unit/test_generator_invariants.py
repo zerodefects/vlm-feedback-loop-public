@@ -48,7 +48,7 @@ PID = "test-proj"
 
 # Key-shaped token planted in a context field the generator renders; the
 # framework redact is the last line of defense before the clipboard.
-SECRET = "nvapi-INJECTEDSECRET123456"
+SECRET = "nvapi-fake-INJECTEDSECRET123456"
 
 
 @dataclass(frozen=True)

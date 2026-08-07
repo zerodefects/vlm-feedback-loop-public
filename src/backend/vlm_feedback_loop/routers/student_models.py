@@ -11,6 +11,7 @@ external endpoint registration + evaluation).
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from vlm_feedback_loop.config import Settings
 from vlm_feedback_loop.routers.projects import get_current_settings
@@ -23,6 +24,7 @@ from vlm_feedback_loop.schemas.student_nim_deploy import (
     DeployNimResponse,
 )
 from vlm_feedback_loop.services import (
+    deployment_bundle_service,
     deployment_handoff_generator,
     student_model_service,
     tao_rescoring_service,
@@ -48,6 +50,9 @@ def list_student_models_endpoint(
         workspace_root=settings.WORKSPACE_ROOT,
         limit=limit,
         cursor=cursor,
+        expected_benchmark_concurrencies=tuple(
+            settings.STUDENT_LATENCY_TEST_CONCURRENCIES
+        ),
     )
     return StudentModelListResponse(
         items=[StudentModelResponse.model_validate(row) for row in items],
@@ -66,6 +71,9 @@ def get_student_model_endpoint(
         project_id=project_id,
         student_model_id=student_model_id,
         workspace_root=settings.WORKSPACE_ROOT,
+        expected_benchmark_concurrencies=tuple(
+            settings.STUDENT_LATENCY_TEST_CONCURRENCIES
+        ),
     )
     if row is None:
         raise HTTPException(status_code=404, detail="Student model not found")
@@ -88,8 +96,8 @@ async def deploy_nim_endpoint(
     ``body.nim_endpoint_url`` decides the mode: ``None`` runs the local
     Docker lifecycle (preflight → docker run → health → smoke → register
     temp endpoint → evaluation → benchmark sweep → stop); a URL skips
-    local entirely and registers the endpoint as external before running
-    the evaluation phase.
+    local orchestration, registers the endpoint as external, and then runs
+    the same evaluation and benchmark sweep.
 
     Returns 202 with the dispatch dict — the lifecycle runs in the
     background and emits SSE events (``nim_benchmark_progress`` /
@@ -103,6 +111,7 @@ async def deploy_nim_endpoint(
         nim_release_version=body.nim_release_version,
         gpu_assignment=body.gpu_assignment,
         auth_mode=body.auth_mode,
+        benchmark_kv_cache_reuse=body.benchmark_kv_cache_reuse,
         settings=settings,
     )
 
@@ -122,6 +131,18 @@ async def deploy_nim_endpoint(
             raise HTTPException(
                 status_code=400,
                 detail="nim_endpoint_url must be an http:// or https:// URL.",
+            )
+        if error == "benchmark_cache_policy_unconfirmed":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "benchmark_cache_policy_unconfirmed",
+                    "message": (
+                        "External Student endpoints must be launched with "
+                        "NIM_ENABLE_KV_CACHE_REUSE=0 and registered with "
+                        "benchmark_kv_cache_reuse='disabled'."
+                    ),
+                },
             )
         if error == "deploy_in_progress":
             raise HTTPException(
@@ -162,7 +183,9 @@ def deployment_handoff_endpoint(
         200 — gates passed; AR payload returned
         404 — Student not found in project
         409 — quality_status_not_validated / serving_status_not_validated /
-              serving_evaluation_run_missing / INFERENCE_CONTRACT_MISMATCH
+              serving_evaluation_run_missing /
+              serving_benchmark_requires_aiperf /
+              INFERENCE_CONTRACT_MISMATCH
     """
     result = deployment_handoff_generator.generate_deployment_handoff_for_student(
         project_id=project_id,
@@ -172,6 +195,40 @@ def deployment_handoff_endpoint(
     if isinstance(result, str):
         raise map_service_error(result)
     return result
+
+
+@student_models_router.get(
+    "/{student_model_id}/deployment_bundle",
+    response_class=StreamingResponse,
+)
+def deployment_bundle_endpoint(
+    project_id: str,
+    student_model_id: str,
+    settings: Settings = Depends(get_current_settings),
+) -> StreamingResponse:
+    """Stream a portable Student NIM deployment bundle.
+
+    The same quality, serving, checkpoint-packaging, and Inference Contract
+    gates as ``:deployment_handoff`` apply. The checkpoint must also resolve
+    beneath the requested project and contain only regular files.
+    """
+    result = deployment_bundle_service.prepare_deployment_bundle(
+        project_id=project_id,
+        student_model_id=student_model_id,
+        settings=settings,
+    )
+    if isinstance(result, str):
+        raise map_service_error(result)
+    return StreamingResponse(
+        deployment_bundle_service.stream_deployment_bundle(result),
+        media_type="application/x-tar",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{result.archive_filename}"'
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @student_models_router.post(
@@ -212,6 +269,14 @@ async def repackage_endpoint(
         )
     if err == "tao_job_unresolved":
         raise HTTPException(status_code=502, detail="TAOJob could not be resolved")
+    if err == "artifact_refresh_failed":
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "The quantized checkpoint could not be refreshed from TAO workspace "
+                "storage. Verify TAO/S3 reachability and retry repackage."
+            ),
+        )
     return result
 
 

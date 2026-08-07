@@ -22,11 +22,9 @@ _EMPTY_SETTINGS = SimpleNamespace(NVIDIA_API_KEY=None)
 
 
 @pytest.fixture(autouse=True)
-def reset_overrides():
+def reset_overrides(monkeypatch):
     """Each test starts with a clean override layer to avoid bleed-through."""
-    runtime_secrets.reset_overrides_for_testing()
-    yield
-    runtime_secrets.reset_overrides_for_testing()
+    monkeypatch.setattr(runtime_secrets, "_runtime_overrides", {})
 
 
 class TestRuntimeOverride:
@@ -110,6 +108,48 @@ class TestPersistSecretToEnv:
             )
         # The pre-existing file is left exactly as it was — no partial write.
         assert env_path.read_text() == "LOG_LEVEL=info\n"
+
+    def test_publish_failure_preserves_existing_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A failed atomic replace cannot truncate the existing secret file."""
+        env_path = tmp_path / ".env"
+        original = "NVIDIA_API_KEY=old-value\n"
+        env_path.write_text(original)
+
+        def fail_replace(source, destination):
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(runtime_secrets.os, "replace", fail_replace)
+        with pytest.raises(OSError, match="simulated replace failure"):
+            runtime_secrets.persist_secret_to_env(
+                "NVIDIA_API_KEY", "new-value", env_path=env_path
+            )
+
+        assert env_path.read_text() == original
+        assert list(tmp_path.glob(".env.*.tmp")) == []
+        assert "NVIDIA_API_KEY" not in runtime_secrets._runtime_overrides
+
+    def test_permission_failure_aborts_before_writing_secret(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Persistence fails closed when mode 0600 cannot be guaranteed."""
+        env_path = tmp_path / ".env"
+        original = "NVIDIA_API_KEY=old-value\n"
+        env_path.write_text(original)
+
+        def fail_fchmod(fd: int, mode: int):
+            raise PermissionError("simulated permission failure")
+
+        monkeypatch.setattr(runtime_secrets.os, "fchmod", fail_fchmod)
+        with pytest.raises(PermissionError, match="simulated permission failure"):
+            runtime_secrets.persist_secret_to_env(
+                "NVIDIA_API_KEY", "new-value", env_path=env_path
+            )
+
+        assert env_path.read_text() == original
+        assert list(tmp_path.glob(".env.*.tmp")) == []
+        assert "NVIDIA_API_KEY" not in runtime_secrets._runtime_overrides
 
     def test_preserves_other_lines_and_comments(self, tmp_path: Path):
         env_path = tmp_path / ".env"
@@ -245,6 +285,31 @@ class TestSecretsRouter:
 
         # Restore flag for downstream tests sharing the fixture
         injected_settings.ALLOW_UI_SECRET_PERSIST = True
+
+    def test_persist_io_failure_keeps_session_override(
+        self, test_app_client, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A failed disk publish is explicit while the pasted key stays usable."""
+
+        def fail_persist(*args, **kwargs):
+            raise OSError("simulated disk failure")
+
+        monkeypatch.setattr(runtime_secrets, "persist_secret_to_env", fail_persist)
+        resp = test_app_client.post(
+            "/v1/secrets:set",
+            json={
+                "name": "NVIDIA_API_KEY",
+                "value": "nvapi-session-only",
+                "persist": True,
+            },
+        )
+
+        assert resp.status_code == 500
+        assert "secret_persist_io_error" in resp.json()["detail"]
+        assert (
+            runtime_secrets.get_effective_secret("NVIDIA_API_KEY", _EMPTY_SETTINGS)
+            == "nvapi-session-only"
+        )
 
     def test_invalid_name_returns_422(self, test_app_client):
         resp = test_app_client.post(

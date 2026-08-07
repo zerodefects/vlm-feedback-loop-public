@@ -28,8 +28,7 @@
  *   - **Resident reuse** — an exact Blueprint-managed Teacher is already
  *     running and selected by project creation: auto-skip setup with the
  *     resident as the active local Teacher. No deploy or NGC key is needed.
- *   - **Case D** — key configured + no GPU: auto-skip to the NGC key
- *     screen.
+ *   - **Case D** — key configured + no GPU: auto-skip to the NGC key screen.
  *
  * Case B does not auto-skip when the GPU is merely capable of a local
  * Teacher. It does auto-skip when the backend has already attached and
@@ -42,7 +41,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { useNavigate, useLocation } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { Button, Spinner, Text } from "@kui/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowRight } from "lucide-react";
@@ -51,11 +50,12 @@ import { testNgcCredential, testNvidiaCredential } from "@/api/nim";
 import { fetchModelConfigs } from "@/api/model-configs";
 import { environmentKeys, modelConfigKeys } from "@/api/query-keys";
 import { setSecret } from "@/api/secrets";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useEnvironmentSetupContext } from "@/pages/setup-context";
 import { DetectedHardwareEyebrow } from "@/components/DetectedHardwareEyebrow";
 import { KeyPasteInput } from "@/components/KeyPasteInput";
 import { KeyPortalLink } from "@/components/KeyPortalLink";
 import { PathChoiceCard } from "@/components/PathChoiceCard";
+import { SetupTransitionCard } from "@/components/common/SetupTransitionCard";
 import { usePersistedKeyProbe } from "@/hooks/usePersistedKeyProbe";
 import {
   NGC_API_KEY_PORTAL_URL,
@@ -64,10 +64,6 @@ import {
 import { formatModelDisplayName, localTeacherDisplayName } from "@/lib/model-display";
 import { describeSecretPersistError } from "@/lib/secret-errors";
 import type { ActivePath, SetupChainState } from "@/types/setupChain";
-
-interface IncomingLocationState {
-  cameFromAutoSkip?: boolean;
-}
 
 function buildLocalQueue(
   localTeacher: string | null | undefined,
@@ -144,9 +140,8 @@ function NgcKeyCluster({
 }
 
 export function NIMNvidiaKeyPage(): JSX.Element {
-  const { projectId, project, environment } = useSetupContext();
+  const { projectId, project, environment } = useEnvironmentSetupContext();
   const navigate = useNavigate();
-  const location = useLocation();
   const queryClient = useQueryClient();
   const didAutoSkip = useRef(false);
   const env = environment;
@@ -253,7 +248,6 @@ export function NIMNvidiaKeyPage(): JSX.Element {
   } else {
     renderCase = "C";
   }
-
   // ── Single-GPU handling (one-NIM-per-GPU) ───────────────────────────
   // Case A copy uses this to avoid promising a second local embedding
   // NIM beside the selected Teacher. Case B uses the hosted endpoint as
@@ -270,7 +264,7 @@ export function NIMNvidiaKeyPage(): JSX.Element {
       runningRecommendedTeacher === undefined &&
       (renderCase === "A" || renderCase === "B"),
     configured: env.ngc_api_key_configured,
-    probe: () => testNgcCredential(),
+    probe: (signal) => testNgcCredential(undefined, signal),
     fallbackError: "NGC key validation failed.",
     onRejected: (message) => {
       setNgcReplacementMode(true);
@@ -283,7 +277,7 @@ export function NIMNvidiaKeyPage(): JSX.Element {
       runningRecommendedTeacher === undefined &&
       (renderCase === "B" || renderCase === "D"),
     configured: env.nvidia_api_key_configured,
-    probe: () => testNvidiaCredential(),
+    probe: (signal) => testNvidiaCredential(undefined, signal),
     fallbackError: "NVIDIA API key validation failed.",
     onRejected: (message) => {
       setNvidiaReplacementMode(true);
@@ -632,19 +626,25 @@ export function NIMNvidiaKeyPage(): JSX.Element {
     runningRecommendedTeacher !== undefined &&
     (selectedTeacherQuery.isLoading || reusedTeacherIsSelected)
   ) {
-    return <></>;
+    return (
+      <SetupTransitionCard
+        title="Reusing your local Teacher…"
+        description="Confirming the model already running on this machine. You'll continue automatically."
+        testId="teacher-reuse-transition"
+      />
+    );
   }
 
-  // Suppress render while Case D auto-skip is firing — UNLESS the
-  // NVIDIA probe flagged the persisted key as bad, in which case auto-
-  // skip is blocked and we need to render the replacement card so the
-  // SME can paste a fresh key.
-  if (
-    renderCase === "D" &&
-    !nvidiaReplacementMode &&
-    !(location.state as IncomingLocationState)?.cameFromAutoSkip
-  ) {
-    return <></>;
+  // Suppress render while Case D validates the key and performs its ordinary
+  // auto-skip, preventing a blank frame between the probe and navigation.
+  if (renderCase === "D" && !nvidiaReplacementMode) {
+    return (
+      <SetupTransitionCard
+        title="Checking your saved NVIDIA API key…"
+        description="This normally takes a few seconds. Setup will continue automatically."
+        testId="nvidia-key-probe-transition"
+      />
+    );
   }
 
   // Case C [Go]: hosted-only single-input flow.
@@ -675,12 +675,15 @@ export function NIMNvidiaKeyPage(): JSX.Element {
       <div className="flex w-full max-w-[680px] flex-col gap-6">
         {/* Page-level hardware eyebrow renders for Cases B/C — Case A
             inlines the GPU/Docker/Toolkit chips inside the Local row
-            because they're the prerequisites for THAT option. */}
-        {renderCase !== "A" && <DetectedHardwareEyebrow env={env} />}
+            because they're the prerequisites for THAT option. Case D is
+            hosted-only, so local-runtime failures are irrelevant there. */}
+        {(renderCase === "B" || renderCase === "C") && (
+          <DetectedHardwareEyebrow env={env} />
+        )}
 
         {renderCase === "A" && (
           <div
-            className="glass-card--elevated flex flex-col gap-5 p-6"
+            className="glass-card glass-card--elevated flex flex-col gap-5 p-6"
             data-testid="combined-card-local-and-hosted"
           >
             <div className="flex flex-col gap-1">
@@ -799,9 +802,9 @@ export function NIMNvidiaKeyPage(): JSX.Element {
                   </Text>
                 </div>
                 <Text kind="body/regular/sm" style={{ color: "var(--text-muted)" }}>
-                  A free NVIDIA API key unlocks more Teacher models and hosted image
-                  embeddings, improving review variety without using your GPU. Takes
-                  about 30 seconds to get.
+                  A free NVIDIA API key unlocks hosted Teacher models and hosted image
+                  embeddings for development and evaluation, improving review variety
+                  without using your GPU. Takes about 30 seconds to get.
                 </Text>
                 {hostedChecked && (
                   <>
@@ -1069,7 +1072,7 @@ function NvidiaReplacementCard({
 }: NvidiaReplacementCardProps): JSX.Element {
   return (
     <div
-      className="glass-card--elevated flex flex-col gap-4 p-6"
+      className="glass-card glass-card--elevated flex flex-col gap-4 p-6"
       data-testid="nvidia-replacement-card"
     >
       <div className="flex flex-col gap-1">

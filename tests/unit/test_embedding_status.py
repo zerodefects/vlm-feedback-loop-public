@@ -36,7 +36,7 @@ def _make_client_and_settings(tmp_path: Path, **overrides: Any):
     workspace.mkdir(exist_ok=True)
     settings = make_settings(workspace, **overrides)
     app.dependency_overrides[get_current_settings] = lambda: settings
-    project_service.clear_engine_cache()
+    project_service.close_project_resources()
     client = TestClient(app, raise_server_exceptions=False)
     return client, settings, workspace
 

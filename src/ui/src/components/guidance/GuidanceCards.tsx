@@ -54,7 +54,9 @@ export function DescriptionCard({
         >
           Task Description
         </Text>
-        <span className="glass-pill">Optional</span>
+        <Text kind="label/regular/xs" className="glass-pill">
+          Optional
+        </Text>
       </div>
       <Text
         kind="body/regular/sm"
@@ -64,6 +66,7 @@ export function DescriptionCard({
       </Text>
       <textarea
         ref={descriptionRef}
+        aria-label="Task description"
         value={description}
         onChange={(e) => onChange(e.target.value)}
         placeholder="You are inspecting manufactured parts for surface damage. Focus on cracks, discoloration, and deformation. Minor cosmetic wear is acceptable..."
@@ -117,15 +120,11 @@ export function SchemaCard({
   coreExtraSlot,
   backendErrorSlot,
 }: SchemaCardProps) {
-  function renderFieldRows(
-    roleFields: ClientField[],
-    isLockedFn: (f: ClientField) => boolean,
-  ) {
+  function renderFieldRows(roleFields: ClientField[]) {
     return roleFields.map((f, idx) => (
       <FieldRow
         key={f._clientId}
         field={f}
-        isLocked={isLockedFn(f)}
         isFirst={idx === 0}
         isLast={idx === roleFields.length - 1}
         issues={allIssues}
@@ -169,11 +168,13 @@ export function SchemaCard({
           >
             Core Fields
           </Text>
-          <span className="glass-pill green">Required</span>
+          <Text kind="label/regular/xs" className="glass-pill green">
+            Required
+          </Text>
         </div>
         <div className="space-y-1.5">
           {coreFields.length > 0 ? (
-            renderFieldRows(coreFields, () => false)
+            renderFieldRows(coreFields)
           ) : (
             <Text
               kind="body/regular/sm"
@@ -220,7 +221,9 @@ export function SchemaCard({
           >
             Aux Fields
           </Text>
-          <span className="glass-pill">Optional</span>
+          <Text kind="label/regular/xs" className="glass-pill">
+            Optional
+          </Text>
         </div>
         <Text
           kind="body/regular/sm"
@@ -260,7 +263,7 @@ export function SchemaCard({
             data-testid="rationale-note-toggle"
           />
         </div>
-        <div className="space-y-1.5">{renderFieldRows(auxFields, () => false)}</div>
+        <div className="space-y-1.5">{renderFieldRows(auxFields)}</div>
         <button
           type="button"
           onClick={() => handlers.onAddField("aux")}
@@ -295,7 +298,9 @@ export function RulesCard({ rules, onChange }: RulesCardProps) {
         >
           Rules & Edge Cases
         </Text>
-        <span className="glass-pill">Optional</span>
+        <Text kind="label/regular/xs" className="glass-pill">
+          Optional
+        </Text>
       </div>
       <Text
         kind="body/regular/sm"
@@ -305,6 +310,7 @@ export function RulesCard({ rules, onChange }: RulesCardProps) {
         surface during labeling, so you can always add Rules later.
       </Text>
       <textarea
+        aria-label="Rules and edge cases"
         value={rules}
         onChange={(e) => onChange(e.target.value)}
         placeholder="If damage is partially obscured, classify based on the visible portion only..."
@@ -345,16 +351,18 @@ export function Previews({ fields, backendValidation, errorCount }: PreviewsProp
           </Text>
         </button>
         {jsonSchemaOpen && (
-          <pre
-            className="mt-2 overflow-x-auto rounded-lg p-4 text-xs glass-terminal"
-            data-testid="json-schema-preview"
-          >
-            {backendValidation?.derived_json_schema
-              ? JSON.stringify(backendValidation.derived_json_schema, null, 2)
-              : errorCount > 0
-                ? "Fix errors above to see the derived schema."
-                : "Loading..."}
-          </pre>
+          <Text asChild kind="mono/sm">
+            <pre
+              className="mt-2 overflow-x-auto rounded-lg p-4 text-xs glass-terminal"
+              data-testid="json-schema-preview"
+            >
+              {backendValidation?.derived_json_schema
+                ? JSON.stringify(backendValidation.derived_json_schema, null, 2)
+                : errorCount > 0
+                  ? "Fix errors above to see the derived schema."
+                  : "Loading..."}
+            </pre>
+          </Text>
         )}
       </div>
       <div>
@@ -378,12 +386,14 @@ export function Previews({ fields, backendValidation, errorCount }: PreviewsProp
             >
               Is this what I want the model to produce?
             </Text>
-            <pre
-              className="overflow-x-auto rounded-lg p-4 text-xs glass-terminal"
-              data-testid="example-output-preview"
-            >
-              {JSON.stringify(generateExampleOutput(fields), null, 2)}
-            </pre>
+            <Text asChild kind="mono/sm">
+              <pre
+                className="overflow-x-auto rounded-lg p-4 text-xs glass-terminal"
+                data-testid="example-output-preview"
+              >
+                {JSON.stringify(generateExampleOutput(fields), null, 2)}
+              </pre>
+            </Text>
           </div>
         )}
       </div>

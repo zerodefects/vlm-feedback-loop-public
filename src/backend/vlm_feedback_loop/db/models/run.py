@@ -39,6 +39,11 @@ class RunRecord(ProjectBase):
     created_at: Mapped[str] = created_at_col()
     started_at: Mapped[str | None] = mapped_column(String(24), nullable=True)
     completed_at: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    # Credential-free ModelConfig/NimEndpoint inputs shared by NIM-backed
+    # evaluation and Batch runs. Persisted before background dispatch.
+    runtime_config_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
 
     # ── Evaluation run fields ──────────────────────────────
     pool_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)

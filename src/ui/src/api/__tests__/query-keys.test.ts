@@ -56,6 +56,9 @@ describe("trainingKeys.preflight", () => {
     expect(trainingKeys.preflight("p1", ["mc-a"], true)).not.toEqual(
       trainingKeys.preflight("p1", ["mc-a"], false),
     );
+    expect(trainingKeys.preflight("p1", ["mc-a"], true, true)).not.toEqual(
+      trainingKeys.preflight("p1", ["mc-a"], true, false),
+    );
   });
 });
 

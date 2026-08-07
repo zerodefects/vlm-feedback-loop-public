@@ -10,18 +10,18 @@
  */
 
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button, Spinner, Text, Select } from "@kui/react";
 import { ArrowLeft, ArrowRight } from "lucide-react";
 
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useEnvironmentSetupContext } from "@/pages/setup-context";
 import { fetchModelConfigs } from "@/api/model-configs";
 import { updateProject } from "@/api/model-configs";
 import { markSetupCompleted } from "@/api/projects";
 import { modelConfigKeys, projectKeys } from "@/api/query-keys";
 import type { ModelConfigResponse } from "@/types/nim";
-import type { SetupAutoSkipState } from "@/types/setupChain";
+import { isSetupChainState, type SetupAutoSkipState } from "@/types/setupChain";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -45,10 +45,14 @@ function preferredDefaultId(
 // ── Component ───────────────────────────────────────────────────────────────
 
 export function ConfirmDefaultsPage() {
-  const { projectId, project, environment } = useSetupContext();
+  const { projectId, project, environment } = useEnvironmentSetupContext();
   const navigate = useNavigate();
+  const location = useLocation();
   const queryClient = useQueryClient();
   const didAutoSkip = useRef(false);
+  const setupChainState = isSetupChainState(location.state)
+    ? location.state
+    : undefined;
 
   // Selection
   const [selectedTeacher, setSelectedTeacher] = useState(
@@ -209,7 +213,7 @@ export function ConfirmDefaultsPage() {
     return (
       <div className="flex flex-1 flex-col items-center justify-center p-6">
         <div
-          className="glass-card--elevated flex w-full max-w-[640px] flex-col items-center gap-4 p-8"
+          className="glass-card glass-card--elevated flex w-full max-w-[640px] flex-col items-center gap-4 p-8"
           data-testid="confirm-defaults-loading-card"
         >
           <Spinner size="large" aria-label="Finishing setup" />
@@ -270,6 +274,7 @@ export function ConfirmDefaultsPage() {
             Proposes labels for each image during interactive labeling.
           </Text>
           <Select
+            aria-label="Teacher"
             items={teacherOptions.map((mc) => ({
               value: mc.model_config_id,
               children: mc.model_name,
@@ -282,7 +287,7 @@ export function ConfirmDefaultsPage() {
             <div className="mt-2 flex flex-wrap gap-2">
               {getCapabilityBadges(selectedTeacherConfig).map((badge) => (
                 <span key={badge} className="glass-pill">
-                  {badge}
+                  <Text kind="label/regular/xs">{badge}</Text>
                 </span>
               ))}
             </div>
@@ -299,7 +304,10 @@ export function ConfirmDefaultsPage() {
 
       {/* Footer navigation — sits directly below the card, not sticky-bottom */}
       <div className="flex items-center justify-between mt-6">
-        <Button kind="secondary" onClick={() => navigate("../setup")}>
+        <Button
+          kind="secondary"
+          onClick={() => navigate("../setup", { state: setupChainState })}
+        >
           <ArrowLeft size={14} /> Back
         </Button>
         <Button

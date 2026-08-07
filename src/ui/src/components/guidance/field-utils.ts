@@ -33,6 +33,11 @@ export function stripClientIds(fields: ClientField[]): SchemaFieldEditInput[] {
   return fields.map(({ _clientId, ...rest }) => rest);
 }
 
+/** Strip both client and persisted identities for the create-shaped draft API. */
+export function stripDraftIds(fields: ClientField[]): SchemaFieldInput[] {
+  return fields.map(({ _clientId, field_id: _fieldId, ...rest }) => rest);
+}
+
 /**
  * Convert schema fields from the response shape (``schema_fields``) to the
  * input shape mutations send back (``schema``). Used by the Edit Guidance

@@ -7,8 +7,8 @@ Covers:
   - _build_metrics_url strips a trailing /v1 (and only that) before
     appending /metrics.
   - _parse_prom_text extracts all three TRACKED_METRICS when present.
-  - Missing metric → 0.0 default.
-  - Non-200 / transport error → all-zeros dict.
+  - Missing metric → unavailable (``None``).
+  - Non-200 / transport error → all-null dict.
 """
 
 from __future__ import annotations
@@ -72,12 +72,12 @@ class TestParseText:
         assert result["request_success_total"] == 1234.0
         assert result["gpu_cache_usage_perc"] == 0.78
 
-    def test_returns_zero_for_missing_metrics(self):
+    def test_returns_null_for_missing_metrics(self):
         text = "request_success_total{model='x'} 99.0"
         result = _parse_prom_text(text)
         assert result["request_success_total"] == 99.0
-        assert result["request_failure_total"] == 0.0
-        assert result["gpu_cache_usage_perc"] == 0.0
+        assert result["request_failure_total"] is None
+        assert result["gpu_cache_usage_perc"] is None
 
     def test_keyset_always_complete(self):
         result = _parse_prom_text("")
@@ -92,12 +92,24 @@ request_failure_total 5
         result = _parse_prom_text(text)
         assert result["request_failure_total"] == 5.0
 
+    def test_ignores_non_finite_samples(self):
+        result = _parse_prom_text(
+            "request_success_total NaN\n"
+            "request_failure_total +Inf\n"
+            "gpu_cache_usage_perc -Inf\n"
+        )
+        assert result == {
+            "request_failure_total": None,
+            "request_success_total": None,
+            "gpu_cache_usage_perc": None,
+        }
+
 
 # ── scrape_prometheus ────────────────────────────────────────────────────────
 
 
 class TestScrape:
-    def test_returns_zeros_on_non_200(self, monkeypatch):
+    def test_returns_nulls_on_non_200(self, monkeypatch):
         async def _fake(*args, **kwargs):
             return HttpResult(status_code=503, body="Service unavailable")
 
@@ -106,10 +118,10 @@ class TestScrape:
             _fake,
         )
         result = asyncio.run(scrape_prometheus("http://x/v1"))
-        assert all(value == 0.0 for value in result.values())
+        assert all(value is None for value in result.values())
         assert set(result.keys()) == set(TRACKED_METRICS)
 
-    def test_returns_zeros_on_transport_error(self, monkeypatch):
+    def test_returns_nulls_on_transport_error(self, monkeypatch):
         async def _fake(*args, **kwargs):
             return HttpResult(
                 status_code=None,
@@ -123,7 +135,7 @@ class TestScrape:
             _fake,
         )
         result = asyncio.run(scrape_prometheus("http://x/v1"))
-        assert all(value == 0.0 for value in result.values())
+        assert all(value is None for value in result.values())
 
     def test_parses_real_response_text(self, monkeypatch):
         async def _fake(*args, **kwargs):

@@ -8,16 +8,18 @@
  * within a chain advance automatically — the screen listens for
  * ``tao_job_progress`` / ``tao_job_completed`` / ``run_failed`` SSE
  * events emitted by the TAO background polling loop and refreshes
- * the suite + per-job caches.  ``[Compare Students]`` stays disabled
- * (with an explanatory tooltip) until every chain completes.
+ * the suite + per-job caches. ``[Compare Students]`` stays disabled until
+ * every job is terminal and at least one finalized Student artifact exists,
+ * so a successful model remains inspectable when an independent chain fails.
  */
 
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button, Spinner, Text, Tooltip } from "@kui/react";
 
-import { getTrainingSuite } from "@/api/training";
+import { parseApiErrorDetail } from "@/api/client";
+import { createTrainingSuite, getTrainingSuite } from "@/api/training";
 import { trainingKeys } from "@/api/query-keys";
 import { InfoBanner } from "@/components/common/InfoBanner";
 import { PageContainer } from "@/components/common/PageContainer";
@@ -25,7 +27,7 @@ import { SectionCard } from "@/components/common/SectionCard";
 import { SectionHeading } from "@/components/common/SectionHeading";
 import { StatusPill } from "@/components/common/StatusPill";
 import { useProjectSSE } from "@/hooks/useProjectSSE";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useSetupContext } from "@/pages/setup-context";
 import { ChainProgressLine } from "@/components/training/ChainProgressLine";
 import { CancelTrainingSuiteDialog } from "@/components/training/CancelTrainingSuiteDialog";
 import { JobCard } from "@/components/training/JobCard";
@@ -38,13 +40,9 @@ import {
 } from "@/types/training";
 
 const POLL_INTERVAL_MS = 5000;
-const AUTO_SKIP_REASON_PREFIX = "auto-skip:";
 
 function isAutoSkippedJob(job: TrainingSuiteChain["jobs"][number]): boolean {
-  return (
-    job.status === "canceled" &&
-    (job.chain_halted_reason ?? "").startsWith(AUTO_SKIP_REASON_PREFIX)
-  );
+  return job.status === "canceled" && isAutoSkippedReason(job.chain_halted_reason);
 }
 
 function suiteAllTerminal(suite: TrainingSuite | undefined): boolean {
@@ -56,43 +54,28 @@ function suiteAllTerminal(suite: TrainingSuite | undefined): boolean {
   );
 }
 
-function chainAllComplete(chain: TrainingSuiteChain): boolean {
-  return (
-    chain.jobs.length > 0 &&
-    chain.jobs.every(
-      (job) => job.status === "succeeded" || isAutoSkippedJob(job),
-    )
-  );
-}
-
 function countComplete(chain: TrainingSuiteChain): number {
-  return chain.jobs.filter(
-    (job) => job.status === "succeeded" || isAutoSkippedJob(job),
-  ).length;
+  return chain.jobs.filter((job) => job.status === "succeeded" || isAutoSkippedJob(job))
+    .length;
 }
 
-function findHaltedReasonJob(
-  chain: TrainingSuiteChain,
-): { action: string; chainSequence: number } | null {
-  // The "root" halted job is the failed one (not the downstream jobs marked
-  // with chain_halted_reason).  Find it by scanning for status=failed WITHOUT
-  // chain_halted_reason, or — if everything is halted — the lowest sequence
-  // that has chain_halted_reason set.
+function findHaltedReasonJob(chain: TrainingSuiteChain): string | null {
+  // Prefer the root job that actually failed. If the predecessor was canceled
+  // or otherwise omitted, derive the truthful outcome from the first durable
+  // downstream halt reason instead of assuming every halted chain failed.
   const rootFailed = chain.jobs.find(
     (j) => j.status === "failed" && !j.chain_halted_reason,
   );
-  if (rootFailed)
-    return { action: rootFailed.action, chainSequence: rootFailed.chain_sequence };
+  if (rootFailed) return `${rootFailed.action} failed.`;
   const firstHalted = chain.jobs
-    .filter(
-      (j) => j.chain_halted_reason && !isAutoSkippedJob(j),
-    )
+    .filter((j) => j.chain_halted_reason && !isAutoSkippedJob(j))
     .sort((a, b) => a.chain_sequence - b.chain_sequence)[0];
-  if (firstHalted)
-    return {
-      action: firstHalted.action,
-      chainSequence: firstHalted.chain_sequence,
-    };
+  if (firstHalted?.chain_halted_reason) {
+    return humanizeHaltedReason(firstHalted.chain_halted_reason).replace(
+      /^Chain halted:\s*/,
+      "",
+    );
+  }
   return null;
 }
 
@@ -101,9 +84,12 @@ function findHaltedReasonJob(
 import {
   formatModelDisplayName,
   localTeacherDisplayName,
+  quantizationDisplayName,
   shortBaseLabel,
 } from "@/lib/model-display";
 import { runStatusRefetchInterval } from "@/lib/run-status-polling";
+import { humanizeHaltedReason } from "@/lib/training/failure-display";
+import { isAutoSkippedReason } from "@/lib/training/statusDisplay";
 
 /**
  * Build a per-job quantization suffix label for display on Quantize and
@@ -131,7 +117,7 @@ function computeQuantLabels(
       // After the baseline evaluate, each pair corresponds to the next scheme.
       const quantPairIndex = Math.floor((i - 2) / 2);
       const scheme = schemes[quantPairIndex] ?? null;
-      result[job.tao_job_id] = scheme;
+      result[job.tao_job_id] = scheme ? quantizationDisplayName(scheme) : null;
     } else {
       result[job.tao_job_id] = null;
     }
@@ -161,6 +147,30 @@ export function TrainingJobMonitorPage() {
     }),
   });
 
+  const retryDatasetUpload = useMutation({
+    mutationFn: () => {
+      if (!suite) throw new Error("Training Suite is not loaded");
+      return createTrainingSuite(projectId, {
+        student_base_model_config_ids: suite.selected_student_base_model_config_ids,
+        training_preset: suite.training_preset,
+        include_auto_labeled: suite.include_auto_labeled,
+        enable_lora: suite.enable_lora,
+        export_field_mode: suite.export_field_mode,
+        quantization_schemes: suite.quantization_schemes,
+        idempotency_key: suite.idempotency_key,
+      });
+    },
+    onSuccess: (updatedSuite) => {
+      queryClient.setQueryData(
+        trainingKeys.suite(projectId, trainingSuiteId!),
+        updatedSuite,
+      );
+      void queryClient.invalidateQueries({
+        queryKey: trainingKeys.suites(projectId),
+      });
+    },
+  });
+
   // Live SSE invalidation: whenever a TAO-job event arrives, refresh the
   // suite + the specific job's detail cache so React Query refetches.
   useEffect(() => {
@@ -183,11 +193,23 @@ export function TrainingJobMonitorPage() {
     }
   }, [lastEvent, projectId, trainingSuiteId, queryClient]);
 
-  const allChainsComplete = useMemo(
+  const compareAvailable = useMemo(
     () =>
       suite !== undefined &&
       suite.chains.length > 0 &&
-      suite.chains.every(chainAllComplete),
+      suite.chains.every(
+        (chain) =>
+          chain.jobs.length > 0 &&
+          chain.jobs.every((job) => TERMINAL_TAO_STATUSES.has(job.status)),
+      ) &&
+      suite.chains.some((chain) =>
+        chain.jobs.some(
+          (job) =>
+            job.action === "train" &&
+            job.status === "succeeded" &&
+            job.outputs_fetch_status === "completed",
+        ),
+      ),
     [suite],
   );
 
@@ -213,6 +235,10 @@ export function TrainingJobMonitorPage() {
     !provisioningFailed &&
     !provisioningCanceled;
   const suiteCancelable = !TERMINAL_TRAINING_SUITE_STATUSES.has(suite.status);
+  const trainingSetupError = suite.setup_error_ref?.replace(
+    /^tao_dataset_upload_failed:\s*/,
+    "",
+  );
 
   // Overall chain progress line (e.g., "8B: done · 2B: 5 of 6") composed
   // from the ordered chains.  Uses the codebase's established middle-dot
@@ -336,19 +362,45 @@ export function TrainingJobMonitorPage() {
               </Text>
             </SectionCard>
           )}
-
-          {suite.status === "failed" &&
-            !provisioningFailed &&
-            suite.setup_error_ref && (
-              <InfoBanner
-                tone="error"
-                border="edge"
-                heading="Training Jobs setup failed."
-                body={suite.setup_error_ref}
-                data-testid="training-setup-error"
-              />
-            )}
         </section>
+      )}
+
+      {suite.status === "failed" && !provisioningFailed && suite.setup_error_ref && (
+        <InfoBanner
+          tone="error"
+          border="edge"
+          heading="Training Jobs setup failed."
+          body={trainingSetupError}
+          actions={
+            suite.setup_retryable ? (
+              <Button
+                kind="primary"
+                className="nvidia-green-button"
+                disabled={retryDatasetUpload.isPending}
+                onClick={() => retryDatasetUpload.mutate()}
+                data-testid="training-retry-dataset-upload"
+              >
+                {retryDatasetUpload.isPending
+                  ? "Retrying Dataset Upload…"
+                  : "Retry Dataset Upload"}
+              </Button>
+            ) : undefined
+          }
+          data-testid="training-setup-error"
+        />
+      )}
+
+      {retryDatasetUpload.isError && (
+        <InfoBanner
+          tone="error"
+          border="edge"
+          heading="Dataset upload retry failed."
+          body={
+            parseApiErrorDetail(retryDatasetUpload.error) ??
+            retryDatasetUpload.error.message
+          }
+          data-testid="training-retry-dataset-upload-error"
+        />
       )}
 
       {suite.chains.map((chain) => {
@@ -375,7 +427,7 @@ export function TrainingJobMonitorPage() {
                 tone="warning"
                 border="edge"
                 align="center"
-                heading={`Chain halted: ${halted.action} failed.`}
+                heading={`Chain halted: ${halted}`}
                 data-testid={`chain-halted-banner-${chain.chain_id}`}
               />
             )}
@@ -383,20 +435,42 @@ export function TrainingJobMonitorPage() {
             <div className="flex flex-col gap-3">
               {[...chain.jobs]
                 .sort((a, b) => a.chain_sequence - b.chain_sequence)
-                .map((job) => (
-                  <JobCard
-                    key={job.tao_job_id}
-                    projectId={projectId}
-                    suiteJob={job}
-                    quantizationScheme={quantLabels[job.tao_job_id]}
-                  />
-                ))}
+                .map((job, index, jobs) => {
+                  const predecessor = index > 0 ? jobs[index - 1] : null;
+                  const waitingForArtifactFinalization =
+                    predecessor?.status === "succeeded" &&
+                    (predecessor.outputs_fetch_status === "pending" ||
+                      predecessor.outputs_fetch_status === "in_progress");
+                  const blockedByArtifactFailure =
+                    predecessor?.status === "succeeded" &&
+                    predecessor.outputs_fetch_status === "failed";
+                  return (
+                    <JobCard
+                      key={job.tao_job_id}
+                      projectId={projectId}
+                      suiteJob={job}
+                      quantizationScheme={quantLabels[job.tao_job_id]}
+                      waitingForArtifactFinalization={waitingForArtifactFinalization}
+                      blockedByArtifactFailure={blockedByArtifactFailure}
+                      onOpenCompare={() => navigate("../compare")}
+                    />
+                  );
+                })}
             </div>
           </section>
         );
       })}
 
       <div className="flex items-center justify-end gap-3 pt-4">
+        {suiteAllTerminal(suite) && (
+          <Button
+            kind="secondary"
+            onClick={() => navigate("../training-runs")}
+            data-testid="monitor-back-to-training-runs"
+          >
+            Back to Training Runs
+          </Button>
+        )}
         {suiteCancelable && (
           <Button
             kind="secondary"
@@ -406,7 +480,7 @@ export function TrainingJobMonitorPage() {
             Cancel Jobs
           </Button>
         )}
-        {allChainsComplete ? (
+        {compareAvailable ? (
           <Button
             kind="primary"
             className="nvidia-green-button"
@@ -416,7 +490,7 @@ export function TrainingJobMonitorPage() {
             Compare Students
           </Button>
         ) : (
-          <Tooltip content="Available once every chain reaches Completed">
+          <Tooltip content="Available after all jobs finish and at least one Student artifact is ready">
             <Button
               kind="primary"
               disabled

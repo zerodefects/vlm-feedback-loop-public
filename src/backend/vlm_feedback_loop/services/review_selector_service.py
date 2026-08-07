@@ -48,16 +48,6 @@ HASH_BITS = 64  # 64-bit pHash
 _last_mode_by_project: dict[str, str] = {}
 
 
-def _reset_mode_tracker() -> None:
-    """Clear the per-project mode tracker.  Used by tests."""
-    _last_mode_by_project.clear()
-
-
-# Listed here so pyright stops flagging ``_reset_mode_tracker`` as unused —
-# it IS used, just from tests/unit/test_review_selector.py.
-__all__ = ["_reset_mode_tracker", "select_next"]
-
-
 # ── Similarity functions ───────────────────────────────────────────────────
 
 

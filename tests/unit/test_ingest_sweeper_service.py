@@ -120,7 +120,7 @@ class TestSweeperHappyPath:
             "vlm_feedback_loop.services.ingest_sweeper_service.sse_manager.emit",
             new=AsyncMock(),
         ) as mock_emit:
-            await _ingest_worker(pid, settings.WORKSPACE_ROOT)
+            await _ingest_worker(pid, settings.WORKSPACE_ROOT, settings)
 
         assert _count_null_phash(pid, settings.WORKSPACE_ROOT) == 0
         # ingest_completed fires exactly once with processed=total=10
@@ -146,7 +146,7 @@ class TestSweeperIdempotency:
             "vlm_feedback_loop.services.ingest_sweeper_service.sse_manager.emit",
             new=AsyncMock(),
         ):
-            await _ingest_worker(pid, settings.WORKSPACE_ROOT)
+            await _ingest_worker(pid, settings.WORKSPACE_ROOT, settings)
 
         assert _count_null_phash(pid, settings.WORKSPACE_ROOT) == 0
 
@@ -154,7 +154,7 @@ class TestSweeperIdempotency:
             "vlm_feedback_loop.services.ingest_sweeper_service.sse_manager.emit",
             new=AsyncMock(),
         ) as mock_emit:
-            await _ingest_worker(pid, settings.WORKSPACE_ROOT)
+            await _ingest_worker(pid, settings.WORKSPACE_ROOT, settings)
 
         # Second run finds no remaining rows → exits without dispatching
         # any progress batch. Only the terminal ``ingest_completed`` fires
@@ -190,7 +190,7 @@ class TestSweeperRecovery:
         ) as mock_trigger:
             await recover_ingest_tasks(settings)
         # Recovery saw the null-pHash rows and called trigger.
-        mock_trigger.assert_called_once_with(pid, settings.WORKSPACE_ROOT)
+        mock_trigger.assert_called_once_with(pid, settings.WORKSPACE_ROOT, settings)
 
     @pytest.mark.asyncio
     async def test_recovery_skips_when_no_null_phash(self, tmp_path: Path):
@@ -259,7 +259,7 @@ class TestSweeperPerRowErrorTolerance:
             "vlm_feedback_loop.services.ingest_sweeper_service.sse_manager.emit",
             new=AsyncMock(),
         ) as mock_emit:
-            await _ingest_worker(pid, settings.WORKSPACE_ROOT)
+            await _ingest_worker(pid, settings.WORKSPACE_ROOT, settings)
 
         # Bad row stays at NULL; the 4 good rows are populated.
         assert _count_null_phash(pid, settings.WORKSPACE_ROOT) == 1
@@ -309,7 +309,7 @@ class TestSweeperDedup:
                 "vlm_feedback_loop.services.ingest_sweeper_service.background_manager.register"
             ) as mock_register,
         ):
-            trigger_ingest_processing(pid, settings.WORKSPACE_ROOT)
+            trigger_ingest_processing(pid, settings.WORKSPACE_ROOT, settings)
 
         mock_register.assert_not_called()
 
@@ -338,7 +338,7 @@ class TestSweeperShutdown:
                 new=AsyncMock(),
             ) as mock_emit,
         ):
-            await _ingest_worker(pid, settings.WORKSPACE_ROOT)
+            await _ingest_worker(pid, settings.WORKSPACE_ROOT, settings)
 
         assert mock_emit.call_args_list == []
         # Rows still null — recovery on next startup picks them up.

@@ -9,8 +9,9 @@
 # tracking the shipped default across upgrades; an uncommented line
 # pins the value written here.
 #
-# Secrets (NVIDIA_API_KEY, NGC_API_KEY, TAO_*, HF_TOKEN) belong in .env,
-# NOT here. See .env.example for the secrets template.
+# Secrets (NVIDIA_API_KEY, NGC_API_KEY, TAO_API_KEY, TAO workspace S3
+# credentials, and HF_TOKEN) belong in .env, NOT here. See .env.example for
+# the secrets template. Non-secret TAO runtime settings remain in this file.
 #
 # Configuration precedence (Engineering_Spec §1.9):
 #   1. Process environment variables
@@ -35,9 +36,10 @@ WORKSPACE_ROOT: /path/to/workspace
 # BIND_HOST: 127.0.0.1
 # BIND_PORT: 8000
 # IMAGE_ROOT:
-# When unset on loopback, Ingest opens at "/" and the filesystem is
-# unrestricted. To start in one dataset directory instead:
-# IMAGE_ROOT: /absolute/path/to/vlm-feedback-loop/deploy/example-images
+# When unset on loopback, the filesystem is unrestricted; Ingest starts beside
+# the bundled sample when it is present. To restrict browsing while keeping the
+# sample directory itself selectable, configure its parent:
+# IMAGE_ROOT: /absolute/path/to/vlm-feedback-loop/deploy
 
 # ── Hosted NIM ─────────────────────────────────────────────
 # HOSTED_NIM_BASE_URL: https://integrate.api.nvidia.com/v1
@@ -65,10 +67,13 @@ WORKSPACE_ROOT: /path/to/workspace
 
 # ── New-project defaults ───────────────────────────────────
 # What model gets seeded as the Teacher on freshly-created projects.
-# Built-in default is hosted MiniMax-M3 — works on any machine with
-# NVIDIA_API_KEY set, no GPU required.
+# Built-in default is hosted Step 3.7 Flash — works on any machine with
+# NVIDIA_API_KEY set, no GPU required, and its published model terms permit
+# commercial use. NVIDIA's free API Catalog endpoint remains for development
+# and evaluation; production requires a subscribed provider endpoint or an
+# appropriately entitled self-hosted NIM.
 #
-# DEFAULT_TEACHER_MODEL: minimaxai/minimax-m3
+# DEFAULT_TEACHER_MODEL: stepfun-ai/step-3.7-flash
 # DEFAULT_TEACHER_LOCAL_BASE_URL: null
 #
 # To use a locally-deployed Teacher NIM (e.g. on a GPU rental with
@@ -89,7 +94,7 @@ WORKSPACE_ROOT: /path/to/workspace
 # this false via process env (the in-container .env is ephemeral).
 # ALLOW_UI_SECRET_PERSIST: true
 
-# ── Embedding model identity (see README §Embedding model override) ──
+# ── Embedding model identity (see Engineering Spec §5.5) ─────
 # The supported Blueprint model is NVIDIA NeMo Retriever VL 1B v2 (2048-dim).
 # Advanced replacements must expose the same OpenAI-compatible embeddings API;
 # the system-managed local launch profile supports only the shipped model.
@@ -113,3 +118,130 @@ WORKSPACE_ROOT: /path/to/workspace
 # unusually long runs. Student Training preflight fails closed if the TAO v2
 # API does not support this field (install guide §13.15).
 # TAO_JOB_TIMEOUT_MINUTES: 1440
+
+# ── Complete advanced tuning catalog ─────────────────────
+# The settings below are normally left commented. They are included so this
+# public sample remains a complete, searchable map of every supported
+# non-secret setting. Uncomment only the narrow value you intentionally want
+# to pin; otherwise the Blueprint continues to inherit the release default.
+
+# Embedding lifecycle and request shape (concurrency and batch sizes must be >= 1)
+# EMBEDDING_PROVIDER: auto
+# EMBEDDING_INPUT_TYPE: passage
+# EMBEDDINGS_AUTO_COMPUTE: true
+# EMBEDDING_CONCURRENCY_HOSTED: 1
+# EMBEDDING_BATCH_SIZE_HOSTED: 8
+# EMBEDDING_CONCURRENCY_SELF_HOSTED: 4
+# EMBEDDING_BATCH_SIZE_SELF_HOSTED: 1
+
+# Proposal generation and visual-budget tables
+# THINKING_DEFAULT_ON: true
+# LABELING_PRESETS:
+#   precise:
+#     temperature: 0.0
+#     top_p: 1.0
+#   explore:
+#     temperature: 0.3
+#     top_p: 0.9
+# VISUAL_BUDGET_PRESETS:
+#   native: {}
+#   fast:
+#     mm_processor_size:
+#       size:
+#         shortest_edge: 1568
+#         longest_edge: 65536
+#     mm_processor_pixels:
+#       images_kwargs:
+#         min_pixels: 1568
+#         max_pixels: 65536
+#     mm_processor_tiles:
+#       max_num_tiles: 8
+#   balanced:
+#     mm_processor_size:
+#       size:
+#         shortest_edge: 1568
+#         longest_edge: 131072
+#     mm_processor_pixels:
+#       images_kwargs:
+#         min_pixels: 1568
+#         max_pixels: 131072
+#     mm_processor_tiles:
+#       max_num_tiles: 16
+#   high_detail:
+#     mm_processor_size:
+#       size:
+#         shortest_edge: 1568
+#         longest_edge: 262144
+#     mm_processor_pixels:
+#       images_kwargs:
+#         min_pixels: 1568
+#         max_pixels: 262144
+#     mm_processor_tiles:
+#       max_num_tiles: 32
+# RUNTIME_PROMPT_OUTPUT_MAX_TOKENS_OVERRIDE: null
+# RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN: 0.85
+# BASE_OUTPUT_TOKENS_FLOOR: 256
+# JSON_STRUCTURAL_OVERHEAD_TOKENS: 48
+# MAX_OUTPUT_FRACTION: 0.25
+# RATIONALE_NOTE_ESTIMATE_TOKENS: 160
+# DEFAULT_UNBOUNDED_STRING_BUDGET: 200
+# MODEL_REASONING_HEADROOM_TOKENS: 16384
+# Token counts must be positive (structural overhead may be zero); fractions
+# and the safety margin must be > 0 and <= 1. Reasoning headroom must be >= 4096.
+
+# ICL, evaluation, and batch dispatch
+# ICL maximum may be null; when set, it must be >= 1.
+# ICL_MAX_EXAMPLES: null
+# ICL_SIM_GAP: 0.05
+# ICL_ABS_THRESHOLD: null
+# Batch run limit may be null; when set, it and the breaker threshold must be >= 1.
+# BATCH_LABEL_RUN_LIMIT: null
+# BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD: 10
+# Dispatch concurrencies must be >= 1.
+# BATCH_LABEL_CONCURRENCY_HOSTED: 1
+# BATCH_LABEL_CONCURRENCY_SELF_HOSTED: 8
+# EVAL_CONCURRENCY_HOSTED: 1
+# EVAL_CONCURRENCY_SELF_HOSTED: 8
+# EVAL_FIRST_POOL_SIZE: 5
+# EVAL_RATE_LIMIT_RETRY_MAX_PASSES: 4
+# EVAL_RATE_LIMIT_RETRY_BACKOFF_S: 30
+# HOSTED_GLOBAL_RPM: 0
+# ENABLE_THINKING_TOGGLE_FALLBACK: true
+# ENABLE_VISUAL_BUDGET_FALLBACK: true
+
+# Student training and local serving (timeouts and each concurrency must be >= 1)
+# TAO_RELEASE_VERSION: 6.26.3
+# COSMOS_RL_CONTAINER_TAG: 6.26.3-cosmos-rl
+# TAO_QUANTIZATION_CALIBRATION_SAMPLES: 128
+# STUDENT_QUALITY_PARTIAL_PARSEABLE_THRESHOLD: 0.9
+# MERGE_LORA_PYTHON: null
+# NIM_STARTUP_TIMEOUT_S: 1200
+# NIM_BENCHMARK_TIMEOUT_S: 1200
+# STUDENT_LATENCY_TEST_CONCURRENCIES:
+# - 1
+# - 8
+# - 24
+# NIM_GPU_MEMORY_8B_BF16_GB: 56
+# NIM_GPU_MEMORY_8B_FP8_GB: 48
+# NIM_GPU_MEMORY_2B_BF16_GB: 36
+# NIM_GPU_MEMORY_2B_FP8_GB: 24
+# NIM_STUDENT_PORT: 8002
+
+# Review selection and schema reminders
+# REVIEW_SELECTION_MODE: auto
+# REVIEW_RECENT_WINDOW_K: 20
+# CLIP_SWITCHOVER_MIN_COUNT: 50
+# SCHEMA_REFINEMENT_REMINDER_THRESHOLD_1: 10
+# SCHEMA_REFINEMENT_REMINDER_THRESHOLD_2: 35
+
+# HTTP deadlines and TAO reconciliation cadence (deadlines/attempts must be >= 1)
+# HTTP_DEADLINE_INTERACTIVE_S: 180
+# HTTP_DEADLINE_BACKGROUND_S: 300
+# HTTP_MAX_RETRIES: 3
+# TAO_POLL_MIN_INTERVAL_S: 30
+# TAO_POLL_MIN_INTERVAL_RUNNING_S: 60
+# TAO_POLL_TICK_S: 10
+# TAO_AUTOEVAL_SKIP_BASES:
+# - nvidia/cosmos-reason2-8b
+# - nvidia/cosmos3-nano-reasoner
+# - nvidia/cosmos3-super-reasoner

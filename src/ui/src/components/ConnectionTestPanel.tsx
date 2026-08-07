@@ -23,7 +23,7 @@ import { Check, ShieldCheck, X } from "lucide-react";
 
 import { testConnection, testNvidiaCredential } from "@/api/nim";
 import { CredentialInput } from "@/components/CredentialInput";
-import type { ConnectionTestResponse } from "@/types/nim";
+import type { ConnectionTestResponse, ProbeKind } from "@/types/nim";
 
 interface TestVars {
   mode: "hosted" | "self_hosted";
@@ -33,6 +33,8 @@ interface TestVars {
 interface ConnectionTestPanelProps {
   mode: "hosted" | "self_hosted";
   apiKeyConfigured: boolean;
+  /** Exact NIM operation the self-hosted endpoint must prove. */
+  probeKind?: ProbeKind;
   /**
    * Fired when a connection probe returns ``success=true``. The second
    * argument is the credential VALUE that just probed green — for
@@ -40,7 +42,11 @@ interface ConnectionTestPanelProps {
    * parent (NIMConnectionPage) uses it to dispatch ``POST
    * /v1/secrets:set`` on Continue / Save for the hosted key path.
    */
-  onTestSuccess?: (result: ConnectionTestResponse, credential: string) => void;
+  onTestSuccess?: (
+    result: ConnectionTestResponse,
+    credential: string,
+    baseUrl?: string,
+  ) => void;
   /**
    * Fired whenever the SME edits the endpoint field after a previous
    * green test. Lets the parent reset its ``connectionVerified`` state
@@ -67,6 +73,7 @@ export function ConnectionTestPanel({
   apiKeyConfigured,
   onTestSuccess,
   onCredentialChange,
+  probeKind = "models",
 }: ConnectionTestPanelProps) {
   const [baseUrl, setBaseUrl] = useState(
     mode === "hosted" ? "https://integrate.api.nvidia.com/v1" : "",
@@ -89,13 +96,13 @@ export function ConnectionTestPanel({
       return testConnection({
         base_url: vars.baseUrl,
         auth_mode: "none",
-        probe_kind: "models",
+        probe_kind: probeKind,
       });
     },
     onSuccess: (result) => {
       setTestResult(result);
       if (result.success && onTestSuccess) {
-        onTestSuccess(result, "");
+        onTestSuccess(result, "", baseUrl.trim().replace(/\/+$/, ""));
       }
     },
   });
@@ -144,9 +151,9 @@ export function ConnectionTestPanel({
               <Text kind="label/bold/sm" style={{ color: "var(--text-primary)" }}>
                 Base URL
               </Text>
-              <span aria-hidden="true" className="text-error">
+              <Text kind="label/bold/sm" aria-hidden="true" className="text-error">
                 *
-              </span>
+              </Text>
             </label>
             <input
               id={baseUrlInputId}

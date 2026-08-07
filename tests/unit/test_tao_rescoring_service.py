@@ -188,6 +188,14 @@ def _make_eval_archive(path: Path, samples: list[dict]) -> None:
         tf.addfile(info, io.BytesIO(ann_bytes))
 
 
+def _load_eval_archive(path: Path):
+    with path.open("rb") as archive_stream:
+        return tao_rescoring_service._load_ground_truth_from_archive(
+            archive_stream,
+            path,
+        )
+
+
 def _write_predictions_single_file(cache_dir: Path, preds: dict[str, dict]):
     """Single-file layout: per_sample_predictions is a JSON file."""
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -356,7 +364,7 @@ async def _prepare_rescore_case(
 ):
     """Build one real frozen-export/prediction case and register its Student."""
     engine, workspace, pdir = _seed_project(tmp_path)
-    archive = pdir / f"{chain_id}-eval.tar.gz"
+    archive = pdir / "exports" / f"{chain_id}-eval.tar.gz"
     _make_eval_archive(archive, samples)
     cache = pdir / "artifacts" / "tao_jobs" / f"{chain_id}-eval"
     cache.mkdir(parents=True, exist_ok=True)
@@ -416,20 +424,11 @@ class TestGroundTruthLoader:
         archive = tmp_path / "eval.tar.gz"
         _make_eval_archive(archive, samples)
 
-        gt, duplicate_keys = tao_rescoring_service._load_ground_truth_from_archive(
-            archive
-        )
+        gt, duplicate_keys = _load_eval_archive(archive)
         assert gt == {
             "ex-01": {"damage_type": "crush", "severity": 2},
             "ex-02": {"damage_type": "dent", "severity": 1},
         }
-        assert duplicate_keys == frozenset()
-
-    def test_missing_archive_returns_empty_dict(self, tmp_path):
-        gt, duplicate_keys = tao_rescoring_service._load_ground_truth_from_archive(
-            tmp_path / "nope.tar.gz"
-        )
-        assert gt == {}
         assert duplicate_keys == frozenset()
 
     @pytest.mark.parametrize("corruption", ["not-tar", "truncated-gzip"])
@@ -444,9 +443,7 @@ class TestGroundTruthLoader:
             )
             archive.write_bytes(archive.read_bytes()[:50])
 
-        gt, duplicate_keys = tao_rescoring_service._load_ground_truth_from_archive(
-            archive
-        )
+        gt, duplicate_keys = _load_eval_archive(archive)
 
         assert gt == {}
         assert duplicate_keys == frozenset()
@@ -461,9 +458,7 @@ class TestGroundTruthLoader:
             ],
         )
 
-        gt, duplicate_keys = tao_rescoring_service._load_ground_truth_from_archive(
-            archive
-        )
+        gt, duplicate_keys = _load_eval_archive(archive)
 
         assert gt == {"ex-01": {"damage_type": "crush", "severity": 2}}
         assert duplicate_keys == frozenset({"ex-01"})
@@ -477,9 +472,7 @@ class TestGroundTruthLoader:
             info.size = len(bad)
             tf.addfile(info, io.BytesIO(bad))
 
-        gt, duplicate_keys = tao_rescoring_service._load_ground_truth_from_archive(
-            archive
-        )
+        gt, duplicate_keys = _load_eval_archive(archive)
         assert gt == {}
         assert duplicate_keys == frozenset()
 
@@ -639,7 +632,7 @@ class TestHappyPath:
     async def test_full_rescore_creates_runrecord_and_flips_quality(self, tmp_path):
         engine, workspace, pdir = _seed_project(tmp_path)
 
-        archive = pdir / "de-eval.tar.gz"
+        archive = pdir / "exports" / "de-eval.tar.gz"
         _make_eval_archive(
             archive,
             [
@@ -768,7 +761,7 @@ class TestHappyPath:
         schema_invalid_prediction,
     ):
         engine, workspace, pdir = _seed_project(tmp_path)
-        archive = pdir / "de-eval.tar.gz"
+        archive = pdir / "exports" / "de-eval.tar.gz"
         _make_eval_archive(
             archive,
             [
@@ -852,7 +845,7 @@ class TestHappyPath:
         engine, workspace, pdir = _seed_project(tmp_path)
         _swap_schema_to_boolean_core(engine)
 
-        archive = pdir / "de-eval-bool.tar.gz"
+        archive = pdir / "exports" / "de-eval-bool.tar.gz"
         _make_eval_archive(
             archive,
             [
@@ -905,6 +898,47 @@ class TestHappyPath:
 
 
 class TestFrozenEvaluationPopulation:
+    @pytest.mark.asyncio
+    async def test_archive_reference_outside_project_exports_is_rejected(
+        self, tmp_path
+    ):
+        sample = _gt_sample(
+            "ex-01",
+            {"damage_type": "crush", "severity": 2},
+        )
+        engine, settings, _student_id, eval_id = await _prepare_rescore_case(
+            tmp_path,
+            samples=[sample],
+            predictions=[
+                {
+                    "id": "ex-01",
+                    "prediction": json.dumps({"damage_type": "crush", "severity": 2}),
+                }
+            ],
+            eval_example_count=1,
+            chain_id="chain-outside-export-root",
+        )
+        outside_archive = tmp_path / "outside-eval.tar.gz"
+        _make_eval_archive(outside_archive, [sample])
+        with Session(engine) as session:
+            dataset_export = session.get(DatasetExport, "de-eval")
+            assert dataset_export is not None
+            dataset_export.artifact_refs = {
+                "archive_path": str(outside_archive),
+                "checksum_sha256": sha256_file(outside_archive),
+            }
+            session.commit()
+
+        run_id = await tao_rescoring_service.rescore_evaluate_job(
+            PID,
+            eval_id,
+            settings=settings,
+        )
+
+        assert run_id is None
+        with Session(engine) as session:
+            assert session.query(RunRecord).count() == 0
+
     @pytest.mark.asyncio
     async def test_missing_prediction_cannot_validate_a_subset(self, tmp_path):
         """Every frozen Test Pool key needs prediction evidence."""
@@ -1359,7 +1393,7 @@ class TestC2EmptyPredictions:
     @pytest.mark.asyncio
     async def test_no_predictions_file_returns_none(self, tmp_path):
         engine, workspace, pdir = _seed_project(tmp_path)
-        archive = pdir / "de-eval.tar.gz"
+        archive = pdir / "exports" / "de-eval.tar.gz"
         _make_eval_archive(
             archive,
             [
@@ -1400,7 +1434,7 @@ class TestC2EmptyPredictions:
     @pytest.mark.asyncio
     async def test_predictions_all_unparseable_returns_none(self, tmp_path):
         engine, workspace, pdir = _seed_project(tmp_path)
-        archive = pdir / "de-eval.tar.gz"
+        archive = pdir / "exports" / "de-eval.tar.gz"
         _make_eval_archive(
             archive,
             [
@@ -1450,7 +1484,7 @@ class TestC2EmptyPredictions:
         whose metrics score nothing but invalid samples."""
         engine, workspace, pdir = _seed_project(tmp_path)
         _swap_schema_to_boolean_core(engine)
-        archive = pdir / "de-eval-allinvalid.tar.gz"
+        archive = pdir / "exports" / "de-eval-allinvalid.tar.gz"
         _make_eval_archive(
             archive,
             [_gt_sample("ex-01", {"is_damaged": True, "damage_kind": "dent"})],
@@ -1723,7 +1757,7 @@ class TestRerescore:
         stripping) flips to validated when re-rescore runs against the
         same on-disk predictions under current code."""
         engine, workspace, pdir = _seed_project(tmp_path)
-        archive = pdir / "de-eval-f33.tar.gz"
+        archive = pdir / "exports" / "de-eval-f33.tar.gz"
         _make_eval_archive(
             archive,
             [
@@ -1815,7 +1849,7 @@ class TestRerescore:
         """Re-rescore MUST refuse to overwrite a Student whose quality_status
         is already 'validated'. The Student stays unchanged."""
         engine, workspace, pdir = _seed_project(tmp_path)
-        archive = pdir / "de-eval-f33-v.tar.gz"
+        archive = pdir / "exports" / "de-eval-f33-v.tar.gz"
         _make_eval_archive(
             archive,
             [
@@ -1868,7 +1902,7 @@ class TestRerescore:
         """Re-rescore MUST refuse to operate on a quality_status='pending'
         Student — those are still mid-pipeline."""
         engine, workspace, pdir = _seed_project(tmp_path)
-        archive = pdir / "de-eval-f33-p.tar.gz"
+        archive = pdir / "exports" / "de-eval-f33-p.tar.gz"
         _make_eval_archive(
             archive,
             [
@@ -1926,7 +1960,7 @@ class TestRerescore:
         Partial Students are set by NIM-eval, not by a stale TAO rescore;
         the remediation path is to re-run NIM eval, not :rerescore."""
         engine, workspace, pdir = _seed_project(tmp_path)
-        archive = pdir / "de-eval-f33-partial.tar.gz"
+        archive = pdir / "exports" / "de-eval-f33-partial.tar.gz"
         _make_eval_archive(
             archive,
             [

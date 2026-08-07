@@ -82,8 +82,3 @@ def release_all_locks() -> None:
     """Release all project locks. Called during shutdown."""
     for project_id in list(_active_locks.keys()):
         release_project_lock(project_id)
-
-
-def clear_lock_state() -> None:
-    """Clear lock tracking without releasing OS locks. For testing only."""
-    _active_locks.clear()

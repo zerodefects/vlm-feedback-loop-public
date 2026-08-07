@@ -52,8 +52,8 @@ async def set_secret(
        they don't choose to persist.
     2. When ``persist=true`` AND ``ALLOW_UI_SECRET_PERSIST`` is true,
        additionally writes the line to ``~/.vlm_feedback_loop/.env``,
-       reloads Settings, and clears the runtime override (so the
-       persisted disk value becomes canonical).
+       reloads Settings, and retains the same runtime override so queued
+       work with an older Settings snapshot still sees the new value.
     3. When ``persist=true`` AND ``ALLOW_UI_SECRET_PERSIST`` is false,
        returns 403 ``ui_secret_persist_disabled`` — the runtime
        application step is NOT executed, since the SME's explicit

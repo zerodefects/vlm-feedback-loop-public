@@ -137,13 +137,6 @@ def _throttle_key(url: str, json_body: dict[str, Any] | None) -> str:
     return f"{host}|{model}" if model else host
 
 
-def reset_adaptive_throttle() -> None:
-    """Clear learned per-host pacing. Used by tests for isolation."""
-    _HOST_MIN_INTERVAL.clear()
-    _HOST_LAST_CALL.clear()
-    _HOST_LOCKS.clear()
-
-
 def _note_rate_limited(host: str, retry_after: float) -> None:
     """Raise ``host``'s learned min-interval after a 429 (multiplicative
     increase, seeded by the server's Retry-After, capped)."""

@@ -26,10 +26,33 @@ export function formatPct(v: number | null | undefined): string {
   return WHOLE_PERCENT.format(v);
 }
 
-// Same half-even rounding as WHOLE_PERCENT so a delta never disagrees on
-// ties with the rates it derives from.
-const WHOLE_NUMBER = new Intl.NumberFormat("en-US", {
-  maximumFractionDigits: 0,
+// Evaluation and benchmark results need enough precision for an SME to compare
+// close runs without adding a trailing decimal to already-whole values.
+const METRIC_PERCENT = new Intl.NumberFormat("en-US", {
+  style: "percent",
+  maximumFractionDigits: 1,
+  roundingMode: "halfEven",
+} as Intl.NumberFormatOptions);
+
+/**
+ * 0–1 result metric → percent with one meaningful decimal at most.
+ *
+ * Keep ``formatPct`` for readiness copy whose backend explanation is rounded
+ * to whole percentages. Result surfaces use this formatter so a measured
+ * 90.8333% score remains distinguishable from 91.2% instead of both reading
+ * as 91%.
+ */
+export function formatMetricPct(v: number | null | undefined): string {
+  if (v == null || Number.isNaN(v)) return "—";
+  return METRIC_PERCENT.format(v);
+}
+
+// Preserve one decimal place when the underlying rates differ by a fractional
+// percentage point. Whole-point deltas stay compact ("+7 pts"), while a real
+// 2.5-point gap is never presented as 2 points merely because it lands on a
+// half-even tie.
+const DELTA_POINTS = new Intl.NumberFormat("en-US", {
+  maximumFractionDigits: 1,
   useGrouping: false,
   roundingMode: "halfEven",
 } as Intl.NumberFormatOptions);
@@ -44,6 +67,6 @@ const WHOLE_NUMBER = new Intl.NumberFormat("en-US", {
  */
 export function formatDeltaPoints(delta: number): string {
   // `+ 0` folds Intl's "-0" (a tiny negative delta) into plain zero.
-  const pts = Number(WHOLE_NUMBER.format(delta * 100)) + 0;
-  return `${pts >= 0 ? "+" : ""}${pts} pts`;
+  const pts = Number(DELTA_POINTS.format(delta * 100)) + 0;
+  return `${pts >= 0 ? "+" : ""}${DELTA_POINTS.format(pts)} pts`;
 }

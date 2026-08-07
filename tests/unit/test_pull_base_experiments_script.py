@@ -7,17 +7,19 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
-from pathlib import Path
 from types import ModuleType
 
 import pytest
 
+from vlm_feedback_loop.services.tao_base_experiment_provisioning_service import (
+    PULL_SCRIPT_PATH,
+)
+
 
 @pytest.fixture
 def pull_script() -> ModuleType:
-    script_path = Path(__file__).parents[2] / "scripts" / "pull_base_experiments.py"
     spec = importlib.util.spec_from_file_location(
-        "pull_base_experiments_under_test", script_path
+        "pull_base_experiments_under_test", PULL_SCRIPT_PATH
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

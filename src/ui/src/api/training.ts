@@ -36,6 +36,7 @@ export function runTrainingPreflight(
   studentBaseModelConfigIds: string[],
   includeAutoLabeled = true,
   enableLora = true,
+  quantizationSchemes: string[] = ["FP8_DYNAMIC"],
 ): Promise<TrainingPreflightResponse> {
   return apiFetch<TrainingPreflightResponse>(
     `/projects/${projectId}/training_preflight`,
@@ -45,6 +46,7 @@ export function runTrainingPreflight(
         student_base_model_config_ids: studentBaseModelConfigIds,
         include_auto_labeled: includeAutoLabeled,
         enable_lora: enableLora,
+        quantization_schemes: quantizationSchemes,
       }),
     },
   );

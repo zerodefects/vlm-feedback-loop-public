@@ -210,7 +210,9 @@ async def _list_tao_job_files(
     return {"success": True, "keys": keys, "error": None}
 
 
-def _select_hf_checkpoint_keys(keys: list[str]) -> tuple[list[str], str | None]:
+def _select_hf_checkpoint_keys(
+    keys: list[str], *, prefer_quantize_root: bool = False
+) -> tuple[list[str], str | None]:
     """Pick the merged-HF checkpoint keys from a TAO job's full key list.
 
     cosmos-rl emits checkpoints in two distinct workspace layouts
@@ -230,9 +232,10 @@ def _select_hf_checkpoint_keys(keys: list[str]) -> tuple[list[str], str | None]:
       returned ``([], None)`` and the empty-listing retry loop fired
       through its full attempt budget thinking the upload was racing.
 
-    Resolution order: try the train shape first; if it finds zero
-    epoch dirs, fall back to the quantize-flat shape. Quantize
-    detection is by presence of standard HF top-level filenames
+    Resolution order is action-aware. Quantize jobs prefer their flat output
+    root because FTMS may include the parent train tree in the same listing;
+    train jobs prefer the newest epoch tree. Quantize detection is by presence
+    of standard HF top-level filenames
     (``config.json`` + at least one ``model*.safetensors`` shard)
     directly under a single ``results/<job>/`` prefix.
 
@@ -242,6 +245,39 @@ def _select_hf_checkpoint_keys(keys: list[str]) -> tuple[list[str], str | None]:
     the root). Returns ``([], None)`` when no checkpoint dir is
     present in either shape.
     """
+    # ── Shape B (quantize): flat at results/<job>/<file>
+    # Group keys by the leading ``results/<job>/`` prefix and check
+    # whether each group has the canonical HF marker files.
+    flat_dirs: dict[str, list[str]] = {}
+    for k in keys:
+        if not k.startswith("results/"):
+            continue
+        # Strip "results/" and take the next path segment as the job dir.
+        rest = k[len("results/") :]
+        head, sep, tail = rest.partition("/")
+        if not sep or "/" in tail:
+            # Either no slash after the job_id, or the tail contains
+            # additional directory nesting — that's the train shape's
+            # ``<timestamp>/safetensors/epoch_<N>/<file>`` tree, which
+            # this fallback doesn't claim. Skip.
+            continue
+        prefix = f"results/{head}/"
+        flat_dirs.setdefault(prefix, []).append(k)
+
+    flat_checkpoint: tuple[list[str], str] | None = None
+    for prefix, group in flat_dirs.items():
+        names = {k[len(prefix) :] for k in group}
+        has_config = "config.json" in names
+        has_shards = any(
+            n.endswith(".safetensors") and n.startswith("model") for n in names
+        )
+        if has_config and has_shards:
+            flat_checkpoint = (group, prefix)
+            break
+
+    if prefer_quantize_root and flat_checkpoint is not None:
+        return flat_checkpoint
+
     # ── Shape A (train): …/safetensors/epoch_<N>/<file>
     epoch_dirs: dict[str, list[str]] = {}
     for k in keys:
@@ -265,36 +301,10 @@ def _select_hf_checkpoint_keys(keys: list[str]) -> tuple[list[str], str | None]:
         )
         return epoch_dirs[best_prefix], best_prefix
 
-    # ── Shape B (quantize): flat at results/<job>/<file>
-    # Group keys by the leading ``results/<job>/`` prefix and check
-    # whether each group has the canonical HF marker files.
-    flat_dirs: dict[str, list[str]] = {}
-    for k in keys:
-        if not k.startswith("results/"):
-            continue
-        # Strip "results/" and take the next path segment as the job dir.
-        rest = k[len("results/") :]
-        head, sep, tail = rest.partition("/")
-        if not sep or "/" in tail:
-            # Either no slash after the job_id, or the tail contains
-            # additional directory nesting — that's the train shape's
-            # ``<timestamp>/safetensors/epoch_<N>/<file>`` tree, which
-            # this fallback doesn't claim. Skip.
-            continue
-        prefix = f"results/{head}/"
-        flat_dirs.setdefault(prefix, []).append(k)
-
-    for prefix, group in flat_dirs.items():
-        names = {k[len(prefix) :] for k in group}
-        has_config = "config.json" in names
-        has_shards = any(
-            n.endswith(".safetensors") and n.startswith("model") for n in names
-        )
-        if has_config and has_shards:
-            # Quantize-output recognised. Caller will mirror the
-            # group flat under ``cache_dir/<file>`` matching the
-            # NIM-loadable HF directory contract.
-            return group, prefix
+    if flat_checkpoint is not None:
+        # Quantize output recognised. Caller mirrors the group flat under
+        # ``cache_dir/<file>`` matching the NIM-loadable HF contract.
+        return flat_checkpoint
 
     return [], None
 
@@ -416,9 +426,8 @@ def _materialize_evaluate_predictions(
     response). The rescoring service expects ``id`` + ``prediction``
     keys, so we translate while aggregating into a single list.
 
-    The full extracted tree is preserved under ``cache_dir/`` so
-    operators can inspect raw outputs (metrics PNGs, per-eval-set
-    score JSONs, full_response strings). Translation remains best effort;
+    The full extracted tree is preserved internally under ``cache_dir/``
+    for pipeline processing and audit. Translation remains best effort;
     the downstream rescoring service compares the materialized key set with
     the frozen DatasetExport before it can validate Student quality.
 
@@ -641,7 +650,9 @@ async def _fetch_tao_artifacts(
                 else []
             )
         else:
-            selected, common_prefix = _select_hf_checkpoint_keys(keys)
+            selected, common_prefix = _select_hf_checkpoint_keys(
+                keys, prefer_quantize_root=action == "quantize"
+            )
             artifacts = []
             for k in selected:
                 rel = (
@@ -769,6 +780,26 @@ async def _fetch_tao_artifacts(
                 )
 
     return {"success": True, "artifacts": artifacts, "error": None}
+
+
+async def refresh_quantized_checkpoint_artifacts(
+    tao_external_job_id: str,
+    *,
+    settings: Settings,
+    local_cache_dir: Path,
+) -> dict[str, Any]:
+    """Re-materialize a completed quantize job's NIM-loadable output.
+
+    This public recovery boundary lets Student ``:repackage`` repair an
+    artifact-selection failure without depending on the polling service's
+    private generic dispatcher or resubmitting the expensive TAO job.
+    """
+    return await _fetch_tao_artifacts(
+        tao_external_job_id,
+        settings=settings,
+        local_cache_dir=local_cache_dir,
+        action="quantize",
+    )
 
 
 async def _get_tao_logs_body(
@@ -1439,7 +1470,10 @@ async def _handle_succeeded(
             job = session.query(TAOJob).filter_by(tao_job_id=tao_job_id).first()
             if job is not None:
                 job.outputs_fetch_status = "failed"
-                job.outputs_fetch_error_ref = repr(exc)[:1000]
+                sanitized = tao_job_service.sanitize_error(repr(exc))
+                job.outputs_fetch_error_ref = (
+                    sanitized or "Artifact processing failed."
+                )[:1000]
                 session.commit()
         return  # caller (_advance_after_terminal) is skipped on hard failure
 
@@ -1995,19 +2029,17 @@ async def handle_terminal_failure(
                 outputs = dict(failed_job.outputs or {})
                 outputs["tao_logs_text"] = log_text
                 failed_job.outputs = outputs
-                actionable_error = (
-                    tao_job_service.extract_actionable_failure_from_logs(log_text)
+                effective_error = tao_job_service.effective_tao_job_error_ref(
+                    failed_job
                 )
-                generic_error = (
-                    not failed_job.error_ref
-                    or failed_job.error_ref.strip().lower()
-                    == f"{action} action failed for cosmos-rl"
-                )
-                if actionable_error and generic_error:
-                    failed_job.error_ref = actionable_error
+                if effective_error != failed_job.error_ref:
+                    failed_job.error_ref = effective_error
 
-        # Evaluate failure → flip paired StudentModel
-        # quality_status="failed" (two-part readiness).
+        # A remote TAO evaluate failure is a measured quality failure. A
+        # Blueprint-local Student NIM row can also end ``failed`` because
+        # preflight, container startup, or benchmarking failed before quality
+        # was measured; that operational failure must not poison the
+        # independent quality gate.
         if action == "evaluate":
             try:
                 from vlm_feedback_loop.services import student_model_service
@@ -2023,7 +2055,10 @@ async def handle_terminal_failure(
                         project_id=project_id,
                         evaluate_job=evaluate_job,
                     )
-                    if student is not None:
+                    if (
+                        student is not None
+                        and evaluate_job.training_backend != "student_nim_local"
+                    ):
                         student_model_service.mark_student_quality_failed(
                             student=student,
                             reason=f"tao_evaluate_{terminal_status}",
@@ -2210,25 +2245,6 @@ async def tick(settings: Settings) -> None:
                     tao_job_id,
                     project_id,
                 )
-
-
-async def _await_pending_post_success_tasks() -> (
-    None
-):  # imported by tests/unit/test_tao_polling_service.py — kept private but listed in __all__
-    """Test helper: await every currently-registered post-success task.
-
-    Production code MUST NOT call this — the polling tick is intentionally
-    non-blocking on post-success flows. Tests use this to drive a
-    deterministic checkpoint between "tick fired" and "post-success
-    finished" so they can assert on the final state.
-    """
-    pending = [
-        t
-        for tid, t in list(background_manager._tasks.items())  # pyright: ignore[reportPrivateUsage] — test-only helper, see docstring above
-        if tid.startswith("post-success-")
-    ]
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def _post_success_flow(
@@ -2651,14 +2667,7 @@ def start_tao_polling(settings: Settings) -> None:
 
 
 __all__ = [
-    # The leading-underscore symbols below are referenced by sibling
-    # modules (other services, tests, scripts/capture_tao_fixtures.py).
-    # Listing them in ``__all__`` quiets pyright's reportUnusedFunction
-    # without per-line ignores.
-    "_await_pending_post_success_tasks",
     "_plan_suite_advance",
-    "_poll_single_job",
-    "_should_poll",
     "start_tao_polling",
     "tick",
 ]

@@ -12,9 +12,17 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
 import { installEventSourceMock } from "@/test/event-source-mock";
 import { makeProjectResponse } from "@/test/fixtures";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
 
@@ -30,6 +38,10 @@ vi.mock("@/api/students", () => ({
   deployNim: vi.fn(),
   requestDeploymentHandoff: vi.fn(),
   rerescoreStudentModel: vi.fn(),
+  deploymentBundleUrl: vi.fn(
+    (projectId: string, studentId: string) =>
+      `/v1/projects/${projectId}/student_models/${studentId}/deployment_bundle`,
+  ),
 }));
 
 vi.mock("@/api/evaluation", () => ({
@@ -56,6 +68,10 @@ vi.mock("@/api/model-configs", () => ({
   updateProject: vi.fn(),
 }));
 
+vi.mock("@/api/training", () => ({
+  listTrainingSuites: vi.fn(),
+}));
+
 vi.mock("@/api/nim", () => ({
   generateActionRequest: vi.fn(),
   logActionRequestCopy: vi.fn(),
@@ -65,8 +81,8 @@ vi.mock("@/api/nim", () => ({
   deployLocalNim: vi.fn(),
 }));
 
-vi.mock("@/pages/ProjectSetupLayout", () => ({
-  useSetupContext: vi.fn(),
+vi.mock("@/pages/setup-context", () => ({
+  useEnvironmentSetupContext: vi.fn(),
 }));
 
 installEventSourceMock();
@@ -89,7 +105,8 @@ import { getEvaluationRun, listEvaluationRuns } from "@/api/evaluation";
 import { fetchGuidance } from "@/api/guidance";
 import { fetchModelConfigs } from "@/api/model-configs";
 import { logActionRequestCopy } from "@/api/nim";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { listTrainingSuites } from "@/api/training";
+import { useEnvironmentSetupContext } from "@/pages/setup-context";
 
 const mockListStudents = listStudentModels as ReturnType<typeof vi.fn>;
 const mockDeployNim = deployNim as ReturnType<typeof vi.fn>;
@@ -101,8 +118,9 @@ const mockGetEvalRun = getEvaluationRun as ReturnType<typeof vi.fn>;
 const mockListEvalRuns = listEvaluationRuns as ReturnType<typeof vi.fn>;
 const mockFetchGuidance = fetchGuidance as ReturnType<typeof vi.fn>;
 const mockFetchModelConfigs = fetchModelConfigs as ReturnType<typeof vi.fn>;
+const mockListTrainingSuites = listTrainingSuites as ReturnType<typeof vi.fn>;
 const mockLogCopy = logActionRequestCopy as ReturnType<typeof vi.fn>;
-const mockSetup = useSetupContext as ReturnType<typeof vi.fn>;
+const mockSetup = useEnvironmentSetupContext as ReturnType<typeof vi.fn>;
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -134,6 +152,8 @@ function makeStudent(overrides: Partial<Record<string, unknown>>) {
   return {
     student_model_id: overrides.student_model_id ?? "sm-1",
     project_id: "pid-1",
+    training_suite_id:
+      "training_suite_id" in overrides ? overrides.training_suite_id : "suite-1",
     student_base_model_config_id: overrides.student_base_model_config_id ?? "mc-8b",
     tao_job_id: overrides.tao_job_id ?? "tao-train-1",
     guidance_id: "g-1",
@@ -145,8 +165,11 @@ function makeStudent(overrides: Partial<Record<string, unknown>>) {
     nim_checkpoint_ref: overrides.nim_checkpoint_ref ?? "/ck/sm-1",
     quality_status: overrides.quality_status ?? "validated",
     quality_evaluation_run_id: overrides.quality_evaluation_run_id ?? "rr-q-1",
-    serving_status: overrides.serving_status ?? "pending",
+    serving_status: overrides.serving_status ?? "not_attempted",
     serving_evaluation_run_id: overrides.serving_evaluation_run_id ?? null,
+    serving_benchmark_current:
+      overrides.serving_benchmark_current ?? overrides.serving_status === "validated",
+    serving_benchmark_blocker: overrides.serving_benchmark_blocker ?? null,
     nim_preflight_status: overrides.nim_preflight_status ?? null,
     nim_preflight_details: null,
     nim_preflight_at: null,
@@ -179,6 +202,40 @@ const STUDENT_W4 = makeStudent({
   quantization_method: "W4A16",
   quantize_tao_job_id: "tao-q-w4",
 });
+
+const TRAINING_SUITE = {
+  training_suite_id: "suite-1",
+  project_id: "pid-1",
+  idempotency_key: "idem-1",
+  guidance_id: "g-1",
+  training_preset: "standard",
+  export_field_mode: "all",
+  include_auto_labeled: true,
+  quantization_schemes: ["FP8_DYNAMIC", "W4A16"],
+  training_dataset_export_id: "de-train",
+  evaluation_dataset_export_id: "de-eval",
+  training_example_count: 372,
+  evaluation_example_count: 20,
+  evaluation_dataset_checksum_sha256: "sha256:test-pool-1",
+  selected_student_base_model_config_ids: ["mc-8b"],
+  chain_ids_ordered: ["chain-1"],
+  chains: [
+    {
+      chain_id: "chain-1",
+      student_base_model_config_id: "mc-8b",
+      base_model_name: "nvidia/cosmos-reason2-8b",
+      jobs: [],
+    },
+  ],
+  student_model_ids: ["sm-baseline", "sm-fp8", "sm-w4"],
+  provisioning_run_id: null,
+  provisioning_model_names: [],
+  setup_error_ref: null,
+  status: "completed",
+  created_at: "2026-04-29T00:00:00Z",
+  started_at: "2026-04-29T00:00:00Z",
+  completed_at: "2026-04-29T03:00:00Z",
+};
 
 const GUIDANCE_RPS = {
   guidance_id: "g-1",
@@ -367,23 +424,42 @@ const SERVING_RUN_BASELINE = {
     benchmarks: [
       {
         concurrency: 1,
+        status: "passed",
         latency_p50_ms: 300,
         latency_p90_ms: 500,
         latency_p99_ms: 800,
+        request_throughput_rps: 2.5,
+        failure_rate: 0,
       },
       {
         concurrency: 8,
+        status: "passed",
         latency_p50_ms: 800,
         latency_p90_ms: 1200,
         latency_p99_ms: 1800,
+        request_throughput_rps: 7.25,
+        failure_rate: 0,
       },
       {
         concurrency: 24,
+        status: "passed",
         latency_p50_ms: 1500,
         latency_p90_ms: 2400,
         latency_p99_ms: 3600,
+        request_throughput_rps: 9.75,
+        failure_rate: 0,
       },
     ],
+    benchmark_workload: {
+      version: "production_vlm_v1",
+      workload_hash: "0123456789abcdef0123456789abcdef",
+      pool_member_count: 120,
+      selected_count: 120,
+      inference_contract: { output_field_mode: "core_only" },
+      output_limit_mode: "uncapped",
+      kv_cache_reuse: "disabled",
+      driver: { name: "aiperf", version: "0.10.0" },
+    },
   },
 };
 
@@ -407,6 +483,10 @@ beforeEach(() => {
   });
   mockFetchGuidance.mockResolvedValue(GUIDANCE_RPS);
   mockFetchModelConfigs.mockResolvedValue(MODEL_CONFIGS);
+  mockListTrainingSuites.mockResolvedValue({
+    items: [TRAINING_SUITE],
+    next_cursor: null,
+  });
   // Per-run-id routing: quality fetches resolve the TAO-rescored run,
   // serving fetches resolve the benchmarked run.
   mockGetEvalRun.mockImplementation((_pid: string, runId: string) =>
@@ -448,17 +528,21 @@ beforeEach(() => {
       "Project: RPS\n" +
       "Student: sm-baseline\n" +
       "Base: Cosmos Reason2 8B · Quantization: none · GPU: 1× A100 80GB\n\n" +
+      "Checkpoint\n    Packaging status: validated\n\n" +
+      "NIM Configuration\n" +
       "Production deployment command:\n    docker run …\n\n" +
       "Endpoint health: GET /v1/health/ready\n\n" +
+      "Model\n    Quantization: none\n\n" +
+      "Evaluation\n" +
       "Quality (TAO-rescored):\n    Overall Exact Match: 0.85\n\n" +
       "Serving (NIM-validated):\n    Overall Exact Match: 0.85\n\n" +
-      "Training lineage:\n    Training TAO job: tao-train-1\n",
+      "Training Lineage\n    Training TAO job: tao-train-1\n",
   });
   mockLogCopy.mockResolvedValue({ audit_event_id: "ae-1" });
 });
 
-function renderPage() {
-  return render(
+function renderPage({ strict = false }: { strict?: boolean } = {}) {
+  const page = (
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={["/projects/pid-1/compare"]}>
         <Routes>
@@ -469,8 +553,9 @@ function renderPage() {
           </Route>
         </Routes>
       </MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  return render(strict ? <StrictMode>{page}</StrictMode> : page);
 }
 
 function emitSse(projectId: string, type: string, data: Record<string, unknown>) {
@@ -498,6 +583,44 @@ function emitSse(projectId: string, type: string, data: Record<string, unknown>)
 
 describe("CompareBenchmarkPage", () => {
   // ── Default view ──────────────────────────────────────────────────────
+  it("keeps loading until human-readable model identities are ready", async () => {
+    let resolveModelConfigs: (value: typeof MODEL_CONFIGS) => void = () => undefined;
+    mockFetchModelConfigs.mockReturnValue(
+      new Promise<typeof MODEL_CONFIGS>((resolve) => {
+        resolveModelConfigs = resolve;
+      }),
+    );
+
+    renderPage();
+    await waitFor(() => expect(mockListStudents).toHaveBeenCalled());
+
+    expect(screen.getByTestId("compare-benchmark-page-loading")).toBeInTheDocument();
+    expect(screen.getByLabelText("Loading comparison data")).toBeInTheDocument();
+    expect(screen.queryByTestId("student-variant-card-sm-baseline")).toBeNull();
+    expect(screen.queryByText("mc-8b")).toBeNull();
+
+    act(() => resolveModelConfigs(MODEL_CONFIGS));
+
+    const card = await screen.findByTestId("student-variant-card-sm-baseline");
+    expect(card).toHaveTextContent("Cosmos Reason2 8B");
+    expect(screen.getByTestId("teacher-baseline-card")).toHaveTextContent(
+      "mistralai/mistral-large-3-675b-instruct-2512",
+    );
+  });
+
+  it("deduplicates evaluation run queries shared by multiple variants", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      renderPage();
+      await screen.findByTestId("student-variant-card-sm-w4");
+
+      const warnings = warnSpy.mock.calls.flat().join("\n");
+      expect(warnings).not.toContain("[QueriesObserver]: Duplicate Queries found");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("default view renders Teacher baseline + per-variant cards + scope controls + 'Not benchmarked'", async () => {
     renderPage();
     await screen.findByTestId("compare-benchmark-page");
@@ -527,6 +650,7 @@ describe("CompareBenchmarkPage", () => {
     const subtitle = screen.getByTestId("compare-page-subtitle");
     expect(subtitle.textContent).toContain("Test Pool: 20 images");
     expect(subtitle.textContent).toContain("Visual budget: balanced");
+    expect(screen.getByTestId("compare-project-name").textContent).toBe("Project: RPS");
 
     // FP8 + W4 not yet benchmarked → "Not benchmarked".
     const fp8Card = screen.getByTestId("student-variant-card-sm-fp8");
@@ -537,8 +661,138 @@ describe("CompareBenchmarkPage", () => {
     // Scope controls.
     expect(screen.getByTestId("benchmark-all-button")).toBeTruthy();
     expect(screen.getByTestId("benchmark-selected-button")).toBeTruthy();
-    expect(screen.getByTestId("compare-metric-select")).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Per-field metric:" })).toBeTruthy();
     expect(screen.getByTestId("chart-toggle-button")).toBeTruthy();
+
+    const runGroup = screen.getByTestId("training-run-group-suite-1");
+    expect(runGroup).toHaveTextContent("Latest training run");
+    expect(runGroup).toHaveTextContent("Standard preset");
+    expect(runGroup).toHaveTextContent("Guidance v3");
+    expect(runGroup).toHaveTextContent("372 training images");
+    expect(runGroup).toHaveTextContent("20 Test Pool images");
+    expect(runGroup).toHaveTextContent("Models: Cosmos Reason2 8B");
+  });
+
+  it("keeps all runs visible while marking incompatible history and disambiguating chart series", async () => {
+    const olderStudent = makeStudent({
+      student_model_id: "sm-older-8b",
+      training_suite_id: "suite-older",
+      quality_evaluation_run_id: "rr-q-old",
+      created_at: "2026-04-20T12:00:00Z",
+    });
+    const olderSuite = {
+      ...TRAINING_SUITE,
+      training_suite_id: "suite-older",
+      idempotency_key: "idem-older",
+      evaluation_dataset_export_id: "de-eval-old",
+      evaluation_dataset_checksum_sha256: "sha256:test-pool-old",
+      training_example_count: 240,
+      evaluation_example_count: 18,
+      student_model_ids: ["sm-older-8b"],
+      created_at: "2026-04-20T12:00:00Z",
+      started_at: "2026-04-20T12:00:00Z",
+      completed_at: "2026-04-20T14:00:00Z",
+    };
+    mockListStudents.mockResolvedValue({
+      items: [STUDENT_BASELINE, olderStudent],
+      next_cursor: null,
+    });
+    mockListTrainingSuites.mockResolvedValue({
+      items: [{ ...TRAINING_SUITE, student_model_ids: ["sm-baseline"] }, olderSuite],
+      next_cursor: null,
+    });
+    mockGetEvalRun.mockImplementation((_pid: string, runId: string) =>
+      Promise.resolve(
+        runId === "rr-q-old"
+          ? { ...QUALITY_RUN_85, run_id: runId, pool_version_id: "pv-old" }
+          : QUALITY_RUN_85,
+      ),
+    );
+
+    renderPage();
+    const latest = await screen.findByTestId("training-run-group-suite-1");
+    const older = screen.getByTestId("training-run-group-suite-older");
+    expect(latest).toHaveTextContent("Latest training run");
+    expect(older).toHaveTextContent("Training run");
+    expect(older).toHaveTextContent("Different evaluation set");
+    expect(older).toHaveTextContent("Student-vs-Teacher deltas are hidden");
+    expect(within(older).queryByTestId("exact-match-delta")).toBeNull();
+    expect(within(latest).getByTestId("exact-match-delta")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("chart-toggle-button"));
+    const legend = await screen.findByTestId("chart-legend");
+    expect(legend).toHaveTextContent("Apr 29");
+    expect(legend).toHaveTextContent("Apr 20");
+    expect(screen.getByTestId("chart-context-warning")).toHaveTextContent(
+      "different or unverified evaluation contexts",
+    );
+  });
+
+  it("keeps a packaged quality-pending Student visible for its first NIM validation", async () => {
+    mockListStudents.mockResolvedValueOnce({
+      items: [
+        makeStudent({
+          student_model_id: "sm-pending-quality",
+          quality_status: "pending",
+          quality_evaluation_run_id: null,
+          serving_status: "not_attempted",
+          serving_evaluation_run_id: null,
+        }),
+      ],
+      next_cursor: null,
+    });
+
+    renderPage();
+    const card = await screen.findByTestId("student-variant-card-sm-pending-quality");
+    expect(card).toHaveTextContent("Quality: Pending");
+    expect(card).toHaveTextContent(
+      "Run the first NIM validation to measure quality and serving performance.",
+    );
+    expect(screen.getByTestId("exact-match")).toHaveTextContent("—");
+
+    const deploy = screen.getByTestId("benchmark-button-sm-pending-quality");
+    expect(deploy).toHaveTextContent("Deploy and benchmark");
+    fireEvent.click(deploy);
+    await waitFor(() =>
+      expect(mockDeployNim).toHaveBeenCalledWith(
+        "pid-1",
+        "sm-pending-quality",
+        expect.objectContaining({}),
+      ),
+    );
+  });
+
+  it("reconciles a normal Student's pending NIM validation after reopen", async () => {
+    mockListStudents.mockResolvedValue({
+      items: [
+        makeStudent({
+          student_model_id: "sm-pending-serving",
+          quality_status: "pending",
+          quality_evaluation_run_id: null,
+          serving_status: "pending",
+          serving_evaluation_run_id: null,
+        }),
+        makeStudent({
+          student_model_id: "sm-other",
+          serving_status: "not_attempted",
+        }),
+      ],
+      next_cursor: null,
+    });
+
+    renderPage();
+    const pendingCard = await screen.findByTestId(
+      "student-variant-card-sm-pending-serving",
+    );
+
+    expect(within(pendingCard).getByTestId("benchmark-reconciled")).toHaveTextContent(
+      "Serving validation is running. Live stage details resume when events arrive.",
+    );
+    expect(
+      within(pendingCard).queryByTestId("benchmark-button-sm-pending-serving"),
+    ).toBeNull();
+    expect(screen.getByTestId("benchmark-all-button")).toBeDisabled();
+    expect(screen.getByTestId("benchmark-button-sm-other")).toBeDisabled();
   });
 
   // ── Fallback (preflight failed) ─────────────────────────────────────────
@@ -700,6 +954,48 @@ describe("CompareBenchmarkPage", () => {
     ).toContain("70%");
   });
 
+  it("uses project thresholds only for their authoritative quality metrics", async () => {
+    mockSetup.mockReturnValue({
+      projectId: "pid-1",
+      project: {
+        ...PROJECT,
+        scaleup_per_field_match_threshold: 0.86,
+        scaleup_min_per_value_f1_threshold: 0.68,
+      },
+      environment: { ...ENVIRONMENT, gpus: [] },
+    });
+    renderPage();
+    await screen.findByTestId("compare-benchmark-page");
+
+    const variantFieldRate = screen
+      .getByTestId("variant-sm-baseline-row-gesture")
+      .querySelector("[data-threshold-status]");
+    const teacherFieldRate = screen
+      .getByTestId("teacher-baseline-row-gesture")
+      .querySelector("[data-threshold-status]");
+    expect(variantFieldRate).toHaveAttribute("data-threshold-status", "below");
+    expect(teacherFieldRate).toHaveAttribute("data-threshold-status", "meets");
+
+    fireEvent.change(screen.getByTestId("compare-metric-select"), {
+      target: { value: "per_value_f1" },
+    });
+    const variantScissors = await screen.findByTestId(
+      "variant-sm-baseline-value-gesture-scissors",
+    );
+    expect(variantScissors.querySelector("[data-threshold-status]")).toHaveAttribute(
+      "data-threshold-status",
+      "below",
+    );
+
+    fireEvent.change(screen.getByTestId("compare-metric-select"), {
+      target: { value: "per_value_precision" },
+    });
+    expect(variantScissors.querySelector("[data-threshold-status]")).toHaveAttribute(
+      "data-threshold-status",
+      "diagnostic",
+    );
+  });
+
   it("per-value drill-down at 25 allowed values renders inside a wrapping grid (no horizontal overflow)", async () => {
     mockFetchGuidance.mockResolvedValue(GUIDANCE_LARGE_ENUM);
     // Quality run with 25 per-value buckets.
@@ -846,7 +1142,8 @@ describe("CompareBenchmarkPage", () => {
       "mistralai/mistral-large-3-675b-instruct-2512",
     );
     const note = screen.getByTestId("teacher-baseline-stale-note");
-    expect(note).toHaveTextContent("predates the current Teacher");
+    expect(note).toHaveTextContent("predates the current Teacher (Cosmos Reason2 8B)");
+    expect(note).toHaveTextContent("Run a new evaluation to refresh the baseline.");
     expect(screen.getAllByTestId("exact-match-delta")[0]).toHaveTextContent(
       "-3 pts vs Teacher baseline",
     );
@@ -857,10 +1154,35 @@ describe("CompareBenchmarkPage", () => {
       "Teacher · mistralai/mistral-large-3-675b-instruct-2512",
     );
 
-    // Displacement targets the currently selected Cosmos Teacher, not the
-    // historical Mistral baseline.
+    // Displacement copy names the actual local-resident resource class. The
+    // selected Teacher can be hosted, so neither current nor historical model
+    // identity belongs in this warning.
     const preview = screen.getAllByTestId("benchmark-displacement-preview")[0];
-    expect(preview).toHaveTextContent("nvidia/cosmos-reason2-8b");
+    expect(preview).toHaveTextContent(/another local NIM/i);
+    expect(preview).not.toHaveTextContent("nvidia/cosmos-reason2-8b");
+    expect(preview).not.toHaveTextContent("mistralai");
+  });
+
+  it("humanizes quantization and labels persisted benchmark hardware", async () => {
+    mockListStudents.mockResolvedValue({
+      items: [
+        makeStudent({
+          student_model_id: "sm-fp8",
+          quality_evaluation_run_id: "rr-q-fp8",
+          serving_status: "validated",
+          serving_evaluation_run_id: "rr-s-1",
+          quantization_method: "FP8_DYNAMIC",
+          gpu_type: "RTX PRO 6000",
+          gpu_count: 1,
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderPage();
+    const card = await screen.findByTestId("student-variant-card-sm-fp8");
+    expect(card).toHaveTextContent("FP8 Dynamic");
+    expect(card).not.toHaveTextContent("FP8_DYNAMIC");
+    expect(card).toHaveTextContent("Benchmark hardware: 1× RTX PRO 6000");
   });
 
   it("retains a historical baseline ID after its catalog row is removed", async () => {
@@ -911,18 +1233,59 @@ describe("CompareBenchmarkPage", () => {
       expect(screen.getByTestId(`serving-matrix-cell-c${c}-p90`)).toBeTruthy();
       expect(screen.getByTestId(`serving-matrix-cell-c${c}-p99`)).toBeTruthy();
     }
-    // Latency always rendered in seconds — no ms/s unit-mixing within a
-    // column. c=1: p50 300 ms → ``0.3s``, p99 800 ms → ``0.8s``.
+    // Milliseconds preserve useful distinctions instead of rounding every
+    // sub-second result into a handful of tenths.
     expect(screen.getByTestId("serving-matrix-cell-c1-p50").textContent).toContain(
-      "0.3s",
+      "300 ms",
     );
     expect(screen.getByTestId("serving-matrix-cell-c1-p99").textContent).toContain(
-      "0.8s",
+      "800 ms",
+    );
+    expect(screen.getByText("2.50")).toBeTruthy();
+    expect(screen.getAllByText("0.0%").length).toBe(3);
+
+    fireEvent.click(screen.getByTestId("serving-workload-toggle"));
+    expect(screen.getByTestId("serving-workload-details").textContent).toContain(
+      "120 real Test Pool images",
+    );
+    expect(screen.getByTestId("serving-workload-details").textContent).toContain(
+      "Uncapped",
+    );
+    expect(screen.getByTestId("serving-workload-details").textContent).toContain(
+      "AIPerf 0.10.0",
+    );
+  });
+
+  it("legacy validated serving evidence requires AIPerf revalidation before handoff", async () => {
+    mockListStudents.mockResolvedValue({
+      items: [
+        makeStudent({
+          student_model_id: "sm-legacy",
+          serving_status: "validated",
+          serving_evaluation_run_id: "rr-s-1",
+          serving_benchmark_current: false,
+          serving_benchmark_blocker: "aiperf_workload_missing",
+        }),
+      ],
+      next_cursor: null,
+    });
+
+    renderPage();
+    const warning = await screen.findByTestId("serving-aiperf-revalidation-required");
+    expect(warning).toHaveTextContent("AIPerf revalidation required");
+    expect(warning).toHaveTextContent("real Test Pool AIPerf workload");
+    expect(screen.queryByTestId("request-deployment-handoff-sm-legacy")).toBeNull();
+
+    const revalidate = screen.getByTestId("benchmark-button-sm-legacy");
+    expect(revalidate).toHaveTextContent("Revalidate with AIPerf");
+    fireEvent.click(revalidate);
+    await waitFor(() =>
+      expect(mockDeployNim).toHaveBeenCalledWith("pid-1", "sm-legacy", {}),
     );
   });
 
   // ── Deployment handoff happy path + audit ───────────────────────────────
-  it("[Request Production Deployment] on dual-validated variant expands the 5-section deployment_handoff AR; Copy fires logActionRequestCopy", async () => {
+  it("[Request Production Deployment] emits one handoff under production StrictMode, expands all sections, and audits Copy", async () => {
     // Dual-validated student fixture.
     mockListStudents.mockResolvedValue({
       items: [
@@ -935,7 +1298,7 @@ describe("CompareBenchmarkPage", () => {
       next_cursor: null,
     });
 
-    renderPage();
+    renderPage({ strict: true });
     await screen.findByTestId("compare-benchmark-page");
 
     // Handoff button visible (dual-validated). Fallback button is NOT.
@@ -949,6 +1312,7 @@ describe("CompareBenchmarkPage", () => {
       expect(mockRequestDeploymentHandoff).toHaveBeenCalledWith("pid-1", "sm-baseline"),
     );
     const ar = await screen.findByTestId("action-request-ready");
+    expect(mockRequestDeploymentHandoff).toHaveBeenCalledTimes(1);
 
     // Five logical sections present in the rendered text: checkpoint,
     // NIM config, model metadata, evaluation snapshot, training lineage.
@@ -959,7 +1323,7 @@ describe("CompareBenchmarkPage", () => {
     expect(text).toMatch(/Quantization:.+(none|FP8|W4)/);
     expect(text).toContain("Quality (TAO-rescored):");
     expect(text).toContain("Serving (NIM-validated):");
-    expect(text).toContain("Training lineage:");
+    expect(text).toContain("Training Lineage");
     expect(text).toContain("Training TAO job");
 
     // Read-only — no SME form fields. The panel only contains buttons
@@ -971,10 +1335,24 @@ describe("CompareBenchmarkPage", () => {
     expect(text.toLowerCase()).not.toContain("ngc-");
     expect(text.toLowerCase()).not.toContain("api_key=");
 
+    // The portable artifact is the primary action and uses a browser-native
+    // streamed download instead of buffering a multi-GB bundle in JS.
+    const anchorClick = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => undefined);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Download portable NIM deployment bundle",
+      }),
+    );
+    expect(anchorClick).toHaveBeenCalledTimes(1);
+    expect((anchorClick.mock.instances[0] as HTMLAnchorElement).href).toContain(
+      "/v1/projects/pid-1/student_models/sm-baseline/deployment_bundle",
+    );
+    anchorClick.mockRestore();
+
     // Copy → logActionRequestCopy fires (audited).
-    const copyBtn = ar.querySelector("button");
-    expect(copyBtn).toBeTruthy();
-    fireEvent.click(copyBtn!);
+    fireEvent.click(screen.getByRole("button", { name: "Copy to Clipboard" }));
     await waitFor(() =>
       expect(mockLogCopy).toHaveBeenCalledWith(
         "pid-1",
@@ -984,28 +1362,8 @@ describe("CompareBenchmarkPage", () => {
     expect(writeTextMock).toHaveBeenCalled();
   });
 
-  // ── Deployment handoff CTA emphasis ─────────────────────────────────────
-  it("with several dual-validated variants only the best-quality one gets the green primary handoff CTA", async () => {
-    // Two dual-validated variants: sm-a at 85% quality, sm-b at 90%. The
-    // green full-strength primary must land on sm-b alone so one action
-    // reads as "the" action; sm-a demotes to a secondary button.
-    const QUALITY_RUN_90 = {
-      ...QUALITY_RUN_85,
-      run_id: "rr-q-2",
-      metrics: {
-        ...QUALITY_RUN_85.metrics,
-        overall: { ...QUALITY_RUN_85.metrics.overall, exact_match_rate: 0.9 },
-      },
-    };
-    mockGetEvalRun.mockImplementation((_pid: string, runId: string) =>
-      Promise.resolve(
-        runId === "rr-s-1"
-          ? SERVING_RUN_BASELINE
-          : runId === "rr-q-2"
-            ? QUALITY_RUN_90
-            : QUALITY_RUN_85,
-      ),
-    );
+  // ── Deployment handoff CTAs ──────────────────────────────────────────────
+  it("gives every dual-validated variant a green production handoff CTA", async () => {
     mockListStudents.mockResolvedValue({
       items: [
         makeStudent({
@@ -1015,7 +1373,6 @@ describe("CompareBenchmarkPage", () => {
         }),
         makeStudent({
           student_model_id: "sm-b",
-          quality_evaluation_run_id: "rr-q-2",
           serving_status: "validated",
           serving_evaluation_run_id: "rr-s-1",
         }),
@@ -1027,13 +1384,70 @@ describe("CompareBenchmarkPage", () => {
     await screen.findByTestId("compare-benchmark-page");
     const handoffA = await screen.findByTestId("request-deployment-handoff-sm-a");
     const handoffB = await screen.findByTestId("request-deployment-handoff-sm-b");
-    // KUI renders the ``kind`` prop as an ``nv-button--kind-*`` class — the
-    // stable emphasis hook (the green styling class is decoration on top).
-    await waitFor(() => expect(handoffB).toHaveClass("nv-button--kind-primary"));
-    expect(handoffA).toHaveClass("nv-button--kind-secondary");
-    // Both stay clickable — emphasis, not gating.
+
+    expect(handoffA).toHaveClass("nv-button--kind-primary", "nvidia-green-button");
+    expect(handoffB).toHaveClass("nv-button--kind-primary", "nvidia-green-button");
     expect((handoffA as HTMLButtonElement).disabled).toBe(false);
     expect((handoffB as HTMLButtonElement).disabled).toBe(false);
+    expect(document.querySelectorAll(".nvidia-green-button")).toHaveLength(2);
+  });
+
+  it("keeps serving recovery secondary when a production handoff is available", async () => {
+    mockListStudents.mockResolvedValue({
+      items: [
+        makeStudent({
+          student_model_id: "sm-ready",
+          serving_status: "validated",
+          serving_evaluation_run_id: "rr-s-1",
+        }),
+        makeStudent({
+          student_model_id: "sm-needs-recovery",
+          quality_status: "failed",
+          quality_evaluation_run_id: null,
+          serving_status: "not_attempted",
+          serving_evaluation_run_id: null,
+        }),
+      ],
+      next_cursor: null,
+    });
+
+    renderPage();
+    const handoff = await screen.findByTestId("request-deployment-handoff-sm-ready");
+    const recovery = await screen.findByTestId(
+      "failed-quality-deploy-sm-needs-recovery",
+    );
+
+    expect(handoff).toHaveClass("nv-button--kind-primary");
+    expect(recovery).toHaveClass("nv-button--kind-secondary");
+    expect(document.querySelectorAll(".nvidia-green-button")).toHaveLength(1);
+  });
+
+  it("promotes only the first serving-recovery action when no handoff is ready", async () => {
+    mockListStudents.mockResolvedValue({
+      items: [
+        makeStudent({
+          student_model_id: "sm-recovery-a",
+          quality_status: "failed",
+          quality_evaluation_run_id: null,
+          serving_status: "not_attempted",
+        }),
+        makeStudent({
+          student_model_id: "sm-recovery-b",
+          quality_status: "failed",
+          quality_evaluation_run_id: null,
+          serving_status: "not_attempted",
+        }),
+      ],
+      next_cursor: null,
+    });
+
+    renderPage();
+    const recoveryA = await screen.findByTestId("failed-quality-deploy-sm-recovery-a");
+    const recoveryB = await screen.findByTestId("failed-quality-deploy-sm-recovery-b");
+
+    expect(recoveryA).toHaveClass("nv-button--kind-primary");
+    expect(recoveryB).toHaveClass("nv-button--kind-secondary");
+    expect(document.querySelectorAll(".nvidia-green-button")).toHaveLength(1);
   });
 
   // ── Deployment handoff 409 conflict path ────────────────────────────────
@@ -1065,6 +1479,32 @@ describe("CompareBenchmarkPage", () => {
     );
     expect(screen.getByTestId("action-request-conflict-detail").textContent).toContain(
       "INFERENCE_CONTRACT_MISMATCH",
+    );
+  });
+
+  it("explains a stale-screen AIPerf handoff rejection without hiding the backend reason", async () => {
+    mockListStudents.mockResolvedValue({
+      items: [
+        makeStudent({
+          student_model_id: "sm-stale",
+          serving_status: "validated",
+          serving_evaluation_run_id: "rr-s-1",
+          serving_benchmark_current: true,
+        }),
+      ],
+      next_cursor: null,
+    });
+    mockRequestDeploymentHandoff.mockRejectedValue(
+      new ApiError(409, "conflict: serving_benchmark_requires_aiperf"),
+    );
+
+    renderPage();
+    fireEvent.click(await screen.findByTestId("request-deployment-handoff-sm-stale"));
+
+    const conflict = await screen.findByTestId("action-request-conflict");
+    expect(conflict).toHaveTextContent("Revalidate with AIPerf");
+    expect(screen.getByTestId("action-request-conflict-detail")).toHaveTextContent(
+      "serving_benchmark_requires_aiperf",
     );
   });
 
@@ -1141,13 +1581,14 @@ describe("CompareBenchmarkPage", () => {
   });
 
   // ── Empty state ────────────────────────────────────────────────────────
-  it("shows an empty state with a Scale-Up Hub link when no Students are quality-validated", async () => {
+  it("shows an empty state with a Scale-Up Hub link when no Students are packaged", async () => {
     mockListStudents.mockResolvedValue({ items: [], next_cursor: null });
     renderPage();
     await screen.findByTestId("compare-benchmark-page-empty");
     expect(screen.getByTestId("compare-empty-state").textContent).toContain(
       "Scale-Up Hub",
     );
+    expect(screen.getByTestId("compare-project-name").textContent).toBe("Project: RPS");
   });
 
   // ── Back to Labeling navigates to /labeling ────────────────────────────
@@ -1285,14 +1726,92 @@ describe("CompareBenchmarkPage", () => {
     expect(screen.getByTestId("student-variant-card-sm-baseline")).toBeTruthy();
   });
 
+  it("humanizes a persisted quality failure token instead of leaking snake_case", async () => {
+    mockListStudents.mockResolvedValue({
+      items: [
+        makeStudent({
+          student_model_id: "sm-token",
+          quality_status: "failed",
+          serving_status: "failed",
+          nim_preflight_details: {
+            quality_failure_reason: "tao_evaluate_failed",
+          },
+        }),
+      ],
+      next_cursor: null,
+    });
+
+    renderPage();
+    const reason = await screen.findByTestId("quality-failure-reason");
+    expect(reason.textContent).toBe("TAO quality evaluation failed.");
+    expect(reason.textContent).not.toContain("tao_evaluate_failed");
+  });
+
   it("[Re-score quality] replays the rescore for the failed Student", async () => {
     mockOneFailedStudent();
     mockRerescore.mockResolvedValue({ quality_status: "validated", run_id: "rr-x" });
     renderPage();
     await screen.findByTestId("quality-failed-variant-card");
+    expect(screen.queryByTestId("compare-empty-state")).toBeNull();
 
     fireEvent.click(screen.getByTestId("rerescore-button"));
     await waitFor(() => expect(mockRerescore).toHaveBeenCalledWith("pid-1", "sm-dead"));
+  });
+
+  it("quality-failed packaged Students can enter the NIM validation lifecycle", async () => {
+    mockListStudents.mockResolvedValue({
+      items: [
+        makeStudent({
+          student_model_id: "sm-loader-gap",
+          quality_status: "failed",
+          quality_evaluation_run_id: null,
+          serving_status: "not_attempted",
+          serving_evaluation_run_id: null,
+          checkpoint_packaging_status: "validated",
+          nim_preflight_details: {
+            quality_failure_reason: "TAO evaluator hit a known upstream loader gap",
+          },
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderPage();
+    await screen.findByTestId("quality-failed-variant-card");
+
+    expect(screen.getByTestId("quality-failed-nim-fallback-help").textContent).toMatch(
+      /persisted lineage determines/i,
+    );
+    fireEvent.click(screen.getByTestId("failed-quality-deploy-sm-loader-gap"));
+    await waitFor(() =>
+      expect(mockDeployNim).toHaveBeenCalledWith("pid-1", "sm-loader-gap", {}),
+    );
+    expect(await screen.findByTestId("quality-failed-benchmark-stage")).toHaveAttribute(
+      "data-stage",
+      "preflight",
+    );
+  });
+
+  it("reconciles a quality-failed Student's pending NIM validation after reopen", async () => {
+    mockListStudents.mockResolvedValue({
+      items: [
+        makeStudent({
+          student_model_id: "sm-reopened",
+          quality_status: "failed",
+          quality_evaluation_run_id: null,
+          serving_status: "pending",
+          serving_evaluation_run_id: null,
+          checkpoint_packaging_status: "validated",
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderPage();
+    await screen.findByTestId("quality-failed-variant-card");
+
+    expect(
+      screen.getByTestId("quality-failed-benchmark-reconciled").textContent,
+    ).toMatch(/serving validation is running/i);
+    expect(screen.queryByTestId("failed-quality-deploy-sm-reopened")).toBeNull();
   });
 
   it("rerescore refusal renders the backend detail inline", async () => {
@@ -1352,9 +1871,8 @@ describe("CompareBenchmarkPage", () => {
     const previews = screen.getAllByTestId("benchmark-displacement-preview");
     expect(previews.length).toBeGreaterThan(0);
     expect(previews[0]).toHaveTextContent(/~6 minutes/);
-    expect(previews[0]).toHaveTextContent(
-      /pauses during the benchmark and resumes automatically/i,
-    );
+    expect(previews[0]).toHaveTextContent(/another local NIM is using this GPU/i);
+    expect(previews[0]).not.toHaveTextContent(/minimax/i);
   });
 
   it("multi-GPU host suppresses the displacement preview", async () => {

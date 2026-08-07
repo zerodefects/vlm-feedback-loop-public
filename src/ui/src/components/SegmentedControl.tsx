@@ -21,6 +21,7 @@ interface SegmentedOption {
 interface SegmentedControlProps {
   testId: string;
   label?: string;
+  ariaLabel?: string;
   options: SegmentedOption[];
   value: string;
   disabled?: boolean;
@@ -30,13 +31,21 @@ interface SegmentedControlProps {
 export function SegmentedControl({
   testId,
   label,
+  ariaLabel,
   options,
   value,
   disabled = false,
   onChange,
 }: SegmentedControlProps) {
+  const accessibleLabel = ariaLabel ?? label;
+
   return (
-    <div className="flex items-center gap-1.5" data-testid={testId}>
+    <div
+      className="flex items-center gap-1.5"
+      role={accessibleLabel ? "group" : undefined}
+      aria-label={accessibleLabel}
+      data-testid={testId}
+    >
       {label && (
         <Text kind="label/regular/sm" style={{ color: "var(--text-muted)" }}>
           {label}:

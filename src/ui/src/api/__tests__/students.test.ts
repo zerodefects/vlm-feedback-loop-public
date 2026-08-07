@@ -14,6 +14,7 @@ import { describe, it, expect } from "vitest";
 import { setupFetchMock } from "@/test/fetch-mock";
 
 import {
+  deploymentBundleUrl,
   listStudentModels,
   deployNim,
   rerescoreStudentModel,
@@ -44,6 +45,7 @@ describe("deployNim", () => {
     const body: DeployNimRequest = {
       nim_endpoint_url: "http://gpu-box:8801/v1",
       auth_mode: "none",
+      benchmark_kv_cache_reuse: "disabled",
     };
     await deployNim("proj-1", "sm-1", body);
     const { url, init } = lastCall();
@@ -70,5 +72,13 @@ describe("requestDeploymentHandoff", () => {
     expect(url).toBe("/v1/projects/proj-1/student_models/sm-1:deployment_handoff");
     expect(init?.method).toBe("POST");
     expect(JSON.parse(init?.body as string)).toEqual({});
+  });
+});
+
+describe("deploymentBundleUrl", () => {
+  it("returns the same-origin streaming download path with encoded IDs", () => {
+    expect(deploymentBundleUrl("proj one", "student/two")).toBe(
+      "/v1/projects/proj%20one/student_models/student%2Ftwo/deployment_bundle",
+    );
   });
 });

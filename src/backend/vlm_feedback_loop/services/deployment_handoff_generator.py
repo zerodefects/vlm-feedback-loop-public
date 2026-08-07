@@ -26,6 +26,7 @@ Error strings produced (mapped by the router):
   - ``"conflict: quality_status_not_validated"`` → 409
   - ``"conflict: serving_status_not_validated"`` → 409
   - ``"conflict: serving_evaluation_run_missing"`` → 409
+  - ``"conflict: serving_benchmark_requires_aiperf"`` → 409
   - ``"conflict: INFERENCE_CONTRACT_MISMATCH"`` → 409
 """
 
@@ -50,7 +51,7 @@ from vlm_feedback_loop.services.action_requests import (
     register_generator,
 )
 from vlm_feedback_loop.services.dataset_export_service import (
-    resolve_test_pool_dataset_sha,
+    resolve_paired_test_pool_dataset_sha,
 )
 from vlm_feedback_loop.services.gpu_memory_floor import (
     resolve_gpu_memory_floor_gb,
@@ -61,10 +62,16 @@ from vlm_feedback_loop.services.inference_contract_resolver import (
 from vlm_feedback_loop.services.local_nim_service import (
     build_student_docker_run_args,
     build_student_docker_run_display,
+    release_version_from_image,
+    resolve_extra_container_env,
 )
 from vlm_feedback_loop.services.project_service import get_project_engine
+from vlm_feedback_loop.services.serving_validation_service import (
+    assess_aiperf_serving_run,
+)
 
 logger = logging.getLogger("vlm_feedback_loop.services.deployment_handoff_generator")
+
 
 # ── Inference Contract equivalence check ────────────────────────────────────
 
@@ -114,6 +121,15 @@ def generate_deployment_handoff_for_student(
         if student is None:
             return f"not found: StudentModel {student_model_id}"
 
+        # The Action Request and portable bundle are production handoffs.
+        # A quality/serving result must never make an absent or failed
+        # checkpoint appear deployable.
+        if (
+            student.checkpoint_packaging_status != "validated"
+            or not student.nim_checkpoint_ref
+        ):
+            return "conflict: checkpoint_packaging_not_validated"
+
         # ── Gate 1: quality_status ──────────────────────────────────────────
         # ``partial`` is informational, NOT gate-passing. The
         # production-handoff bar still requires a fully-validated run.
@@ -138,6 +154,18 @@ def generate_deployment_handoff_for_student(
         )
         if serving_run is None:
             return "conflict: serving_evaluation_run_missing"
+
+        # ``serving_status`` is retained historical state. Workspaces created
+        # before the production AIPerf contract can contain a successful
+        # synthetic httpx latency sweep marked validated. That evidence stays
+        # visible for audit, but it cannot unlock a production handoff or
+        # portable bundle until the Student is revalidated through AIPerf.
+        serving_assessment = assess_aiperf_serving_run(
+            serving_run,
+            expected_concurrencies=settings.STUDENT_LATENCY_TEST_CONCURRENCIES,
+        )
+        if not serving_assessment.current:
+            return "conflict: serving_benchmark_requires_aiperf"
 
         # ── Gate 4: Inference Contract parity ───────────────────────────────
         training_contract = student.training_inference_contract
@@ -192,6 +220,27 @@ def generate_deployment_handoff_for_student(
             .filter_by(model_config_id=student.student_base_model_config_id)
             .first()
         )
+        base_local_deploy_metadata = (
+            base_mc.local_deploy_metadata
+            if base_mc and isinstance(base_mc.local_deploy_metadata, dict)
+            else {}
+        )
+        if not nim_container_image:
+            catalog_image = base_local_deploy_metadata.get("nim_container_image")
+            if isinstance(catalog_image, str) and catalog_image:
+                nim_container_image = catalog_image
+        nim_release_version = student.nim_vlm_release_version or (
+            release_version_from_image(nim_container_image)
+        )
+        nim_model_size_raw = base_local_deploy_metadata.get("nim_model_size")
+        nim_model_size = (
+            str(nim_model_size_raw) if nim_model_size_raw is not None else None
+        )
+        extra_container_env = resolve_extra_container_env(
+            project_id,
+            student.student_base_model_config_id,
+            settings.WORKSPACE_ROOT,
+        )
 
         # Training lineage
         train_job = (
@@ -205,10 +254,18 @@ def generate_deployment_handoff_for_student(
                 .first()
             )
 
-        # Test Pool DatasetExport SHA-256 (provenance for reproducibility)
-        dataset_sha = resolve_test_pool_dataset_sha(
-            session, list(student.dataset_export_ids or [])
-        )
+        # Test Pool DatasetExport SHA-256 (provenance for reproducibility).
+        # StudentModel.dataset_export_ids is training-only by contract; follow
+        # the paired evaluate job from the artifact-producing train/quantize
+        # job. Prefer the serving run's persisted value when present.
+        artifact_parent_job_id = student.quantize_tao_job_id or student.tao_job_id
+        dataset_sha = serving_run.dataset_manifest_sha256
+        if not dataset_sha:
+            dataset_sha = resolve_paired_test_pool_dataset_sha(
+                session,
+                artifact_parent_tao_job_id=artifact_parent_job_id,
+                fallback_export_ids=list(student.dataset_export_ids or []),
+            )
 
         # GPU memory minimum (drives the gpu_requirements string and
         # differentiates 2B vs 8B handoffs on identical-GPU rentals).
@@ -256,7 +313,9 @@ def generate_deployment_handoff_for_student(
             "nim_container_image": nim_container_image,
             "nim_served_model_name": nim_served_model_name,
             "nim_model_name_path": nim_model_name_path,
-            "nim_release_version": student.nim_vlm_release_version,
+            "nim_release_version": nim_release_version,
+            "nim_model_size": nim_model_size,
+            "extra_container_env": extra_container_env,
             # Audit (sourced from StudentModel as-is).
             "nim_model_profile_requested": student.nim_model_profile_requested,
             "nim_model_profile_selected": student.nim_model_profile_selected,
@@ -277,6 +336,8 @@ def generate_deployment_handoff_for_student(
             "quality_metrics": quality_metrics,
             "rescored_metrics": rescored_metrics,
             "serving_metrics": serving_metrics,
+            "quality_evaluation_run_id": student.quality_evaluation_run_id,
+            "serving_evaluation_run_id": student.serving_evaluation_run_id,
             "visual_budget_preset_key": serving_run.visual_budget_preset_key,
             "generation_preset_key": serving_run.generation_preset_key,
             "thinking_mode_effective": serving_run.thinking_mode_effective,
@@ -325,6 +386,13 @@ def _generate_deployment_handoff(
         context.get("nim_model_name_path") or "/opt/checkpoints/student"
     )
     nim_release_version = context.get("nim_release_version") or "(unknown)"
+    nim_model_size = context.get("nim_model_size")
+    extra_container_env_raw: Any = context.get("extra_container_env") or {}
+    extra_container_env: dict[str, str] = (
+        cast("dict[str, str]", extra_container_env_raw)
+        if isinstance(extra_container_env_raw, dict)
+        else {}
+    )
     nim_model_profile_recommended = context.get("nim_model_profile_recommended")
     # Display fallback for the rendered_text only — the structured field stays
     # null when no profile has been selected, so consumers can detect the
@@ -434,11 +502,15 @@ def _generate_deployment_handoff(
     nim_env_vars_recommended: dict[str, str] = {
         "NGC_API_KEY": "$NGC_API_KEY",
         "NIM_MODEL_NAME": nim_model_name_path,
+        "NIM_ENABLE_KV_CACHE_REUSE": "0",
     }
     if nim_served_model_name:
         nim_env_vars_recommended["NIM_SERVED_MODEL_NAME"] = nim_served_model_name
+    if nim_model_size:
+        nim_env_vars_recommended["NIM_MODEL_SIZE"] = str(nim_model_size)
     if nim_model_profile_recommended:
         nim_env_vars_recommended["NIM_MODEL_PROFILE"] = nim_model_profile_recommended
+    nim_env_vars_recommended.update(extra_container_env)
 
     # gpu_requirements — example shape: "8× A100 80 GB". On a
     # single-GPU host both 2B and 8B land "1× A100"; the per-variant
@@ -453,6 +525,8 @@ def _generate_deployment_handoff(
         "nim_release_version": nim_release_version,
         "nim_served_model_name": nim_served_model_name,
         "nim_model_name_path": nim_model_name_path,
+        "nim_model_size": nim_model_size,
+        "extra_container_env": extra_container_env,
         # Customer-facing recommendation. Audit value
         # ``nim_model_profile_selected`` is preserved on the StudentModel row.
         "nim_model_profile_recommended": nim_model_profile_recommended,
@@ -491,6 +565,8 @@ def _generate_deployment_handoff(
         "serving_status": "validated",
         "quality_evaluation_overall_exact_match": overall_quality_em,
         "serving_evaluation_overall_exact_match": serving_em,
+        "quality_evaluation_run_id": context.get("quality_evaluation_run_id"),
+        "serving_evaluation_run_id": context.get("serving_evaluation_run_id"),
         "quality_metrics": quality_metrics,
         "rescored_metrics": rescored_metrics,
         "serving_metrics": serving_metrics,
@@ -504,7 +580,7 @@ def _generate_deployment_handoff(
     }
 
     rendered_text = (
-        "Deployment Handoff Request\n"
+        "Deployment Handoff Request\n\n"
         f"Project: {project_name}\n"
         f"Student: {student_model_id}\n"
         f"Base: {base_model_name} · Quantization: {quantization_method} · "
@@ -513,10 +589,29 @@ def _generate_deployment_handoff(
         "Training-time and evaluation-time Inference Contracts match.\n\n"
         "The receiving infrastructure team owns the permanent service, "
         "access controls, scaling, monitoring, and operations.\n\n"
+        "Checkpoint\n"
+        f"    Validated source: {nim_checkpoint_ref}\n"
+        "    Packaging status: validated\n"
+        "    Portable artifact: use Download portable NIM deployment bundle "
+        "in this panel; "
+        "it includes the checkpoint, manifest, and SHA-256 checksums.\n\n"
+        "NIM Configuration\n"
+        f"    Runtime image: {nim_container_image}\n"
+        f"    NIM release: {nim_release_version}\n"
+        f"    NIM_MODEL_NAME: {nim_model_name_path}\n"
+        f"    NIM_SERVED_MODEL_NAME: {nim_served_model_name}\n"
+        f"    NIM_MODEL_SIZE: {nim_model_size or '(not required)'}\n"
+        f"    NIM_MODEL_PROFILE: {nim_model_profile_display}\n"
         "Production deployment command:\n"
         f"{docker_run_command}\n\n"
         "Endpoint health: GET /v1/health/ready\n"
         f"Smoke test: POST /v1/chat/completions with model={nim_served_model_name!r}\n\n"
+        "Model\n"
+        f"    Base model: {base_model_name}\n"
+        f"    Quantization: {quantization_method}\n"
+        f"    GPU requirement: {gpu_requirements}\n"
+        f"    Tensor parallelism: {tensor_parallelism}\n\n"
+        "Evaluation\n"
         "Quality (TAO-rescored):\n"
         f"    Overall Exact Match: {overall_quality_em}\n"
         f"    Inference Contract: {inference_contract}\n"
@@ -526,7 +621,7 @@ def _generate_deployment_handoff(
         f"    Profile recommended: {nim_model_profile_display}\n"
         f"    Profile metadata: {nim_profile_metadata}\n"
         f"    Tensor parallelism: {tensor_parallelism}\n\n"
-        "Training lineage:\n"
+        "Training Lineage\n"
         f"    Training TAO job: {training_tao_job_id}\n"
         f"    Quantize TAO job: {quantize_tao_job_id}\n"
         f"    Training preset: {training_preset}\n"

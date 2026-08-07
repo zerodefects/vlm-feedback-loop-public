@@ -14,7 +14,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button, Spinner, Text } from "@kui/react";
 import { ChevronRight, Plus, RotateCcw } from "lucide-react";
 
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useSetupContext } from "@/pages/setup-context";
 import { SetupAutoSkipBanner } from "@/components/common/SetupAutoSkipBanner";
 import {
   ImagePanel,
@@ -50,11 +50,13 @@ import {
 import { fetchModelConfigs, updateProject } from "@/api/model-configs";
 import { fetchProjectList } from "@/api/projects";
 import { fetchScaleUpGate } from "@/api/evaluation";
+import { listStudentModels } from "@/api/students";
 import {
   evaluationKeys,
   guidanceKeys,
   modelConfigKeys,
   projectKeys,
+  studentModelKeys,
 } from "@/api/query-keys";
 import { RATIONALE_NOTE_FIELD_NAME } from "@/lib/guidance-templates";
 import { thinkingToggleVisible, visualBudgetVisible } from "@/lib/model-display";
@@ -105,7 +107,8 @@ type LabelingAction =
   | { type: "ACTION_FAIL"; error: string }
   | { type: "SKIP_START" }
   | { type: "RETRY" }
-  | { type: "IMAGE_MISSING" };
+  | { type: "IMAGE_MISSING" }
+  | { type: "IMAGE_LOADED" };
 
 const INITIAL_STATE: LabelingState = {
   phase: "fetching_next",
@@ -159,6 +162,8 @@ function reducer(state: LabelingState, action: LabelingAction): LabelingState {
       return { ...state, phase: "fetching_proposal", proposal: null };
     case "IMAGE_MISSING":
       return { ...state, imageMissing: true };
+    case "IMAGE_LOADED":
+      return { ...state, imageMissing: false };
     default:
       return state;
   }
@@ -234,6 +239,13 @@ export function LabelingPage() {
     refetchInterval: 30_000,
   });
   const gatePassCount = gateData?.criteria?.filter((c) => c.passed).length ?? 0;
+  const { data: studentModels } = useQuery({
+    queryKey: studentModelKeys.list(projectId),
+    // Keep the shared list key's query contract identical to AppShell,
+    // Project Overview, and Compare so their cached pages cannot collide.
+    queryFn: () => listStudentModels(projectId, { limit: 200 }),
+  });
+  const hasStudentModels = (studentModels?.items.length ?? 0) > 0;
   const poolCriterion = gateData?.criteria?.find(
     (c) => c.criterion_name === "min_test_pool_size",
   );
@@ -476,6 +488,12 @@ export function LabelingPage() {
         ...rationaleMetadata,
       });
       await queryClient.invalidateQueries({ queryKey: projectKeys.list() });
+      // Automatic pool routing happens in the same save transaction. Refresh
+      // the gate immediately so the visible Test Pool count reconciles with
+      // the saved label instead of waiting for the 30-second poll.
+      await queryClient.invalidateQueries({
+        queryKey: evaluationKeys.gate(projectId),
+      });
       // A save can change the Verified count past a reminder threshold —
       // refetch the backend's reminder decision.
       await queryClient.invalidateQueries({
@@ -544,6 +562,10 @@ export function LabelingPage() {
 
   function handleImageMissing() {
     dispatch({ type: "IMAGE_MISSING" });
+  }
+
+  function handleImageLoaded() {
+    dispatch({ type: "IMAGE_LOADED" });
   }
 
   function handleRationaleTextChange(text: string) {
@@ -798,7 +820,16 @@ export function LabelingPage() {
             onThinkingChange={handleThinkingChange}
             onVisualBudgetChange={handleVisualBudgetChange}
           />
-          <IclChip count={state.proposal?.icl_example_keys_used?.length ?? 0} />
+          <IclChip
+            idle={state.phase === "queue_empty"}
+            count={
+              state.proposal
+                ? (state.proposal.icl_example_keys_used?.length ?? 0)
+                : countsLoaded && counts.verified === 0
+                  ? 0
+                  : null
+            }
+          />
         </div>
       </div>
       {topBarError && (
@@ -861,6 +892,7 @@ export function LabelingPage() {
             storageRef={currentStorageRef}
             isLoading={state.phase === "fetching_next"}
             onImageMissing={handleImageMissing}
+            onImageLoaded={handleImageLoaded}
           />
         )}
 
@@ -933,14 +965,15 @@ export function LabelingPage() {
                     >
                       rationale_note
                     </Text>
-                    <div
+                    <Text
+                      kind="body/regular/sm"
                       className="glass-info px-3 py-2 text-sm"
-                      style={{ color: "var(--text-secondary)" }}
+                      style={{ color: "var(--text-secondary)", display: "block" }}
                     >
                       {String(
                         state.proposal.proposal_json?.[RATIONALE_NOTE_FIELD_NAME] ?? "",
                       )}
-                    </div>
+                    </Text>
                   </div>
                 )}
 
@@ -1177,6 +1210,17 @@ export function LabelingPage() {
           <Plus size={14} /> Add Images
         </Button>
         <div className="flex items-center gap-3" data-testid="footer-right">
+          {hasStudentModels && (
+            <Button
+              kind="tertiary"
+              className="glass-pill"
+              onClick={() => navigate(`/projects/${projectId}/compare`)}
+              data-testid="models-results-indicator"
+            >
+              Models &amp; Results
+              <ChevronRight size={14} style={{ marginLeft: 4 }} />
+            </Button>
+          )}
           <Button
             kind="tertiary"
             className="glass-pill"
@@ -1196,6 +1240,7 @@ export function LabelingPage() {
           onClose={() => setResultsRun(null)}
           teacherConfigs={modelConfigs?.items ?? []}
           guidanceVersions={guidanceList?.items ?? []}
+          minPerValueF1Threshold={project.scaleup_min_per_value_f1_threshold}
         />
       )}
     </div>

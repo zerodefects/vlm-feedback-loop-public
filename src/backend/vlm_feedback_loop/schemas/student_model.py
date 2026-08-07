@@ -21,6 +21,7 @@ class StudentModelResponse(BaseModel):
 
     student_model_id: str
     project_id: str
+    training_suite_id: str | None
     student_base_model_config_id: str
     # Joined from ModelConfig.model_name so consumers (Compare & Benchmark
     # UI, full_stack_validation classifier, deployment-handoff renderers)
@@ -45,6 +46,11 @@ class StudentModelResponse(BaseModel):
     quality_evaluation_run_id: str | None
     serving_status: ServingStatus
     serving_evaluation_run_id: str | None
+    # ``serving_status`` is durable historical state. This response-only
+    # assessment prevents pre-AIPerf latency sweeps from satisfying the
+    # current production handoff gate after a workspace upgrade.
+    serving_benchmark_current: bool = False
+    serving_benchmark_blocker: str | None = None
 
     # NIM deployment state
     nim_preflight_status: str | None

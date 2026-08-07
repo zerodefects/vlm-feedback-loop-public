@@ -400,6 +400,45 @@ class TestHandleFailedEvaluateFlipsStudent:
             assert s.query(StudentModel).count() == 0
 
     @pytest.mark.asyncio
+    async def test_local_nim_operational_failure_preserves_pending_quality(
+        self, tmp_path, patch_tao_http
+    ):
+        """A failed local serving attempt is not a measured quality result."""
+        engine, workspace, pdir = _seed_project(tmp_path)
+        train_id, eval_id = _seed_chain_baseline(
+            engine, pdir, chain_id="chain-local-nim-fail"
+        )
+        settings = make_settings(workspace)
+        await student_model_service.register_from_tao_terminal(
+            PID, train_id, settings=settings
+        )
+
+        with Session(engine) as s:
+            evaluate = s.query(TAOJob).filter_by(tao_job_id=eval_id).one()
+            evaluate.status = "failed"
+            evaluate.training_backend = "student_nim_local"
+            evaluate.error_ref = "student_nim_evaluation_failed"
+            s.commit()
+
+        await tao_polling_service.handle_terminal_failure(
+            PID,
+            eval_id,
+            chain_id="chain-local-nim-fail",
+            chain_sequence=2,
+            action="evaluate",
+            terminal_status="failed",
+            engine=engine,
+            settings=settings,
+        )
+
+        with Session(engine) as s:
+            student = s.query(StudentModel).one()
+            assert student.quality_status == "pending"
+            assert not (student.nim_preflight_details or {}).get(
+                "quality_failure_reason"
+            )
+
+    @pytest.mark.asyncio
     async def test_evaluate_canceled_flips_student_quality_failed(
         self, tmp_path, patch_tao_http
     ):
@@ -490,7 +529,7 @@ class TestFailureLogCapture:
             assert j.outputs.get("tao_logs_text") == log_body
 
     @pytest.mark.asyncio
-    async def test_quantize_failed_captures_logs_tail(
+    async def test_quantize_failed_captures_logs_tail_and_actionable_error(
         self, tmp_path, patch_tao_http, monkeypatch
     ):
         """Quantize failures get the same treatment — races like the
@@ -514,6 +553,7 @@ class TestFailureLogCapture:
                     job_config={"quantization_method": "W8A16"},
                     tao_create_job_request={},
                     outputs={},
+                    error_ref="quantize action failed for cosmos-rl",
                     tao_external_job_id="ext-qz",
                     parent_tao_job_id=train_id,
                     chain_id="chain-F42-Q",
@@ -522,7 +562,10 @@ class TestFailureLogCapture:
             )
             s.commit()
 
-        log_body = "cosmos-rl-quantize: AssertionError on shard 4"
+        log_body = (
+            "Quantization failed: offset overflow while concatenating arrays, "
+            "consider casting to large_list first."
+        )
         monkeypatch.setattr(
             tao_polling_service,
             "_fetch_tao_log_text",
@@ -545,6 +588,9 @@ class TestFailureLogCapture:
             j = s.query(TAOJob).filter_by(tao_job_id=quantize_id).one()
             assert j.outputs is not None
             assert j.outputs.get("tao_logs_text") == log_body
+            assert j.error_ref is not None
+            assert "offset overflow while concatenating arrays" in j.error_ref
+            assert "num_calibration_samples" in j.error_ref
 
     @pytest.mark.asyncio
     async def test_evaluate_failed_still_captures_logs_tail(

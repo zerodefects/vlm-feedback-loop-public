@@ -221,12 +221,36 @@ def backend_server(_server_log_dir: Path, tmp_path_factory: pytest.TempPathFacto
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(BACKEND_DIR) + os.pathsep + env.get("PYTHONPATH", "")
-    # Point the spawned backend at a throwaway session workspace (process
-    # env beats config.yaml in the settings precedence chain). The suite
-    # creates projects freely and never deletes them, so without this the
-    # operator's real {WORKSPACE_ROOT} accumulates junk projects on every
-    # run.
-    env["WORKSPACE_ROOT"] = str(tmp_path_factory.mktemp("workspace"))
+    # Give the child its own canonical config as well as a throwaway workspace.
+    # A process-env WORKSPACE_ROOT cannot replace the required config file, and
+    # relying on a developer's real HOME made this fixture fail on clean CI
+    # runners while also exposing tests to unrelated local configuration.
+    test_home = tmp_path_factory.mktemp("backend-home")
+    workspace = tmp_path_factory.mktemp("workspace")
+    config_dir = test_home / ".vlm_feedback_loop"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text(f"WORKSPACE_ROOT: {workspace}\n")
+    env["HOME"] = str(test_home)
+    env["WORKSPACE_ROOT"] = str(workspace)
+    # A disposable integration backend must inherit external credentials only
+    # when the operator exported them explicitly for this test process.  An
+    # absent parent variable must become an explicit empty process override;
+    # otherwise the normal settings loader falls through to the operator's
+    # canonical ~/.vlm_feedback_loop/.env and a nominal no-key test can make
+    # real hosted NIM, NGC, Hugging Face, or TAO calls.
+    for secret_name in (
+        "NVIDIA_API_KEY",
+        "NGC_API_KEY",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "TAO_API_KEY",
+        "TAO_WORKSPACE_S3_ACCESS_KEY",
+        "TAO_WORKSPACE_S3_SECRET_KEY",
+    ):
+        env[secret_name] = os.environ.get(secret_name, "")
+    env["ALLOW_UI_SECRET_PERSIST"] = "false"
+    if not env["NVIDIA_API_KEY"]:
+        env["EMBEDDING_PROVIDER"] = "none"
     # Mount the test-only /v1/testing SSE-injection routes for this live
     # server — the SSE-recovery tests drive events through them. Production
     # leaves them unmounted (see main.py).

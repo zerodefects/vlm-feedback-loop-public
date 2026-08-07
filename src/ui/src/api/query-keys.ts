@@ -28,6 +28,10 @@ export const modelConfigKeys = {
     ["modelConfigs", projectId, "list", role] as const,
 };
 
+export const nimEndpointKeys = {
+  list: (projectId: string) => ["nimEndpoints", projectId, "list"] as const,
+};
+
 // Local-NIM deployment polling — shared between NIMSetupGatePage and
 // LocalDeployBanner so their pollers hit the same cache entry.
 export const localNimKeys = {
@@ -73,6 +77,8 @@ export const trainingKeys = {
     projectId: string,
     modelConfigIds: string[],
     includeAutoLabeled: boolean,
+    enableLora = true,
+    quantizationSchemes: string[] = ["FP8_DYNAMIC"],
   ) =>
     [
       "training",
@@ -80,6 +86,8 @@ export const trainingKeys = {
       "preflight",
       [...modelConfigIds].sort().join(","),
       includeAutoLabeled,
+      enableLora,
+      [...quantizationSchemes].sort().join(","),
     ] as const,
   presets: (projectId: string, modelConfigIds: string[]) =>
     ["training", projectId, "presets", [...modelConfigIds].sort().join(",")] as const,

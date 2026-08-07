@@ -8,9 +8,12 @@ Router-level HTTP tests using TestClient, mocking the service layer.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 from vlm_feedback_loop.db.base import utc_now
+from vlm_feedback_loop.services.authorized_file import open_regular_file_beneath
+from vlm_feedback_loop.services.dataset_export_service import DatasetExportArchive
 
 # Service-level patch targets
 _SVC = "vlm_feedback_loop.services.dataset_export_service"
@@ -165,6 +168,41 @@ class TestGetExport:
             resp = test_app_client.get(f"/v1/projects/{PID}/dataset_exports/no-such")
         assert resp.status_code == 404
         assert "Dataset export no-such" in resp.json()["detail"]
+
+
+class TestDownloadExportArchive:
+    def test_download_streams_archive_with_checksum(
+        self, test_app_client, tmp_path: Path
+    ):
+        """Completed archives traverse the same-origin REST/nginx boundary."""
+        archive = tmp_path / "dataset-export.tar.gz"
+        archive.write_bytes(b"portable export bytes")
+        checksum = "a" * 64
+        opened = open_regular_file_beneath(archive, tmp_path)
+        with patch(f"{_SVC}.get_dataset_export_archive") as mock_get:
+            mock_get.return_value = DatasetExportArchive(opened, checksum)
+            resp = test_app_client.get(
+                f"/v1/projects/{PID}/dataset_exports/{DEID}/archive"
+            )
+
+        assert resp.status_code == 200
+        assert resp.content == b"portable export bytes"
+        assert resp.headers["content-type"] == "application/gzip"
+        assert "attachment" in resp.headers["content-disposition"]
+        assert "dataset-export.tar.gz" in resp.headers["content-disposition"]
+        assert resp.headers["x-checksum-sha256"] == checksum
+        assert opened._closed is True
+
+    def test_download_rejects_running_export(self, test_app_client):
+        """A running export cannot be presented as a completed download."""
+        with patch(f"{_SVC}.get_dataset_export_archive") as mock_get:
+            mock_get.return_value = "conflict: Dataset export de-001 is running"
+            resp = test_app_client.get(
+                f"/v1/projects/{PID}/dataset_exports/{DEID}/archive"
+            )
+
+        assert resp.status_code == 409
+        assert "running" in resp.json()["detail"]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

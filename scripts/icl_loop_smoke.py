@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end live smoke for the ICL loop, per default Teacher.
+"""End-to-end live smoke for the ICL loop, per Teacher.
 
 Drives the full lifecycle through the running backend's REST API:
 
@@ -18,15 +18,17 @@ Cosmos Reason 2 8B local is intentionally not in the default Teacher list
 because this host has no GPU/Docker NIM substrate — pass it explicitly via
 ``--teachers cosmos_8b_local`` once a local NIM endpoint is registered.
 
-The script assumes the backend is already running at
-``http://127.0.0.1:8000``. Start it via ``./scripts/dev.sh`` (or by booting
-``vlm_feedback_loop.main`` directly) before invoking this smoke.
+The default hosted matrix starts with the shipped Step 3.7 Flash Teacher and
+covers all currently hosted-compatible seeded Teachers. The script assumes the backend
+is already running at ``http://127.0.0.1:8000``. Start it via
+``./scripts/dev.sh`` (or by booting ``vlm_feedback_loop.main`` directly) before
+invoking this smoke.
 
 Usage::
 
     uv run python scripts/icl_loop_smoke.py
-    uv run python scripts/icl_loop_smoke.py --teachers qwen
-    uv run python scripts/icl_loop_smoke.py --teachers qwen,step
+    uv run python scripts/icl_loop_smoke.py --teachers step
+    uv run python scripts/icl_loop_smoke.py --teachers step,nemotron
 """
 
 from __future__ import annotations
@@ -43,6 +45,15 @@ from typing import Any
 
 import httpx
 
+from vlm_feedback_loop.model_catalog_constants import (
+    COSMOS_REASON2_2B,
+    COSMOS_REASON2_8B,
+    MISTRAL_MEDIUM_3_5,
+    NEMOTRON_3_NANO_OMNI_REASONING,
+    NEMOTRON_NANO_12B_VL,
+    STEP_3_7_FLASH,
+)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_helpers import (  # noqa: E402
     StageResult,
@@ -54,14 +65,17 @@ BACKEND_URL = "http://127.0.0.1:8000"
 RPS_ROOT = Path(os.environ.get("RPS_TEST_SET_ROOT", "~/rps-test-set")).expanduser()
 
 TEACHER_LOOKUP: dict[str, str] = {
-    "qwen": "qwen/qwen3.5-397b-a17b",
-    "step": "stepfun-ai/step-3.7-flash",
-    "mistral": "mistralai/mistral-large-3-675b-instruct-2512",
-    "nemotron": "nvidia/nemotron-nano-12b-v2-vl",
+    "step": STEP_3_7_FLASH,
+    "mistral_medium": MISTRAL_MEDIUM_3_5,
+    "nemotron": NEMOTRON_NANO_12B_VL,
+    "omni": NEMOTRON_3_NANO_OMNI_REASONING,
     # Local-deployed only; explicit opt-in.
-    "cosmos_8b_local": "nvidia/cosmos-reason2-8b",
-    "cosmos_2b_local": "nvidia/cosmos-reason2-2b",
+    "cosmos_8b_local": COSMOS_REASON2_8B,
+    "cosmos_2b_local": COSMOS_REASON2_2B,
 }
+DEFAULT_TEACHERS = ",".join(
+    label for label in TEACHER_LOOKUP if not label.endswith("_local")
+)
 
 # 3 images per class. With the default ``target_edits=5`` and the 0.40
 # default test-pool fraction (``Project.test_pool_fraction``), 5
@@ -162,10 +176,9 @@ async def _switch_teacher(
 ) -> bool:
     """Patch the project to point at the target Teacher.
 
-    Also flips ``thinking_default_on`` to False by default. Hosted NIM thinking-
-    mode adds 60–90s per proposal on Kimi/Qwen, blowing past
-    ``HTTP_DEADLINE_INTERACTIVE_S=180``. The smoke wants integration coverage,
-    not reasoning quality, so thinking is OFF unless the caller flips it.
+    Also flips ``thinking_default_on`` to False by default. The smoke wants
+    integration coverage rather than reasoning quality, so thinking is OFF
+    unless the caller flips it.
     """
     assert report.project_id is not None
     t0 = time.monotonic()
@@ -499,9 +512,9 @@ async def amain(argv: list[str]) -> int:
     parser.add_argument(
         "--teachers",
         type=str,
-        default="qwen,step",
+        default=DEFAULT_TEACHERS,
         help=(
-            "Comma list of teacher labels. Default: qwen,step. "
+            f"Comma list of teacher labels. Default: {DEFAULT_TEACHERS}. "
             "Available: " + ", ".join(TEACHER_LOOKUP.keys())
         ),
     )

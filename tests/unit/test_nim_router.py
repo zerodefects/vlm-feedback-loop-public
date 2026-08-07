@@ -21,8 +21,9 @@ from vlm_feedback_loop.model_catalog_constants import (
     EMBEDDING_MODEL_ID,
     EMBEDDING_NIM_GPU_MIN_GB,
     EMBEDDING_NIM_IMAGE,
-    MISTRAL_LARGE_3,
+    STEP_3_7_FLASH,
 )
+from vlm_feedback_loop.services import environment as environment_service
 from vlm_feedback_loop.services.environment import GpuInfo
 from vlm_feedback_loop.services.project_service import SEEDED_MODEL_CATALOG
 
@@ -38,6 +39,50 @@ def _create_project(client: TestClient) -> str:
 
 
 class TestEnvironmentEndpoint:
+    @pytest.fixture(autouse=True)
+    def _reset_machine_assessment_cache(self):
+        environment_service.invalidate_machine_assessment_cache()
+        yield
+        environment_service.invalidate_machine_assessment_cache()
+
+    def test_caches_hardware_until_an_explicit_refresh(self, test_app_client):
+        """Ordinary reads reuse host probes; explicit refresh replaces the snapshot."""
+        docker_probe = AsyncMock(return_value=(True, None))
+        toolkit_probe = AsyncMock(return_value=(True, None))
+        gpu_probe = AsyncMock(
+            side_effect=[
+                [GpuInfo(name="GPU before change", memory_total_mb=40960)],
+                [GpuInfo(name="GPU after change", memory_total_mb=97887)],
+            ]
+        )
+        with (
+            patch(
+                "vlm_feedback_loop.services.environment.check_docker_available",
+                docker_probe,
+            ),
+            patch(
+                "vlm_feedback_loop.services.environment.check_nvidia_toolkit",
+                toolkit_probe,
+            ),
+            patch(
+                "vlm_feedback_loop.services.environment.probe_gpu_inventory",
+                gpu_probe,
+            ),
+        ):
+            before = test_app_client.get("/v1/environment")
+            cached = test_app_client.get("/v1/environment")
+            refreshed = test_app_client.get("/v1/environment?refresh_hardware=true")
+
+        assert before.status_code == 200
+        assert cached.status_code == 200
+        assert refreshed.status_code == 200
+        assert before.json()["gpus"][0]["name"] == "GPU before change"
+        assert cached.json()["gpus"][0]["name"] == "GPU before change"
+        assert refreshed.json()["gpus"][0]["name"] == "GPU after change"
+        assert docker_probe.await_count == 2
+        assert toolkit_probe.await_count == 2
+        assert gpu_probe.await_count == 2
+
     def test_returns_all_required_fields(self, test_app_client):
         with (
             patch(
@@ -264,7 +309,10 @@ class TestConnectionTest:
 
             mock_req.return_value = HttpResult(
                 status_code=200,
-                body={"data": [{"index": 0, "embedding": [0.1]}], "model": "nvclip"},
+                body={
+                    "data": [{"index": 0, "embedding": [0.1] * 2048}],
+                    "model": EMBEDDING_MODEL_ID,
+                },
                 error_class=None,
                 attempts=1,
             )
@@ -272,15 +320,44 @@ class TestConnectionTest:
             resp = test_app_client.post(
                 "/v1/nim/test_connection",
                 json={
-                    "base_url": "https://integrate.api.nvidia.com/v1",
-                    "auth_mode": "bearer",
-                    "credential_transient": "nvapi-test",
+                    "base_url": "http://embedding.internal:8000/v1",
+                    "auth_mode": "none",
                     "probe_kind": "embeddings",
                 },
             )
 
         assert resp.status_code == 200
         assert resp.json()["success"] is True
+        request = mock_req.await_args
+        assert request.args[1] == "http://embedding.internal:8000/v1/embeddings"
+        assert request.kwargs["json_body"]["model"] == EMBEDDING_MODEL_ID
+        assert request.kwargs["json_body"]["input_type"] == "passage"
+
+    def test_embeddings_probe_rejects_wrong_dimension(self, test_app_client):
+        with patch(
+            "vlm_feedback_loop.services.nim_client.resilient_request",
+            new_callable=AsyncMock,
+        ) as mock_req:
+            from vlm_feedback_loop.services.http_client import HttpResult
+
+            mock_req.return_value = HttpResult(
+                status_code=200,
+                body={"data": [{"index": 0, "embedding": [0.1]}]},
+                error_class=None,
+                attempts=1,
+            )
+            resp = test_app_client.post(
+                "/v1/nim/test_connection",
+                json={
+                    "base_url": "http://teacher-only.internal:8000/v1",
+                    "auth_mode": "none",
+                    "probe_kind": "embeddings",
+                },
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["success"] is False
+        assert "2048-dimensional" in resp.json()["error"]
 
     def test_missing_credential_returns_error(self, test_app_client):
         resp = test_app_client.post(
@@ -362,6 +439,7 @@ class TestNimEndpointCRUD:
         assert data["endpoint_id"]  # UUID4
         assert data["project_id"] == project_id
         assert data["source_kind"] == "user_configured"
+        assert data["usage_policy"] == "operator_managed"
         # Auto-probe ran
         assert data["last_probe_at"] is not None
         assert data["last_probe_status"] == "healthy"
@@ -376,6 +454,26 @@ class TestNimEndpointCRUD:
         # The seeded endpoint
         seeded = data["items"][0]
         assert seeded["source_kind"] == "seeded_hosted"
+        assert seeded["usage_policy"] == "evaluation_only"
+
+    def test_catalog_host_is_evaluation_only_even_when_user_configured(
+        self, test_app_client
+    ):
+        """Usage policy follows the service host, not endpoint provenance."""
+        project_id = _create_project(test_app_client)
+        response = test_app_client.post(
+            f"/v1/projects/{project_id}/nim_endpoints",
+            json={
+                "display_name": "Catalog override",
+                "endpoint_mode": "hosted",
+                "base_url": "https://INTEGRATE.API.NVIDIA.COM./v1",
+                "auth_mode": "bearer",
+            },
+        )
+
+        assert response.status_code == 201
+        assert response.json()["source_kind"] == "user_configured"
+        assert response.json()["usage_policy"] == "evaluation_only"
 
     def test_get_endpoint_by_id(self, test_app_client):
         project_id = _create_project(test_app_client)
@@ -463,6 +561,238 @@ class TestNimEndpointCRUD:
         assert resp.json()["detail"] == "Project not found"
 
 
+class TestConfigureSelfHostedTeacher:
+    @pytest.fixture(autouse=True)
+    def _mock_capability_probes(self):
+        with (
+            patch(
+                "vlm_feedback_loop.services.model_config_service."
+                "probe_structured_generation",
+                new=AsyncMock(return_value="supported"),
+            ),
+            patch(
+                "vlm_feedback_loop.services.model_config_service.probe_thinking_toggle",
+                new=AsyncMock(return_value="unsupported"),
+            ),
+            patch(
+                "vlm_feedback_loop.services.model_config_service.probe_visual_budget",
+                new=AsyncMock(return_value="unsupported"),
+            ),
+            patch(
+                "vlm_feedback_loop.services.model_config_service."
+                "_probe_image_cap_support",
+                new=AsyncMock(return_value="supported"),
+            ),
+        ):
+            yield
+
+    def _selected_teacher(self, client: TestClient, project_id: str) -> dict:
+        project = client.get(f"/v1/projects/{project_id}").json()
+        teachers = client.get(
+            f"/v1/projects/{project_id}/model_configs?eligible_role=teacher"
+        ).json()["items"]
+        return next(
+            item
+            for item in teachers
+            if item["model_config_id"] == project["teacher_model_config_id"]
+        )
+
+    def test_verified_endpoint_is_bound_selected_and_capability_probed(
+        self, test_app_client
+    ):
+        from vlm_feedback_loop.services.nim_client import NimListModelsResult
+
+        project_id = _create_project(test_app_client)
+        teacher = self._selected_teacher(test_app_client, project_id)
+        with patch(
+            "vlm_feedback_loop.services.nim_endpoint_service.nim_client.list_models",
+            new=AsyncMock(
+                return_value=NimListModelsResult(
+                    success=True,
+                    models=[teacher["model_name"]],
+                    status_code=200,
+                )
+            ),
+        ) as list_models:
+            response = test_app_client.post(
+                f"/v1/projects/{project_id}/nim_endpoints:configure_self_hosted_teacher",
+                json={
+                    "base_url": "http://nim.internal:8000/v1/",
+                    "model_config_id": teacher["model_config_id"],
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["endpoint"]["endpoint_mode"] == "self_hosted"
+        assert data["endpoint"]["base_url"] == "http://nim.internal:8000/v1"
+        assert data["endpoint"]["auth_mode"] == "none"
+        assert data["endpoint"]["last_probe_status"] == "healthy"
+        assert data["model_config_id"] == teacher["model_config_id"]
+        assert data["model_name"] == teacher["model_name"]
+        assert data["structured_generation_support"] == "supported"
+        assert data["thinking_toggle_support"] == "unsupported"
+        assert data["visual_budget_support"] == "unsupported"
+        list_models.assert_awaited_once_with(
+            base_url="http://nim.internal:8000/v1",
+            auth_headers={},
+            deadline_s=180.0,
+            max_retries=1,
+        )
+
+        selected = self._selected_teacher(test_app_client, project_id)
+        assert selected["model_config_id"] == teacher["model_config_id"]
+        assert selected["endpoint_id"] == data["endpoint"]["endpoint_id"]
+        assert selected["availability"] == {"available": True, "reason": None}
+
+    def test_repeat_apply_reuses_endpoint_instead_of_duplicating(self, test_app_client):
+        from vlm_feedback_loop.services.nim_client import NimListModelsResult
+
+        project_id = _create_project(test_app_client)
+        teacher = self._selected_teacher(test_app_client, project_id)
+        probe = AsyncMock(
+            return_value=NimListModelsResult(
+                success=True,
+                models=[teacher["model_name"]],
+                status_code=200,
+            )
+        )
+        payload = {
+            "base_url": "http://nim.internal:8000/v1",
+            "model_config_id": teacher["model_config_id"],
+        }
+        with patch(
+            "vlm_feedback_loop.services.nim_endpoint_service.nim_client.list_models",
+            probe,
+        ):
+            first = test_app_client.post(
+                f"/v1/projects/{project_id}/nim_endpoints:configure_self_hosted_teacher",
+                json=payload,
+            )
+            second = test_app_client.post(
+                f"/v1/projects/{project_id}/nim_endpoints:configure_self_hosted_teacher",
+                json=payload,
+            )
+
+        assert first.status_code == second.status_code == 200
+        assert (
+            first.json()["endpoint"]["endpoint_id"]
+            == second.json()["endpoint"]["endpoint_id"]
+        )
+        endpoints = test_app_client.get(
+            f"/v1/projects/{project_id}/nim_endpoints"
+        ).json()["items"]
+        matching = [
+            endpoint
+            for endpoint in endpoints
+            if endpoint["endpoint_mode"] == "self_hosted"
+            and endpoint["base_url"] == payload["base_url"]
+        ]
+        assert len(matching) == 1
+
+    def test_apply_reuses_and_canonicalizes_an_existing_self_hosted_endpoint(
+        self, test_app_client
+    ):
+        """Save binds one existing URL and enforces the credential-free contract."""
+        from vlm_feedback_loop.services.nim_client import NimListModelsResult
+
+        project_id = _create_project(test_app_client)
+        teacher = self._selected_teacher(test_app_client, project_id)
+        create_probe = AsyncMock(
+            return_value=NimListModelsResult(
+                success=True,
+                models=[teacher["model_name"]],
+                status_code=200,
+            )
+        )
+        with patch(
+            "vlm_feedback_loop.services.nim_endpoint_service.nim_client.list_models",
+            create_probe,
+        ):
+            existing = test_app_client.post(
+                f"/v1/projects/{project_id}/nim_endpoints",
+                json={
+                    "display_name": "Old custom name",
+                    "endpoint_mode": "self_hosted",
+                    "base_url": "http://nim.internal:8000/v1",
+                    "auth_mode": "bearer",
+                },
+            )
+            configured = test_app_client.post(
+                f"/v1/projects/{project_id}/nim_endpoints:configure_self_hosted_teacher",
+                json={
+                    "base_url": "http://nim.internal:8000/v1",
+                    "model_config_id": teacher["model_config_id"],
+                },
+            )
+
+        assert existing.status_code == 201
+        assert configured.status_code == 200
+        endpoint = configured.json()["endpoint"]
+        assert endpoint["endpoint_id"] == existing.json()["endpoint_id"]
+        assert endpoint["auth_mode"] == "none"
+        assert endpoint["display_name"] == (
+            "Self-hosted Teacher (http://nim.internal:8000/v1)"
+        )
+
+    def test_model_mismatch_leaves_project_binding_unchanged(self, test_app_client):
+        from vlm_feedback_loop.services.nim_client import NimListModelsResult
+
+        project_id = _create_project(test_app_client)
+        teacher = self._selected_teacher(test_app_client, project_id)
+        original_endpoint_id = teacher["endpoint_id"]
+        with patch(
+            "vlm_feedback_loop.services.nim_endpoint_service.nim_client.list_models",
+            new=AsyncMock(
+                return_value=NimListModelsResult(
+                    success=True,
+                    models=["a-different-model"],
+                    status_code=200,
+                )
+            ),
+        ):
+            response = test_app_client.post(
+                f"/v1/projects/{project_id}/nim_endpoints:configure_self_hosted_teacher",
+                json={
+                    "base_url": "http://wrong-model:8000/v1",
+                    "model_config_id": teacher["model_config_id"],
+                },
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "model_not_served"
+        selected = self._selected_teacher(test_app_client, project_id)
+        assert selected["endpoint_id"] == original_endpoint_id
+        endpoints = test_app_client.get(
+            f"/v1/projects/{project_id}/nim_endpoints"
+        ).json()["items"]
+        assert not any(
+            endpoint["base_url"] == "http://wrong-model:8000/v1"
+            for endpoint in endpoints
+        )
+
+    def test_embedded_credentials_are_rejected_before_network_or_persistence(
+        self, test_app_client
+    ):
+        project_id = _create_project(test_app_client)
+        teacher = self._selected_teacher(test_app_client, project_id)
+        with patch(
+            "vlm_feedback_loop.services.nim_endpoint_service.nim_client.list_models",
+            new=AsyncMock(),
+        ) as probe:
+            response = test_app_client.post(
+                f"/v1/projects/{project_id}/nim_endpoints:configure_self_hosted_teacher",
+                json={
+                    "base_url": "http://operator:secret@nim.internal:8000/v1",
+                    "model_config_id": teacher["model_config_id"],
+                },
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "embedded_credentials_forbidden"
+        probe.assert_not_awaited()
+
+
 # ── PATCH /v1/embedding_deployment_config ───────────────────────────────────
 
 
@@ -514,6 +844,185 @@ class TestEmbeddingDeploymentConfig:
         assert data["preferred_host_port"] == 8001
 
 
+class TestConfigureSelfHostedEmbedding:
+    def test_verified_vector_is_persisted_and_projects_are_reswept(
+        self, test_app_client
+    ):
+        from vlm_feedback_loop.services.nim_client import NimEmbeddingsResult
+
+        _create_project(test_app_client)
+        probe = AsyncMock(
+            return_value=NimEmbeddingsResult(
+                success=True,
+                embeddings=[[0.25] * 2048],
+                model=EMBEDDING_MODEL_ID,
+                status_code=200,
+            )
+        )
+        resweep = AsyncMock()
+        with (
+            patch(
+                "vlm_feedback_loop.services.local_nim_service.create_embeddings",
+                probe,
+            ),
+            patch(
+                "vlm_feedback_loop.services.local_nim_service.resweep_embedding_tasks",
+                resweep,
+            ),
+        ):
+            response = test_app_client.post(
+                "/v1/embedding_deployment_config:configure_self_hosted",
+                json={"base_url": "http://embedding.internal:8000/v1/"},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["provider"] == "self_hosted_nvclip"
+        assert data["endpoint_url"] == "http://embedding.internal:8000/v1"
+        assert data["gpu_assignment"] is None
+        probe.assert_awaited_once()
+        assert probe.await_args.kwargs["model"] == EMBEDDING_MODEL_ID
+        assert probe.await_args.kwargs["input_type"] == "passage"
+        resweep.assert_awaited_once()
+
+    def test_failed_probe_does_not_mutate_configuration(self, test_app_client):
+        from vlm_feedback_loop.services.nim_client import NimEmbeddingsResult
+
+        _create_project(test_app_client)
+        with patch(
+            "vlm_feedback_loop.services.local_nim_service.create_embeddings",
+            new=AsyncMock(
+                return_value=NimEmbeddingsResult(
+                    success=False,
+                    error="Endpoint error: HTTP 404",
+                    status_code=404,
+                )
+            ),
+        ):
+            response = test_app_client.post(
+                "/v1/embedding_deployment_config:configure_self_hosted",
+                json={"base_url": "http://teacher-only.internal:8000/v1"},
+            )
+
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "embedding_probe_failed"
+        assert response.json()["detail"]["message"] == (
+            "This endpoint does not expose the required /embeddings operation "
+            "for the configured NeMo Retriever model."
+        )
+        config = test_app_client.patch(
+            "/v1/embedding_deployment_config", json={}
+        ).json()
+        assert config["provider"] == "none"
+
+    def test_different_url_cannot_orphan_active_managed_embedding(
+        self, test_app_client
+    ):
+        from vlm_feedback_loop.services.nim_client import NimEmbeddingsResult
+
+        project_id = _create_project(test_app_client)
+        with (
+            patch(
+                "vlm_feedback_loop.services.local_nim_service.create_embeddings",
+                new=AsyncMock(
+                    return_value=NimEmbeddingsResult(
+                        success=True,
+                        embeddings=[[0.25] * 2048],
+                        status_code=200,
+                    )
+                ),
+            ),
+            patch(
+                "vlm_feedback_loop.services.local_nim_service."
+                "_scan_active_deployment_placements",
+                return_value=[("0", "embedding", project_id, "missing", 8001)],
+            ),
+        ):
+            response = test_app_client.post(
+                "/v1/embedding_deployment_config:configure_self_hosted",
+                json={"base_url": "http://different.internal:8000/v1"},
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "local_embedding_active"
+        config = test_app_client.patch(
+            "/v1/embedding_deployment_config", json={}
+        ).json()
+        assert config["provider"] == "none"
+        assert config["endpoint_url"] is None
+
+    def test_exact_active_managed_url_keeps_gpu_assignment(self, test_app_client):
+        from pathlib import Path
+
+        from sqlalchemy.orm import Session
+
+        from vlm_feedback_loop.db.models.local_nim_deployment import (
+            LocalNimDeployment,
+        )
+        from vlm_feedback_loop.services.nim_client import NimEmbeddingsResult
+        from vlm_feedback_loop.services.project_service import get_project_engine
+
+        project_id = _create_project(test_app_client)
+        deployment_id = "active-embedding"
+        project_dir = Path(
+            test_app_client.get(f"/v1/projects/{project_id}").json()["project_dir"]
+        )
+        engine = get_project_engine(project_id, str(project_dir.parents[1]))
+        assert engine is not None
+        with Session(engine) as session:
+            session.add(
+                LocalNimDeployment(
+                    local_nim_deployment_id=deployment_id,
+                    project_id=project_id,
+                    model_config_id="embedding",
+                    role="embedding",
+                    nim_container_image=EMBEDDING_NIM_IMAGE,
+                    container_name="vlm-embedding-test",
+                    host_port=8001,
+                    endpoint_url="http://managed.internal:8000/v1",
+                    gpu_assignment="device=0",
+                    status="running",
+                )
+            )
+            session.commit()
+        test_app_client.patch(
+            "/v1/embedding_deployment_config",
+            json={
+                "provider": "self_hosted_nvclip",
+                "endpoint_url": "http://managed.internal:8000/v1",
+                "gpu_assignment": "device=0",
+            },
+        )
+        with (
+            patch(
+                "vlm_feedback_loop.services.local_nim_service.create_embeddings",
+                new=AsyncMock(
+                    return_value=NimEmbeddingsResult(
+                        success=True,
+                        embeddings=[[0.25] * 2048],
+                        status_code=200,
+                    )
+                ),
+            ),
+            patch(
+                "vlm_feedback_loop.services.local_nim_service."
+                "_scan_active_deployment_placements",
+                return_value=[("0", "embedding", project_id, deployment_id, 8001)],
+            ),
+            patch(
+                "vlm_feedback_loop.services.local_nim_service.resweep_embedding_tasks",
+                new=AsyncMock(),
+            ),
+        ):
+            response = test_app_client.post(
+                "/v1/embedding_deployment_config:configure_self_hosted",
+                json={"base_url": "http://managed.internal:8000/v1/"},
+            )
+
+        assert response.status_code == 200
+        assert response.json()["gpu_assignment"] == "device=0"
+
+
 # ── nim_setup Action Request ────────────────────────────────────────────────
 
 
@@ -534,7 +1043,7 @@ class TestNimSetupActionRequest:
         text = data["rendered_text"]
         assert COSMOS_REASON2_8B in text
         assert COSMOS_REASON2_2B in text
-        assert MISTRAL_LARGE_3 in text
+        assert STEP_3_7_FLASH in text
 
     def test_contains_endpoint_config_fields(self, test_app_client):
         project_id = _create_project(test_app_client)

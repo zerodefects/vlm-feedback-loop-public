@@ -12,6 +12,13 @@ Covers:
 
 from __future__ import annotations
 
+import io
+import json
+import os
+import subprocess
+import tarfile
+from pathlib import Path
+
 import pytest
 from sqlalchemy.orm import Session
 
@@ -21,19 +28,61 @@ from vlm_feedback_loop.db.models.dataset_export import DatasetExport
 from vlm_feedback_loop.db.models.guidance import Guidance
 from vlm_feedback_loop.db.models.local_nim_deployment import LocalNimDeployment
 from vlm_feedback_loop.db.models.model_config import ModelConfig
+from vlm_feedback_loop.db.models.operation import OperationRecord
 from vlm_feedback_loop.db.models.run import RunRecord
 from vlm_feedback_loop.db.models.student_model import StudentModel
 from vlm_feedback_loop.db.models.tao_job import TAOJob
 from vlm_feedback_loop.model_catalog_constants import (
+    COSMOS3_REASONER_NIM_IMAGE,
     COSMOS3_SUPER_REASONER,
     COSMOS_REASON2_2B,
     COSMOS_REASON2_2B_NIM_IMAGE,
     COSMOS_REASON2_8B,
     COSMOS_REASON2_8B_NIM_IMAGE,
 )
-from vlm_feedback_loop.services import deployment_handoff_generator, local_nim_service
+from vlm_feedback_loop.services import (
+    deployment_bundle_service,
+    deployment_handoff_generator,
+    local_nim_service,
+)
 
 # ── Helper: seed a Student in a fully-validated state ───────────────────────
+
+
+def _current_aiperf_metrics() -> dict:
+    """Minimal complete production workload used by handoff fixtures."""
+
+    return {
+        "overall": {"exact_match_rate": 0.85},
+        "benchmark_workload": {
+            "version": "production_vlm_v1",
+            "driver": {"name": "aiperf", "version": "0.10.0"},
+            "output_limit_mode": "uncapped",
+            "kv_cache_reuse": "disabled",
+            "selected_count": 20,
+            "workload_hash": "workload-sha",
+            "prompt_hash": "prompt-sha",
+            "evaluated_prompt_hash": "prompt-sha",
+        },
+        "benchmarks": [
+            {
+                "concurrency": concurrency,
+                "status": "passed",
+                "failed": False,
+                "driver": "aiperf",
+                "driver_version": "0.10.0",
+                "attempted_request_count": 20,
+                "successful_request_count": 20,
+                "failed_request_count": 0,
+                "failure_rate": 0,
+                "latency_p50_ms": 10.0,
+                "latency_p90_ms": 20.0,
+                "latency_p99_ms": 30.0,
+                "request_throughput_rps": 40.0,
+            }
+            for concurrency in (1, 8, 24)
+        ],
+    }
 
 
 def _seed_validated_student(
@@ -48,6 +97,7 @@ def _seed_validated_student(
     nim_container_image: str = COSMOS_REASON2_2B_NIM_IMAGE,
     nim_model_profile_selected: str | None = "vllm-tp1-fp8",
     profile_tp: int = 1,
+    base_local_deploy_metadata: dict | None = None,
     project_id_override: str | None = None,
 ) -> tuple[str, str]:
     """Create a project + Student in the requested gate state.
@@ -71,7 +121,20 @@ def _seed_validated_student(
     de_test_id = generate_uuid4()
     guidance_id = generate_uuid4()
     tao_job_id = generate_uuid4()
+    evaluate_tao_job_id = generate_uuid4()
     now = "2026-04-29T00:00:00Z"
+    checkpoint_dir = (
+        Path(settings.WORKSPACE_ROOT)
+        / "projects"
+        / project_id
+        / "artifacts"
+        / "test-checkpoints"
+        / student_model_id
+    )
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "config.json").write_text('{"model_type":"test"}\n')
+    (checkpoint_dir / "model.safetensors").write_bytes(b"test-model-weights")
+    (checkpoint_dir / "tokenizer.json").write_text('{"version":"1.0"}\n')
 
     with Session(engine) as session:
         # Reuse seeded endpoint; create dedicated base mc, guidance, exports
@@ -89,6 +152,7 @@ def _seed_validated_student(
                 context_window_tokens=256000,
                 eligible_roles=["student_base"],
                 supports_image_input=True,
+                local_deploy_metadata=base_local_deploy_metadata,
             )
         )
         # Compute the next version so seeding a second Student into the same
@@ -107,7 +171,32 @@ def _seed_validated_student(
                 guidance_id=guidance_id,
                 version_number=(existing_max or 0) + 1,
                 description="d",
-                schema={"core_fields": [], "aux_fields": []},
+                schema={
+                    "fields": [
+                        {
+                            "field_id": generate_uuid4(),
+                            "field_name": "gesture",
+                            "type": "enum",
+                            "role": "core",
+                            "display_order": 1,
+                            "allowed_values": ["rock", "paper", "scissors"],
+                        }
+                    ],
+                    "derived_json_schema": {
+                        "type": "object",
+                        "properties": {
+                            "gesture": {
+                                "type": "string",
+                                "enum": ["rock", "paper", "scissors"],
+                            }
+                        },
+                        "required": ["gesture"],
+                        "additionalProperties": False,
+                        "x-generation-order": ["gesture"],
+                    },
+                    "generation_order": ["gesture"],
+                    "schema_hash": "schema-sha",
+                },
                 rules="",
                 created_at=now,
             )
@@ -130,7 +219,7 @@ def _seed_validated_student(
             DatasetExport(
                 dataset_export_id=de_test_id,
                 project_id=project_id,
-                dataset_intent="testing",
+                dataset_intent="evaluation",
                 export_field_mode=training_contract["output_field_mode"],
                 guidance_id=guidance_id,
                 label_tier_filter="verified",
@@ -156,6 +245,23 @@ def _seed_validated_student(
             )
         )
         session.add(
+            TAOJob(
+                tao_job_id=evaluate_tao_job_id,
+                project_id=project_id,
+                student_base_model_config_id=base_mc_id,
+                dataset_export_ids=[de_test_id],
+                training_backend="cosmos_rl_tao_vlm",
+                action="evaluate",
+                status="succeeded",
+                tao_status_raw="Done",
+                job_config={},
+                tao_create_job_request={},
+                parent_tao_job_id=tao_job_id,
+                chain_sequence=2,
+                created_at=now,
+            )
+        )
+        session.add(
             RunRecord(
                 run_id=quality_run_id,
                 project_id=project_id,
@@ -165,6 +271,7 @@ def _seed_validated_student(
                 started_at=now,
                 completed_at=now,
                 evaluation_source="tao",
+                tao_job_id=evaluate_tao_job_id,
                 model_config_id=base_mc_id,
                 inference_contract=training_contract,
                 metrics={"overall": {"exact_match_rate": 0.9}},
@@ -181,12 +288,34 @@ def _seed_validated_student(
                 started_at=now,
                 completed_at=now,
                 evaluation_source="nim",
+                guidance_id=guidance_id,
                 model_config_id=base_mc_id,
                 inference_contract=serving_contract,
-                metrics={"overall": {"exact_match_rate": 0.85}},
+                metrics=_current_aiperf_metrics(),
                 visual_budget_preset_key="balanced",
                 generation_preset_key="precise",
                 thinking_mode_effective="on",
+            )
+        )
+        session.add(
+            OperationRecord(
+                inference_invocation_id=generate_uuid4(),
+                project_id=project_id,
+                purpose="evaluation",
+                example_key="rock/example.png",
+                guidance_id=guidance_id,
+                model_config_id=base_mc_id,
+                model_name=f"student-{student_model_id[:8]}",
+                invocation_status="success",
+                generation_preset_key="precise",
+                sampling_params_effective={"temperature": 0.0, "top_p": 1.0},
+                thinking_mode_effective="off",
+                max_tokens_effective=256,
+                visual_budget_preset_key="balanced",
+                structured_generation_mode_effective="auto",
+                structured_generation_attempted=True,
+                prompt_hash=None,
+                evaluation_run_id=serving_run_id,
             )
         )
         session.add(
@@ -196,12 +325,14 @@ def _seed_validated_student(
                 student_base_model_config_id=base_mc_id,
                 tao_job_id=tao_job_id,
                 guidance_id=guidance_id,
-                dataset_export_ids=[de_train_id, de_test_id],
+                # StudentModel tracks training lineage only; held-out
+                # provenance is resolved through the paired evaluate job.
+                dataset_export_ids=[de_train_id],
                 training_preset="standard",
                 lora_config={"enable_lora": True},
                 created_at=now,
                 checkpoint_packaging_status="validated",
-                nim_checkpoint_ref="/tmp/ckpt",
+                nim_checkpoint_ref=str(checkpoint_dir),
                 quality_status=quality_status,
                 quality_evaluation_run_id=quality_run_id,
                 serving_status=serving_status,
@@ -240,7 +371,7 @@ def _seed_validated_student(
                     gpu_assignment="device=0",
                     status="running",
                     student_model_id=student_model_id,
-                    checkpoint_mount_path="/tmp/ckpt",
+                    checkpoint_mount_path=str(checkpoint_dir),
                     nim_served_model_name=f"student-{student_model_id[:8]}",
                     nim_model_name_path="/opt/checkpoints/student",
                     precision_method=quantization_method,
@@ -353,6 +484,55 @@ def test_handoff_blocks_on_serving_failed(settings_in_workspace):
     )
     assert isinstance(result, str), result
     assert "serving_status_not_validated" in result
+
+
+def test_handoff_blocks_legacy_validated_httpx_benchmark(settings_in_workspace):
+    """A pre-AIPerf validated status remains historical, not deployable."""
+
+    project_id, student_id = _seed_validated_student(
+        settings_in_workspace,
+        training_contract=_ALL_FIELDS,
+        serving_contract=_ALL_FIELDS,
+    )
+    from vlm_feedback_loop.services.project_service import get_project_engine
+
+    engine = get_project_engine(project_id, settings_in_workspace.WORKSPACE_ROOT)
+    with Session(engine) as session:
+        student = session.get(StudentModel, student_id)
+        assert student is not None
+        serving_run = session.get(RunRecord, student.serving_evaluation_run_id)
+        assert serving_run is not None
+        serving_run.metrics = {
+            "overall": {"exact_match_rate": 0.85},
+            "benchmarks": [
+                {
+                    "concurrency": concurrency,
+                    "driver": "httpx",
+                    "latency_p50_ms": 10,
+                    "latency_p90_ms": 20,
+                    "latency_p99_ms": 30,
+                    "request_count": 100,
+                    "error_count": 0,
+                    "failed": False,
+                }
+                for concurrency in (1, 8, 24)
+            ],
+        }
+        session.commit()
+
+    result = deployment_handoff_generator.generate_deployment_handoff_for_student(
+        project_id=project_id,
+        student_model_id=student_id,
+        settings=settings_in_workspace,
+    )
+    assert result == "conflict: serving_benchmark_requires_aiperf"
+
+    bundle = deployment_bundle_service.prepare_deployment_bundle(
+        project_id=project_id,
+        student_model_id=student_id,
+        settings=settings_in_workspace,
+    )
+    assert bundle == "conflict: serving_benchmark_requires_aiperf"
 
 
 def test_handoff_blocks_on_contract_mismatch(settings_in_workspace):
@@ -722,3 +902,273 @@ def test_handoff_and_public_builder_use_name_only_secret_forwarding(
         assert "NGC_API_KEY=" not in rendered
         assert sentinel not in rendered
         assert "$NGC_API_KEY" not in rendered
+
+
+def test_handoff_requires_validated_checkpoint_packaging(settings_in_workspace):
+    """A completed evaluation cannot make a failed checkpoint deployable."""
+    project_id, student_id = _seed_validated_student(
+        settings_in_workspace,
+        training_contract=_ALL_FIELDS,
+        serving_contract=_ALL_FIELDS,
+    )
+    from vlm_feedback_loop.services import project_service
+
+    engine = project_service.get_project_engine(
+        project_id, settings_in_workspace.WORKSPACE_ROOT
+    )
+    with Session(engine) as session:
+        student = session.get(StudentModel, student_id)
+        student.checkpoint_packaging_status = "failed"
+        session.commit()
+
+    result = deployment_handoff_generator.generate_deployment_handoff_for_student(
+        project_id=project_id,
+        student_model_id=student_id,
+        settings=settings_in_workspace,
+    )
+    assert result == "conflict: checkpoint_packaging_not_validated"
+
+
+def test_handoff_derives_release_from_pinned_runtime_image(settings_in_workspace):
+    """Omitting a redundant request field must not produce an unknown release."""
+    project_id, student_id = _seed_validated_student(
+        settings_in_workspace,
+        training_contract=_ALL_FIELDS,
+        serving_contract=_ALL_FIELDS,
+    )
+    result = deployment_handoff_generator.generate_deployment_handoff_for_student(
+        project_id=project_id,
+        student_model_id=student_id,
+        settings=settings_in_workspace,
+    )
+    assert isinstance(result, dict)
+    assert result["technical_requirements"]["nim_release_version"] == "1.6.0"
+    for heading in (
+        "Checkpoint",
+        "NIM Configuration",
+        "Model",
+        "Evaluation",
+        "Training Lineage",
+    ):
+        assert f"\n{heading}\n" in result["rendered_text"]
+
+
+def test_portable_bundle_contains_checkpoint_launch_config_and_evidence(
+    settings_in_workspace,
+    tmp_path,
+):
+    """A gated bundle is independently deployable and contains no host path."""
+    project_id, student_id = _seed_validated_student(
+        settings_in_workspace,
+        training_contract=_ALL_FIELDS,
+        serving_contract=_ALL_FIELDS,
+    )
+    checkpoint_dir = (
+        Path(settings_in_workspace.WORKSPACE_ROOT)
+        / "projects"
+        / project_id
+        / "artifacts"
+        / "test-checkpoints"
+        / student_id
+    )
+    (checkpoint_dir / "microservices_log.txt").write_text(
+        "operator-only runtime log\n", encoding="utf-8"
+    )
+    (checkpoint_dir / "status.json").write_text(
+        '{"state":"finished"}\n', encoding="utf-8"
+    )
+    plan = deployment_bundle_service.prepare_deployment_bundle(
+        project_id=project_id,
+        student_model_id=student_id,
+        settings=settings_in_workspace,
+    )
+    assert isinstance(plan, deployment_bundle_service.DeploymentBundlePlan), plan
+
+    payload = b"".join(deployment_bundle_service.stream_deployment_bundle(plan))
+    assert str(settings_in_workspace.WORKSPACE_ROOT).encode() not in payload
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
+        members = {member.name: member for member in archive.getmembers()}
+        root = plan.archive_root
+        required = {
+            f"{root}/checkpoint/config.json",
+            f"{root}/checkpoint/model.safetensors",
+            f"{root}/checkpoint/tokenizer.json",
+            f"{root}/README.md",
+            f"{root}/run-nim.sh",
+            f"{root}/verify-nim.sh",
+            f"{root}/request-template.json",
+            f"{root}/manifest.json",
+            f"{root}/SHA256SUMS",
+        }
+        assert required <= members.keys()
+        assert f"{root}/checkpoint/microservices_log.txt" not in members
+        assert f"{root}/checkpoint/status.json" not in members
+        assert b"operator-only runtime log" not in payload
+        manifest = json.loads(
+            archive.extractfile(members[f"{root}/manifest.json"]).read()
+        )
+        run_script = archive.extractfile(members[f"{root}/run-nim.sh"]).read()
+        verify_script = archive.extractfile(members[f"{root}/verify-nim.sh"]).read()
+        request_template = json.loads(
+            archive.extractfile(members[f"{root}/request-template.json"]).read()
+        )
+        checksum_text = (
+            archive.extractfile(members[f"{root}/SHA256SUMS"]).read().decode("utf-8")
+        )
+
+        assert manifest["runtime"]["image"] == COSMOS_REASON2_2B_NIM_IMAGE
+        assert manifest["runtime"]["release_version"] == "1.6.0"
+        assert manifest["credentials_included"] is False
+        assert manifest["nim_runtime_image_included"] is False
+        assert manifest["evaluation"]["quality_status"] == "validated"
+        assert manifest["evaluation"]["serving_status"] == "validated"
+        assert manifest["training_lineage"]["training_tao_job_id"]
+        assert manifest["verification"]["guidance_schema_hash"] == "schema-sha"
+        assert manifest["verification"]["request_template"] == ("request-template.json")
+        assert request_template["response_format"]["json_schema"]["schema"] == {
+            "type": "object",
+            "properties": {
+                "gesture": {
+                    "type": "string",
+                    "enum": ["rock", "paper", "scissors"],
+                }
+            },
+            "required": ["gesture"],
+            "additionalProperties": False,
+            "x-generation-order": ["gesture"],
+        }
+        serialized_template = json.dumps(request_template)
+        assert serialized_template.count("__VLM_IMAGE_DATA_URL__") == 1
+        assert "Return JSON only." in serialized_template
+        assert b"${BUNDLE_ROOT}/checkpoint" in run_script
+        assert b"-e NGC_API_KEY" in run_script
+        assert b"NGC_API_KEY=" not in run_script
+        assert b"docker pull" in run_script
+        assert b"request-template.json" in verify_script
+        assert b"fromjson" in verify_script
+        assert b"Return the trained structured label" not in verify_script
+
+        # Execute the shipped launcher against a recording Docker boundary.
+        # A pinned profile must be followed immediately by the runtime image;
+        # otherwise Docker interprets any intervening token as the image name.
+        bundle_root = tmp_path / root
+        bundle_root.mkdir()
+        (bundle_root / "checkpoint").mkdir()
+        run_script_path = bundle_root / "run-nim.sh"
+        run_script_path.write_bytes(run_script)
+        run_script_path.chmod(0o755)
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        docker_log = tmp_path / "docker-argv.log"
+        fake_docker = fake_bin / "docker"
+        fake_docker.write_text(
+            '#!/usr/bin/env bash\nprintf \'%s\\n\' "$@" >> "${DOCKER_LOG:?}"\n',
+            encoding="utf-8",
+        )
+        fake_docker.chmod(0o755)
+        env = os.environ.copy()
+        env.update(
+            {
+                "DOCKER_LOG": str(docker_log),
+                "HOME": str(tmp_path),
+                "NGC_API_KEY": "test-only",
+                "PATH": f"{fake_bin}:{env['PATH']}",
+            }
+        )
+        subprocess.run(
+            [str(run_script_path)],
+            cwd=bundle_root,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        docker_argv = docker_log.read_text(encoding="utf-8").splitlines()
+        run_argv = docker_argv[docker_argv.index("run") + 1 :]
+        profile_index = run_argv.index("NIM_MODEL_PROFILE=vllm-tp1-fp8")
+        assert run_argv[profile_index + 1] == COSMOS_REASON2_2B_NIM_IMAGE
+
+        for line in checksum_text.splitlines():
+            expected, relative_name = line.split("  ", 1)
+            content = archive.extractfile(members[f"{root}/{relative_name}"]).read()
+            import hashlib
+
+            assert hashlib.sha256(content).hexdigest() == expected
+
+
+def test_cr3_super_handoff_and_bundle_pin_shared_image_size(
+    settings_in_workspace,
+):
+    """A downloaded Super bundle must launch Super, never image-default Nano."""
+    project_id, student_id = _seed_validated_student(
+        settings_in_workspace,
+        training_contract=_ALL_FIELDS,
+        serving_contract=_ALL_FIELDS,
+        base_model_name=COSMOS3_SUPER_REASONER,
+        nim_container_image=COSMOS3_REASONER_NIM_IMAGE,
+        nim_model_profile_selected=None,
+        quantization_method="none",
+        base_local_deploy_metadata={
+            "nim_container_image": COSMOS3_REASONER_NIM_IMAGE,
+            "nim_gpu_memory_minimum_gb": 96,
+            "nim_model_size": "super",
+            "extra_container_env": {"NIM_MAX_MODEL_LEN": 65536},
+        },
+    )
+    handoff = deployment_handoff_generator.generate_deployment_handoff_for_student(
+        project_id=project_id,
+        student_model_id=student_id,
+        settings=settings_in_workspace,
+    )
+    assert isinstance(handoff, dict)
+    technical = handoff["technical_requirements"]
+    assert technical["nim_model_size"] == "super"
+    assert technical["nim_env_vars_recommended"]["NIM_MODEL_SIZE"] == "super"
+    assert technical["nim_env_vars_recommended"]["NIM_MAX_MODEL_LEN"] == "65536"
+    assert "NIM_MODEL_SIZE=super" in technical["docker_run_args"]
+    assert "NIM_MAX_MODEL_LEN=65536" in technical["docker_run_args"]
+    assert (
+        f"NIM_SERVED_MODEL_NAME=student-{student_id[:8]}"
+        in technical["docker_run_args"]
+    )
+
+    plan = deployment_bundle_service.prepare_deployment_bundle(
+        project_id=project_id,
+        student_model_id=student_id,
+        settings=settings_in_workspace,
+    )
+    assert isinstance(plan, deployment_bundle_service.DeploymentBundlePlan), plan
+    payload = b"".join(deployment_bundle_service.stream_deployment_bundle(plan))
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
+        root = plan.archive_root
+        run_script = archive.extractfile(f"{root}/run-nim.sh").read()
+        manifest = json.loads(archive.extractfile(f"{root}/manifest.json").read())
+    assert b"NIM_MODEL_SIZE=super" in run_script
+    assert b"NIM_MAX_MODEL_LEN=65536" in run_script
+    assert manifest["runtime"]["environment"]["NIM_MODEL_SIZE"] == "super"
+    assert manifest["runtime"]["environment"]["NIM_MAX_MODEL_LEN"] == "65536"
+
+
+def test_portable_bundle_rejects_checkpoint_symlinks(settings_in_workspace):
+    """An archive must never follow a checkpoint link outside its project."""
+    project_id, student_id = _seed_validated_student(
+        settings_in_workspace,
+        training_contract=_ALL_FIELDS,
+        serving_contract=_ALL_FIELDS,
+    )
+    from vlm_feedback_loop.services import project_service
+
+    engine = project_service.get_project_engine(
+        project_id, settings_in_workspace.WORKSPACE_ROOT
+    )
+    with Session(engine) as session:
+        student = session.get(StudentModel, student_id)
+        checkpoint = Path(student.nim_checkpoint_ref)
+    (checkpoint / "unsafe-link").symlink_to(Path(settings_in_workspace.WORKSPACE_ROOT))
+
+    result = deployment_bundle_service.prepare_deployment_bundle(
+        project_id=project_id,
+        student_model_id=student_id,
+        settings=settings_in_workspace,
+    )
+    assert result == "conflict: deployment_bundle_checkpoint_contains_symlink"

@@ -21,7 +21,7 @@
 
 import { Text } from "@kui/react";
 
-import { formatPct } from "@/lib/format-percent";
+import { formatMetricPct } from "@/lib/format-percent";
 import type { MetricsBucket, PerValueMetric } from "@/types/evaluation";
 import type { SchemaFieldResponse } from "@/types/guidance";
 
@@ -29,12 +29,12 @@ import type { MetricSelection } from "./CompareScopeBar";
 
 const CATEGORICAL_TYPES: ReadonlySet<string> = new Set(["enum", "enum_set", "boolean"]);
 
-const PER_VALUE_THRESHOLD = 0.8; // below-80% values get the flag color
-
 export interface PerFieldMetricsBlockProps {
   overall: MetricsBucket;
   coreFields: SchemaFieldResponse[];
   metricSelection: MetricSelection;
+  perFieldMatchThreshold: number;
+  minPerValueF1Threshold: number;
   /** Used as the ``data-testid`` prefix for sub-elements so different
       cards on the same page don't share IDs. */
   "data-testid-prefix"?: string;
@@ -44,6 +44,8 @@ export function PerFieldMetricsBlock({
   overall,
   coreFields,
   metricSelection,
+  perFieldMatchThreshold,
+  minPerValueF1Threshold,
   "data-testid-prefix": prefix = "per-field",
 }: PerFieldMetricsBlockProps) {
   const sortedCore = [...coreFields].sort((a, b) => a.display_order - b.display_order);
@@ -66,6 +68,7 @@ export function PerFieldMetricsBlock({
         >
           {sortedCore.map((field) => {
             const rate = overall.per_field_match_rates?.[field.field_name];
+            const belowThreshold = rate != null && rate < perFieldMatchThreshold;
             return (
               <div
                 key={field.field_name}
@@ -75,15 +78,15 @@ export function PerFieldMetricsBlock({
                 <Text kind="body/regular/sm">{field.field_name}</Text>
                 <Text
                   kind="body/regular/sm"
+                  data-threshold-status={belowThreshold ? "below" : "meets"}
                   style={{
                     textAlign: "right",
-                    color:
-                      rate != null && rate < PER_VALUE_THRESHOLD
-                        ? "var(--warning-amber, #f59e0b)"
-                        : "var(--text-primary)",
+                    color: belowThreshold
+                      ? "var(--warning-amber, #f59e0b)"
+                      : "var(--text-primary)",
                   }}
                 >
-                  {formatPct(rate)}
+                  {formatMetricPct(rate)}
                 </Text>
               </div>
             );
@@ -119,6 +122,8 @@ export function PerFieldMetricsBlock({
         const isCategorical = CATEGORICAL_TYPES.has(field.type);
         const perValue = overall.per_value_metrics?.[field.field_name] ?? {};
         const valueLabels = isCategorical ? collectValueLabels(field, perValue) : [];
+        const fieldBelowThreshold =
+          fieldRate != null && fieldRate < perFieldMatchThreshold;
 
         return (
           <div
@@ -135,14 +140,14 @@ export function PerFieldMetricsBlock({
                 </Text>
                 <Text
                   kind="body/regular/sm"
+                  data-threshold-status={fieldBelowThreshold ? "below" : "meets"}
                   style={{
-                    color:
-                      fieldRate != null && fieldRate < PER_VALUE_THRESHOLD
-                        ? "var(--warning-amber, #f59e0b)"
-                        : "var(--text-primary)",
+                    color: fieldBelowThreshold
+                      ? "var(--warning-amber, #f59e0b)"
+                      : "var(--text-primary)",
                   }}
                 >
-                  {formatPct(fieldRate)}
+                  {formatMetricPct(fieldRate)}
                 </Text>
               </div>
             </div>
@@ -160,16 +165,26 @@ export function PerFieldMetricsBlock({
                 {valueLabels.map((value) => {
                   const m = perValue[value];
                   const v = m ? m[valueKey] : null;
-                  const flagged = v != null && v < PER_VALUE_THRESHOLD;
+                  const flagged =
+                    metricSelection === "per_value_f1" &&
+                    v != null &&
+                    v < minPerValueF1Threshold;
                   return (
                     <div
                       key={value}
                       className="flex items-baseline gap-2 truncate"
                       data-testid={`${prefix}-value-${field.field_name}-${value}`}
-                      title={`${value}: ${formatPct(v)} ${valueKey}`}
+                      title={`${value}: ${formatMetricPct(v)} ${valueKey}`}
                     >
                       <Text
                         kind="label/regular/xs"
+                        data-threshold-status={
+                          metricSelection === "per_value_f1"
+                            ? flagged
+                              ? "below"
+                              : "meets"
+                            : "diagnostic"
+                        }
                         style={{ color: "var(--text-secondary)" }}
                       >
                         {value}
@@ -182,7 +197,7 @@ export function PerFieldMetricsBlock({
                             : "var(--text-primary)",
                         }}
                       >
-                        {formatPct(v)}
+                        {formatMetricPct(v)}
                       </Text>
                     </div>
                   );

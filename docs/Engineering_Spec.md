@@ -2,7 +2,7 @@
 
 *Labeling with ICL; Optional Fine-Tuning*
 
-**Version 1.10.0**
+**Version 1.10.1**
 
 > Amendment markers such as "F-W7 amendment (2026-07-14)" or "Phase 12
 > amendment" are stable IDs from the project's engineering finding ledger,
@@ -23,17 +23,18 @@
   - Every model used for inference, evaluation, or batch labeling MUST reference a catalog entry with the appropriate `eligible_roles` value (`teacher` or `student_base`).
   - Student Training MAY produce multiple Student variants; evaluations MUST record which Student variant was used.
 - **Prompt budgets are per-model:** prompt packing MUST derive effective input budgets from the selected model’s configured context window.
-- **Comparison reads from evaluation runs directly:** the Compare screen's Teacher baseline is the most recent completed Teacher-contract evaluation run, and each Student's quality/serving results come from the runs referenced on its StudentModel record (`quality_evaluation_run_id` / `serving_evaluation_run_id`). The pre-v1.0 evaluation-suite grouping was removed with the Student+ICL evaluation arm (§7.2 note).
+- **Comparison reads from evaluation runs directly:** the Compare screen's Teacher baseline is the most recent completed Teacher-contract evaluation run, and each Student's quality/serving results come from the runs referenced on its StudentModel record (`quality_evaluation_run_id` / `serving_evaluation_run_id`). The page remains one project-wide comparison and groups retained Students by immutable `training_suite_id`, newest run first. Repeated base/precision combinations use run-qualified chart identities. Cross-run score differences are explicitly directional when Guidance, effective Inference Contract, or frozen evaluation evidence differs; Student-vs-Teacher deltas are hidden unless both evaluation contexts match. The pre-v1.0 evaluation-suite *execution* grouping was removed with the Student+ICL evaluation arm (§7.2 note); Training Suite headings are provenance, not a replacement evaluation-suite subsystem.
 - **Batch Labeling is Teacher-run:** the batch fully synthetic label generation workflow in this spec runs the **Teacher**.
 - **Retry is a first-class interactive action:** the UI MUST offer **Save / Skip / Retry** per image. Retry MUST produce a new proposal attempt for the same example after applying a user-selected Teacher model and/or Guidance. Retry MUST NOT create a Verified label by itself.
 - **Skip omits the image:** Skip MUST record no label and MUST omit the image from the workflow so it is not presented again.
-- **Review selector selection is always diversity-driven:** pHash (computed inline at ingest) provides the baseline diversity signal. When per-image CLIP embeddings exist, the selector upgrades to CLIP-diverse mode (semantic diversity). There is no random selection mode.
+- **Review selector selection is diversity-driven whenever a signal is available:** a restartable background pHash sweep provides the baseline signal. When per-image CLIP embeddings exist, the selector upgrades to CLIP-diverse mode (semantic diversity). While all candidate signals are still pending, the selector uses deterministic `example_key` order; there is no random selection mode.
 - **All persisted entities are project-scoped:** every Example/Label/Guidance/Pool/Run/Operation/ModelConfig MUST reference `project_id`.
 - **Cosmos-RL / TAO VLM jobs are first-class and poll-tracked:** every Student Training fine-tuning execution MUST create a **TAOJob** record with an explicit TAOJob state machine, persist the exact job configuration payload used to start the training backend, and track (by reference) required outputs: **artifacts, metrics/progress, and logs**. Status MUST be updated via polling the TAO Jobs API and mapped deterministically into the TAOJob state machine.
 - **Rationale notes are opt-in auxiliary data, never prediction authority:** Guidance disables `rationale_note` by default. The SME MAY enable or disable the reserved `role="aux"` string field at any time without label invalidation (§4.4). When enabled, the production Teacher requests it last and the existing review/provenance workflow applies. When disabled, the field is absent from prompts, model contracts, proposals, review, validation, and newly Verified labels; neither the model nor the SME supplies it. Core validity and evaluation never depend on it. Production Teacher ICL is Core-only and never feeds rationale text back as a labeling signal. An export field mode (`all`, `aux_and_core`, or `core_only`; default `all`) independently controls serialization of rationale data that is present (§9.3).
 - **Embedding computation is default-on via hosted embedding NIM:** when a hosted NIM API key is configured, the system MUST automatically compute CLIP-style image embeddings for ingested images (§5.5). The supported Blueprint model is **NVIDIA NeMo Retriever VL 1B v2** (`nvidia/llama-nemotron-embed-vl-1b-v2`, 2048-dim, requires `input_type` in the request body). Embedding computation MUST NOT block interactive labeling (§5.5.2).
-- **Pool management is fully automatic:** the system assigns newly Verified examples to the Test Pool based on a configured fraction and CLIP-embedding diversity, regardless of verification outcome. Both Accepts and Edits are candidates for the Test Pool, producing a representative evaluation set that reflects actual task difficulty. ICL draws exclusively from Edits (the corrective signal); Accepts are not selected for ICL. Rebalancing uses CLIP-embedding diversity when available. Evaluation runs auto-create frozen pool version snapshots for reproducibility. No user action is required (§4.3).
+- **Pool management is fully automatic:** a configured fraction sets the Test Pool target, and the next Verified example fills an immediate shortfall regardless of verification outcome. Rebalancing uses CLIP-diverse selection once enough embeddings exist and pHash-diverse selection otherwise. Both Accepts and Edits are candidates for the Test Pool; ICL draws exclusively from non-pool Edits. Evaluation runs auto-create frozen pool version snapshots for reproducibility. No user action is required (§4.3).
 - **Scale-Up Readiness Gate governs Batch Labeling:** the Batch Labeling CTA MUST be gated on configurable, system-evaluated criteria (evaluation overall Exact Match, per-core-field match rate, minimum per-value F1, Accept rate over a rolling window, and minimum Test Pool size). Clicking [Run Batch Labeling] when criteria pass IS the SME's confirmation. The gate MUST NOT block Interactive Labeling or evaluation runs. Thresholds are configurable per project (§7.3).
+- **Student Training has an independent data-readiness gate:** the Scale-Up Teacher-quality criteria (Exact Match, per-field match, per-value F1, and Accept rate) MUST NOT block Student Training navigation or launch. **Start Training** MUST, however, fail closed until the active Guidance has at least one non-pool Verified training example and the Test Pool reaches the project's configured `scaleup_min_test_pool_size` (default: 60; effective Student-evaluation floor: one). The same backend preflight check MUST protect initial launch and post-provisioning suite materialization (§9.7.8.3, §10.2.22).
 - **Generation Controls are preset-driven:** labeling workflows expose Output Stability presets and a Thinking toggle as the only user-facing sampling knobs; raw parameter editing is not permitted. Effective values are always persisted in Operation Records. See §6.7.
 - **Visual Budget Controls are capability-gated and preset-driven:** image preprocessing (visual token spend) is managed via named presets (**Fast** / **Balanced** / **High Detail**) that resolve to model-specific `mm_processor_kwargs`. Controls are only exposed when the active Teacher supports them (`visual_budget_mode` ≠ `none`). The effective `mm_processor_kwargs` sent per invocation are persisted on Operation Records. Evaluation and Batch Labeling use the project's visual budget preset (no per-example variation) for apples-to-apples reproducibility. See §6.9.
 - **Student Training backend is Cosmos-RL / TAO VLM supervised fine-tuning:** Student Training is not a generic TAO operation. It is an explicit Cosmos-RL / TAO VLM supervised fine-tuning workflow with TAO-native dataset, config, checkpoint, quantization, and NIM deployment handoff requirements. Only catalog entries with the `student_base` role are eligible (currently Cosmos Reason2 8B/2B and Cosmos 3 Nano/Super reasoner). The default training policy is `sft` (supervised fine-tuning); implementations MUST NOT assume RLHF-like behavior from the "RL" in the product name.
@@ -48,7 +49,7 @@
   to exactly four jobs. Multi-base and additional quantization comparison is
   an explicit advanced intent. Each selected scheme remains a separate TAO
   `quantize` job followed by a TAO `evaluate` job.
-- **Student quality and serving readiness are separate gates:** Student quality is validated by TAO evaluation (accuracy/F1/precision/recall against the Test Pool, re-scored by the canonical evaluator). Student serving readiness is validated by NIM deployment + evaluation (latency, throughput, profile metadata). Quality validation does not require NIM. Serving validation does. The `deployment_handoff` Action Request (§10.3) requires both gates to pass.
+- **Student quality and serving readiness are separate gates:** Student quality is validated by TAO evaluation (accuracy/F1/precision/recall against the Test Pool, re-scored by the canonical evaluator). Student serving readiness is validated by NIM deployment + evaluation (latency, throughput, profile metadata) and the current real Test Pool AIPerf workload. Quality validation does not require NIM. Serving validation does. The `deployment_handoff` Action Request (§10.3) requires both gates to pass; a legacy synthetic serving result remains historical evidence but cannot satisfy the serving gate.
 - **NIM deployment for Student evaluation uses local orchestration with Action Request fallback:** the system attempts to deploy Student NIM containers locally on the backend host via Docker (§9.5.2). A NIM deployment preflight checks prerequisites (Docker, NVIDIA Container Toolkit, GPU memory, NGC API key). If preflight passes, the system orchestrates the full container lifecycle (start → health poll → evaluate → benchmark → stop) per variant, sequentially. If preflight fails, the system generates an Action Request with the exact `docker run` command and prerequisites so the SME can hand off to infrastructure. Student NIM endpoints are temporary evaluation infrastructure, not production deployments.
 - **One-NIM-per-GPU invariant (F49 amendment, 2026-05-19; §1.5, §9.5.2):** at most one NIM container is `starting` or `running` on any GPU at any time. Fresh-project creation and later Teacher deploys reuse an exact compatible running Blueprint-managed Teacher, including across projects; the fresh project selects it before returning. A different resident is never stopped implicitly: the API names it and requires an explicit `replace_resident=true`; the FTUE asks the SME whether to keep it or stop it and start the requested NIM. Multi-GPU placement is deterministic: lowest free index first. Student NIM benchmarking (§9.5.2 step 0) defaults to replace semantics and best-effort auto-restores the displaced Teacher after stop (§9.5.2 step 9). On single-GPU local-only hosts, image embedding falls back to pHash diversity (§5.6) until the operator enables a hybrid path (`NVIDIA_API_KEY` for hosted embeddings) or explicitly stops the Teacher. Empirical motivation: Cosmos Reason2 NIM's hardcoded `gpu_memory_utilization=0.9` profile-selector floor (README "One-NIM-per-GPU policy").
 
@@ -106,7 +107,7 @@ Implementations MUST follow these reuse boundaries:
 - Minimize time from feedback to changed behavior (edits influence subsequent calls).
 - Maximize label efficiency via ICL under token constraints.
 - Quick onboarding (hosted NIM + API key sufficient).
-- Improve SME throughput via diversity-driven selection from first image (pHash immediate, CLIP upgrade).
+- Improve SME throughput via diversity-driven selection as background pHash/CLIP signals become available, with a deterministic no-signal fallback from the first image.
 - Scale dataset creation via Batch Labeling with lineage + safeguards.
 - Tradeoff decision support: compare Students with accuracy + latency.
 - Interactive iteration speed: Retry per image by changing Teacher and/or Guidance.
@@ -151,9 +152,11 @@ The system can deploy NIM containers locally on the backend host for models with
 
 Local NIM deployment is available for seeded catalog entries that carry `local_deploy_metadata` (§13.10): container image ref, GPU memory minimum, and preferred host port. In v1, this covers the NeMo Retriever VL 1B v2 embedding NIM and the seeded Teacher models (Cosmos Reason2 8B/2B, Cosmos 3 Nano/Super reasoner, and Nemotron 3 Nano Omni). Arbitrary user-added catalog entries are remote-only unless they include full local deployment metadata.
 
-**Environment assessment (runs at backend startup and on project creation):**
+**Environment assessment (deployment-scoped, warmed at application start):**
 
-The system probes the local environment to determine which NIM deployment modes are available. The assessment is ephemeral (recomputed on startup, not persisted) and drives the onboarding recommendation screen (Overview §6 step 2). All checks are non-blocking and lightweight.
+The system probes the local environment to determine which NIM deployment modes are available. The browser starts this deployment-scoped assessment once at application startup without blocking the Project List; project creation and direct API clients lazily initialize the same backend snapshot when it is not already warm. The expensive machine capability portion (Docker, NVIDIA Container Toolkit, and GPU inventory) is ephemeral but cached for the backend process lifetime rather than repeated per project or per request. Cheap dynamic state — configured credentials, embedding deployment configuration, and active Blueprint-managed NIM residents — is composed fresh on every response. Routes whose behavior does not depend on machine capabilities MUST NOT wait for the assessment.
+
+`GET /v1/environment?refresh_hardware=true` explicitly discards and rebuilds the process-local machine snapshot for the uncommon case where an operator installs or changes Docker, the NVIDIA runtime, drivers, or GPUs without restarting the backend. This read-side cache is recommendation state, not a deployment safety gate: every local NIM preflight still re-checks the applicable live hardware and runtime requirements immediately before launch.
 
 Checks:
 
@@ -174,18 +177,18 @@ Output: a structured `EnvironmentAssessment` available via `GET /v1/environment`
 - `ngc_api_key_configured: boolean`
 - `gpus[]: { name: string, memory_total_gb: float, compute_capability: float | null }` (empty when no GPU detected)
 - `local_deployable_models[]: { model_name: string, nim_container_image: string, gpu_memory_minimum_gb: int, compute_capability_minimum: float | null, fits: boolean }` (seeded catalog entries with `local_deploy_metadata`, each annotated with whether one detected GPU meets both declared floors. This deployment-scoped response intentionally carries no project-local ModelConfig IDs; NIM Configuration joins by `model_name` against `GET /projects/{id}/model_configs`. This covers Teacher/Student models only — VLM inference models from the model catalog.)
-- `embedding_deployment: { model_name: string, nim_container_image: string, gpu_memory_minimum_gb: int, fits: boolean, provider: string }` (Embedding NIM deployment availability, sourced from `EmbeddingDeploymentConfig` §13.17, not from the model catalog. Reported separately because the embedding NIM is infrastructure for background embedding computation, not a user-selectable inference model.)
+- `embedding_deployment: { model_name: string, nim_container_image: string, gpu_memory_minimum_gb: int, fits: boolean, provider: string }` (Embedding NIM deployment availability, sourced from `EmbeddingDeploymentConfig` §13.17, not from the model catalog. `fits` requires a currently claimable GPU whose memory meets the floor and whose detected name exactly matches the pinned NIM support matrix. Reported separately because the embedding NIM is infrastructure for background embedding computation, not a user-selectable inference model.)
 - `missing_prerequisites[]: { check: string, install_hint: string }` (what's missing and how to fix it)
 - `recommended_teacher_mode: "hosted" | "local" | "none"` (system recommendation based on available capabilities)
-- `recommended_embedding_mode: "hosted" | "local" | "none"` (system recommendation; prefers the local embedding NIM whenever a suitable GPU will actually be free for it — placement-aware: devices holding an active Teacher/Student NIM are excluded, and when a local Teacher is recommended but not yet deployed, the auto-placer's pick is reserved for it; floor sourced from `EmbeddingDeploymentConfig`)
+- `recommended_embedding_mode: "hosted" | "local" | "none"` (system recommendation; prefers the local embedding NIM whenever a supported GPU will actually be free for it — placement-aware: devices holding an active Teacher/Student NIM are excluded, when a local Teacher is recommended but not yet deployed the auto-placer's pick is reserved for it, and automatic eligibility requires both the floor from `EmbeddingDeploymentConfig` and an exact detected-name match in the pinned support matrix)
 - `active_local_nim_residents[]: { project_id, project_name, local_nim_deployment_id, role, model_name, nim_container_image, gpu_assignment, status }` (non-secret summaries of Blueprint-managed `starting | running` NIMs; used to explain reuse and replacement choices)
 
-Recommendation logic: first compute the quality-ranked local Teacher whose hardware contract this host satisfies. An exact healthy Blueprint-managed Teacher resident is auto-reused only when it matches that recommendation; a different resident remains visible and the SME chooses whether to keep or explicitly replace it. Otherwise prefer hosted Teacher (instant, no startup wait) when `NVIDIA_API_KEY` is configured, while still surfacing the local option. Prefer local embedding NIM when local deployment is available and a suitable GPU will remain free for it (eliminates rate limits, no hosted transport constraints). A host whose every GPU is below the Teacher floors but at/above the 10 GB embedding floor still recommends local embeddings — that host class runs local embeddings with a hosted Teacher. When `NVIDIA_API_KEY` is not configured and local deployment is available, recommend local Teacher.
+Recommendation logic: first compute the quality-ranked local Teacher whose hardware contract this host satisfies. An exact healthy Blueprint-managed Teacher resident is auto-reused only when it matches that recommendation; a different resident remains visible and the SME chooses whether to keep or explicitly replace it. Otherwise prefer hosted Teacher (instant, no startup wait) when `NVIDIA_API_KEY` is configured, while still surfacing the local option. Prefer local embedding NIM when local deployment is available and a suitable GPU will remain free for it (eliminates rate limits, no hosted transport constraints). A host whose every GPU is below the Teacher floors but has a supported GPU at/above the 24 GB embedding floor still recommends local embeddings — that host class runs local embeddings with a hosted Teacher. When `NVIDIA_API_KEY` is not configured and local deployment is available, recommend local Teacher.
 
 **F-amendment NIM-FTU-Local-Peer (2026-05-18).** Restores spec compliance after a Phase H (2026-05-12) regression that had over-simplified `recommended_teacher_mode` to always `"hosted"`. Three normative additions:
 
-1. **Auto-pick by validated quality, then gate by hardware.** Filter to entries with `"teacher" ∈ eligible_roles`, non-null `local_deploy_metadata`, and at least one GPU satisfying `nim_gpu_memory_minimum_gb` plus optional `nim_compute_capability_minimum`. Sort by the curated quality rank first; memory is eligibility, not a quality proxy. The 2026-07-24 policy is: Nemotron 3 Nano Omni on ≥80 GB, compute capability ≥9.0; CR3-Nano on ≥56 GB when Omni is ineligible; Cosmos Reason2 2B on 36–55 GB. GPU memory comparisons allow a 1% reporting tolerance because `nvidia-smi` can expose a nominal 80 GB card as approximately 79.6 GiB; this recognizes the documented card tier without admitting a meaningfully smaller device. CR3-Super and Cosmos Reason2 8B remain selectable but do not become defaults merely by consuming more memory. This ranking follows the completed 3-model × 3-dataset long-horizon ICL matrix: Omni led the two multiclass datasets, while CR3-Nano beat Super on two of three datasets and Super won only VisA. Omni's 0.68–1.57% schema-error rate remains a disclosed tradeoff; CR3 had zero. On 10–35 GB GPUs no local Teacher fits, but the embedding-only path below remains available. Canonical implementation: `services.environment._pick_local_teacher_recommendation` (`_LOCAL_TEACHER_PREFERENCE_RANK`).
-2. **Hybrid-by-default when both paths are viable but no preferred Teacher is resident.** When `NVIDIA_API_KEY` is configured AND a local Teacher fits, `recommended_teacher_mode` stays `"hosted"` (ready instantly via the seeded hosted default, MiniMax-M3 — §4.8) BUT the local-teacher recommendation fields stay populated so the FTUE can offer the measured-best local Teacher as a peer card. An exact compatible running resident overrides this theoretical-fit rule only when it matches the current quality recommendation: `recommended_teacher_mode="local"`, and fresh-project creation attaches and selects the matching local config before returning. A different resident is reported as a keep/replace choice rather than silently overriding the current policy.
+1. **Auto-pick by validated quality, then gate by hardware.** Filter to entries with `"teacher" ∈ eligible_roles`, non-null `local_deploy_metadata`, and at least one GPU satisfying `nim_gpu_memory_minimum_gb` plus optional `nim_compute_capability_minimum`. Sort by the curated quality rank first; memory is eligibility, not a quality proxy. The 2026-07-24 policy is: Nemotron 3 Nano Omni on ≥80 GB, compute capability ≥9.0; CR3-Nano on ≥56 GB when Omni is ineligible; Cosmos Reason2 2B on 36–55 GB. GPU memory comparisons allow a 1% reporting tolerance because `nvidia-smi` can expose a nominal 80 GB card as approximately 79.6 GiB; this recognizes the documented card tier without admitting a meaningfully smaller device. CR3-Super and Cosmos Reason2 8B remain selectable but do not become defaults merely by consuming more memory. This ranking follows the completed 3-model × 3-dataset long-horizon ICL matrix: Omni led the two multiclass datasets, while CR3-Nano beat Super on two of three datasets and Super won only VisA. Omni's 0.68–1.57% schema-error rate remains a disclosed tradeoff; CR3 had zero. On supported 24–35 GB GPUs no local Teacher fits, but the embedding-only path below remains available. Canonical implementation: `services.environment._pick_local_teacher_recommendation` (`_LOCAL_TEACHER_PREFERENCE_RANK`).
+2. **Hybrid-by-default when both paths are viable but no preferred Teacher is resident.** When `NVIDIA_API_KEY` is configured AND a local Teacher fits, `recommended_teacher_mode` stays `"hosted"` (ready instantly via the seeded hosted default, Step 3.7 Flash — §4.8) BUT the local-teacher recommendation fields stay populated so the FTUE can offer the measured-best local Teacher as a peer card. An exact compatible running resident overrides this theoretical-fit rule only when it matches the current quality recommendation: `recommended_teacher_mode="local"`, and fresh-project creation attaches and selects the matching local config before returning. A different resident is reported as a keep/replace choice rather than silently overriding the current policy.
 3. **New `EnvironmentAssessment` fields (additive).** Three optional fields surface the concrete recommendation to the frontend without it having to re-derive: `recommended_local_teacher_model_name: str | None`, `recommended_local_teacher_image: str | None`, `recommended_local_teacher_gpu_memory_minimum_gb: int | None`. Null when no teacher-eligible local model fits the GPU.
 
 Fresh-project adoption and background-deploy dispatch: after seeding the project catalog, `POST /v1/projects` MUST scan durable active residents. When an exact compatible running Teacher matches the host's current quality recommendation, it MUST attach a project-local endpoint and set `teacher_model_config_id` to that matching config before returning. The FTUE queues no Teacher deploy and auto-skips when embeddings need no action; on a multi-GPU host it may continue solely to collect/dispatch a separately recommended embedding NIM. A different resident is not silently adopted: Screen 2C names it and obtains the SME's keep/replace decision. Otherwise Screen 2C fires one `POST /v1/projects/{id}/local_nim/deploy` per queued model. The deploy endpoint repeats the exact-reuse check to cover later model changes and races. No second Teacher container, model reload, or ownership transfer occurs on reuse.
@@ -198,13 +201,13 @@ Fresh-project adoption and background-deploy dispatch: after seeding the project
 4. `NGC_API_KEY` configured (required to pull NIM container images).
 5. Docker registry authenticated to `nvcr.io` with the configured NGC key (password on stdin, never argv).
 6. Container image pullable from NGC.
-7. Model-specific profile check: run `list-model-profiles` against the target image to confirm a compatible profile exists on the current hardware. Shared-image probes MUST receive the same `NIM_MODEL_SIZE`, pinned `NIM_MODEL_PROFILE` (when configured), and `NIM_SERVED_MODEL_NAME` as the real deploy, so the probe cannot validate the image's default sibling model. If no runnable profile is available, deployment fails with a clear error.
+7. Model-specific profile check: run `list-model-profiles` against the target image to confirm a compatible profile exists on the current hardware. A shared-image Teacher probe MUST receive the same `NIM_MODEL_SIZE`, pinned `NIM_MODEL_PROFILE` (when configured), and size-specific `NIM_SERVED_MODEL_NAME` as the real deploy, so the probe cannot validate the image's default sibling model. A custom-checkpoint Student retains the base `NIM_MODEL_SIZE` but MUST NOT inherit the base model's pinned `NIM_MODEL_PROFILE`: that profile selects the image's bundled weights and conflicts with the read-only checkpoint selected by `NIM_MODEL_NAME`. Its probe and real launch let NIM select a checkpoint-compatible profile, and its real launch uses the Student-specific served name. If no runnable profile is available, deployment fails with a clear error. A published single-model NIM that does not ship the optional standalone utility is inconclusive rather than incompatible: continue to the bounded serve health and served-model checks, which remain authoritative. This exception never applies to a shared-image selection.
 
 If preflight fails, the system generates an Action Request with the exact `docker run` command and prerequisites (existing §10.3 pattern) so the SME can hand off to infrastructure.
 
 **Container lifecycle (persistent, named):**
 
-1. Construct `docker run` with: pinned container image, name-only `-e NGC_API_KEY` forwarding, NIM cache mount (`~/.cache/nim:/opt/nim/.cache`), host port → container port 8000, `--runtime=nvidia`, GPU assignment (`--gpus`), `--shm-size=32GB`, named container (`--name`). The Docker client subprocess receives the credential through its private child environment; neither the value nor a `KEY=value` assignment may enter the process argument vector or operator-visible command. Most supported images run as the host UID so the cache stays writable. Nemotron 3 Nano Omni `1.7.0-variant` MUST retain its declared `nvs` user because its startup calls `getpwuid()` and exits for an arbitrary host UID; the orchestrator MUST make only the shared cache parent/scratch directories writable to that user, without recursively changing cached model artifacts. NeMo Retriever VL NIM 2.0.0 MUST receive `NIM_PRECISION=fp16` (the unset-precision SM120 path requires a cuDNN plan directory its entrypoint skips creating) and a `NIM_MODEL_PATH` below `/opt/nim/.cache` so model downloads survive container replacement.
+1. Construct `docker run` with: pinned container image, name-only `-e NGC_API_KEY` forwarding, NIM cache mount (`~/.cache/nim:/opt/nim/.cache`), loopback-only host port → container port 8000 (`127.0.0.1:{host_port}:8000`), `--runtime=nvidia`, GPU assignment (`--gpus`), `--shm-size=32GB`, named container (`--name`). System-managed NIMs are unauthenticated implementation services and MUST NOT be published on every host interface. The Docker client subprocess receives the credential through its private child environment; neither the value nor a `KEY=value` assignment may enter the process argument vector or operator-visible command. Most supported images run as the host UID so the cache stays writable. Nemotron 3 Nano Omni `1.7.0-variant` MUST retain its declared `nvs` user because its startup calls `getpwuid()` and exits for an arbitrary host UID; the orchestrator MUST make only the shared cache parent/scratch directories writable to that user, without recursively changing cached model artifacts. NeMo Retriever VL NIM 2.0.0 MUST receive `NIM_PRECISION=fp16` (the unset-precision SM120 path requires a cuDNN plan directory its entrypoint skips creating) and a `NIM_MODEL_PATH` below `/opt/nim/.cache` so model downloads survive container replacement.
 2. Start container. Poll `/v1/health/ready` up to `NIM_STARTUP_TIMEOUT_S` (default: 1200s). Every transition to a terminal `failed` state for a deployment whose container may still exist (health timeout, served-model verification failure, inference-probe failure) MUST best-effort stop and remove the named container: a terminal row is invisible to the one-NIM-per-GPU placement scan, so an untouched container would keep holding the GPU's VRAM and port as an unmanaged resident. Teardown targets the persisted container id when available (container names are project+role scoped and reused across deployment generations).
 3. **Served-model verification (Teacher deployments).** Before marking the deployment healthy, the system MUST confirm the container is genuinely serving the *requested* model — `/v1/health/ready` returning and `/v1/models` reporting the requested name are NOT proof the right weights are loaded. Verification queries `/v1/metadata` for the actually-loaded model slug and confirms the requested model has real weight files in the NIM cache (not a config-only stub). On a contradiction — a `/v1/metadata` loaded-model mismatch, or zero non-trivial weight files for the requested model — the deployment is marked `failed` with an actionable `status_reason` instead of being marked healthy. This guards the silent wrong-model fallback observed with `cosmos3-reasoner` at `NIM_MODEL_SIZE=nano`: when the nano NGC profile fetch timed out the NIM logged `Detected 0 compatible profile(s)`, silently fell back to the cached SUPER weights, and kept reporting `served_model_name=…nano…` (the nano cache was a 52K config-only stub with zero weight files). Verification is Teacher-role only (Students mount checkpoints; the embedding NIM uses a different cache). Passing verification is followed by a minimal real-inference probe (a 1-token `/v1/chat/completions` call carrying the Blueprint source header): `/v1/health/ready`, `/v1/models`, and `/v1/metadata` keep answering 200 from the surviving HTTP front-end after a vLLM EngineCore death (observed live: CUDA illegal-memory-access under load), so only the inference path proves the engine is alive. An affirmative probe failure (HTTP error, connection refusal) marks the deployment `failed` with an actionable `status_reason` and stops the container; a probe timeout is inconclusive and passes adoption — a busy but healthy NIM queues completions for tens of seconds under load, and the probe must never tear down a serving deployment on slowness alone. The same verification + probe gate runs when restart recovery re-adopts a running container. The probe is Teacher-role only: embedding NIMs do not serve `/v1/chat/completions` (their inference path is live-verified at provider resolution, §5.5.1), and the Student lifecycle runs its own smoke inference (§9.5.2 step 3). On the same healthy transition the system also auto-sets the endpoint's per-prompt image cap (`NIM_MAX_IMAGES_PER_PROMPT`) from the served NIM, so ICL is not silently truncated by a version-specific default.
 4. On healthy: auto-register the local endpoint in the model catalog (Teacher) or set `embedding_provider=self_hosted_nvclip` with the local endpoint URL (embedding NIM — enum value name retained for backwards compatibility); the embedding NIM's healthy transition also re-resolves the provider for every non-archived project and drains pending embedding work (§5.5.1). The SME does not manually configure URLs.
@@ -214,7 +217,7 @@ If preflight fails, the system generates an Action Request with the exact `docke
 
 **One-NIM-per-GPU invariant (F49 amendment, 2026-05-19):** at most one NIM container is `starting` or `running` on any GPU at any time, regardless of how much VRAM the math suggests is free. This is a backend-enforced invariant, not a frontend convention.
 
-Before placement, a Teacher deploy with `replace_resident=false` MUST scan all non-archived project databases for Blueprint-managed active residents. A `running` Teacher with the exact same runtime identity — model name, pinned container image, model size/profile, and other container-affecting catalog environment — is reused across projects. The consuming project gets its own enabled `local_system_managed` endpoint attachment linked to the owner deployment; the owner keeps lifecycle control. If that resident later stops or fails, every attached project endpoint is disabled.
+Before placement, a Teacher deploy with `replace_resident=false` MUST scan all non-archived project databases for Blueprint-managed active residents. A `running` Teacher with the exact same runtime identity — model name, pinned container image, model size/profile, and other container-affecting catalog environment — is reused across projects. The consuming project gets its own enabled `local_system_managed` endpoint attachment linked to the owner deployment; the owner keeps lifecycle control. If that resident later stops or fails, every attached project endpoint is disabled. When a new generation of that exact runtime later passes the healthy-adoption gate, the system MUST reattach projects whose selected Teacher still points at a disabled Blueprint-managed attachment from the prior resident; hosted, self-hosted, and differently selected configs are not changed. Proposal dispatch MUST reject disabled or hard-unhealthy endpoint state before making an HTTP request, even when the old host port currently answers.
 
 Fresh-project creation performs the same exact scan immediately after catalog seeding. If a match exists, it attaches the endpoint and selects the matching Teacher before the create response returns; a hosted API key does not outrank already-running local infrastructure. Project creation remains available if the host scan itself fails, falling back to the effective seeded default and the normal setup choice.
 
@@ -222,13 +225,42 @@ To start a different NIM on an occupied GPU, the orchestrator MUST first transit
 
 **Post-onboarding compatible-model chooser and safe replacement:** NIM Configuration MUST list every Teacher entry for which `local_deployable_models[].fits=true` and a project ModelConfig with `teacher` role plus `local_deploy_metadata` exists. It marks `recommended_local_teacher_model_name`, the running resident, and each hardware floor, but deploys only the explicit selection. The first request always sends `replace_resident=false`; only a structured 409 naming the exact floor-qualified replacement target may open the confirmation. A confirmed retry pins that `gpu_assignment` and sends `replace_resident=true`. For a model change, `activate_on_success=true` is persisted on `LocalNimDeployment`; the Project's `teacher_model_config_id` changes only after the local endpoint passes health, served-model, and inference verification (or immediately after exact healthy-resident reuse). When a confirmed replacement fails during background preflight, container startup, health polling, served-model verification, or restart recovery, the orchestrator MUST best-effort requeue every displaced Teacher/embedding resident identified by `displaced_by_deployment_id`. Restoration failure is logged and surfaced operationally but does not conceal the requested deployment's original failure.
 
-**Placement policy (deterministic):** a new deployment claims the lowest-indexed GPU whose `LocalNimDeployment` rows are all in a terminal state (`stopped` / `failed`). The auto-placer never returns a GPU whose residents are active. Embedding deployments additionally skip free GPUs below the embedding memory floor (`EmbeddingDeploymentConfig.gpu_memory_minimum_gb`, seeded 10 GB for NIM 2.0.0), so a heterogeneous host (say 80 GB + 8 GB) never lands the embedding NIM on a device that cannot hold it; when free GPUs exist but none meets the floor, the placer raises `GpuExhaustedError` pointing at the real fixes (larger GPU or the hosted provider) rather than suggesting replace semantics. When every GPU has an active resident, the auto-placer raises `GpuExhaustedError` and the router returns `409 gpu_exhausted`; the caller chooses whether to explicitly opt into replace semantics.
+NIM Configuration MUST also expose the deployment-scoped NeMo Retriever VL
+embedding lifecycle after onboarding. Its first deploy request sends
+`role="embedding"` and `replace_resident=false` even when the placement-aware
+`embedding_deployment.fits` value is false: that value means no GPU currently
+meets the conservative automatic recommendation contract (free placement,
+memory floor, and exact pinned-matrix name), not that a manual fallback attempt
+is prohibited. The backend remains authoritative and either returns a
+floor/placement failure or a
+structured 409 naming the exact replaceable resident. Only the latter opens a
+Keep-versus-stop-and-start confirmation; the confirmed retry pins the returned
+GPU and sends `replace_resident=true`. A running embedding deployment owned by
+the current project exposes the normal `:stop` lifecycle action. Deploy and
+stop transitions invalidate environment/project state so provider
+re-resolution and the hosted-or-pHash fallback remain visible without a
+backend restart. A different project's embedding resident is named but its
+lifecycle stays with the owning project.
 
-**Single-GPU hosts:** support exactly one NIM at a time, which yields three viable splits. (1) The FTUE Screen 2A "Run locally" path deploys the Teacher only; image embedding falls back to pHash diversity (§5.6) until the operator either switches to a hybrid path where the embedding NIM runs hosted via `NVIDIA_API_KEY`, or explicitly stops the Teacher and runs an embedding deploy. (2) Hybrid: local Teacher on the GPU, hosted embeddings via `NVIDIA_API_KEY`. (3) The inverse split for the small-GPU host class: a single GPU below every Teacher floor but at/above the embedding floor (10 GB seeded) runs the local embedding NIM with a hosted Teacher — `recommended_embedding_mode="local"` covers exactly this case. Below 10 GB, use hosted embeddings when configured or pHash diversity. Student NIM benchmarking on a single-GPU host explicitly invokes the replace semantics: the resident Teacher is stopped, the Student runs evaluation + benchmark, the Student stops, and the orchestrator best-effort auto-restores the displaced Teacher on the same GPU (§9.5.2 step 0 and step 9).
+The self-hosted embedding override on the same screen MUST prove the embedding
+operation rather than treating a generic model-list response as sufficient.
+Both Test Connection and Save send a credential-free request to
+`POST {base_url}/embeddings` using the deployment config's exact NeMo Retriever
+model and `input_type`, and require one finite vector of the configured 2,048
+dimensions. Test is transient. Save repeats the proof before persisting
+`provider=self_hosted_nvclip` and the normalized URL, then immediately
+re-resolves every non-archived project. It MUST NOT switch to a different URL
+while a Blueprint-managed embedding deployment is active; the SME stops that
+resident explicitly first. Re-saving the exact active managed URL is an
+idempotent live verification and preserves its GPU assignment.
 
-**Multi-GPU hosts:** each NIM gets its own GPU deterministically (Teacher → device=0, embedding → device=1, additional deployments → next free index). Co-location on the same GPU is not supported in v1.
+**Placement policy (deterministic):** a new deployment claims the lowest-indexed GPU whose `LocalNimDeployment` rows are all in a terminal state (`stopped` / `failed`). The auto-placer never returns a GPU whose residents are active. Embedding deployments additionally skip free GPUs below the embedding memory floor (`EmbeddingDeploymentConfig.gpu_memory_minimum_gb`, seeded 24 GB for NIM 2.0.0), so a heterogeneous host (say 80 GB + 8 GB) never lands the embedding NIM on a device below the eligibility floor; when free GPUs exist but none meets the floor, the placer raises `GpuExhaustedError` pointing at the real fixes (larger GPU or the hosted provider) rather than suggesting replace semantics. Memory alone does not establish embedding compatibility: automatic recommendations also require the detected GPU name to exactly match a SKU in the pinned support matrix. Unrecognized hardware stays hosted/pHash unless the operator deliberately requests the documented fallback path, whose live preflight remains authoritative. When every GPU has an active resident, the auto-placer raises `GpuExhaustedError` and the router returns `409 gpu_exhausted`; the caller chooses whether to explicitly opt into replace semantics.
 
-**Preflight:** for every deployment, preflight verifies a runnable model/profile exists on the assigned GPU (via `list-model-profiles`). On occupied-GPU replace, preflight runs AFTER the resident is stopped so the GPU-memory check reflects post-displacement free memory.
+**Single-GPU hosts:** support exactly one NIM at a time, which yields three viable splits. (1) The FTUE Screen 2A "Run locally" path deploys the Teacher only; image embedding falls back to pHash diversity (§5.6) until the operator either switches to a hybrid path where the embedding NIM runs hosted via `NVIDIA_API_KEY`, or explicitly stops the Teacher and runs an embedding deploy. (2) Hybrid: local Teacher on the GPU, hosted embeddings via `NVIDIA_API_KEY`. (3) The inverse split for the small-GPU host class: one supported GPU below every Teacher floor but at/above the embedding floor (24 GB seeded) runs the local embedding NIM with a hosted Teacher — `recommended_embedding_mode="local"` covers exactly this case. Below 24 GB, use hosted embeddings when configured or pHash diversity. Student NIM benchmarking on a single-GPU host explicitly invokes the replace semantics: the resident Teacher is stopped, the Student runs evaluation + benchmark, the Student stops, and the orchestrator best-effort auto-restores the displaced Teacher on the same GPU (§9.5.2 step 0 and step 9).
+
+**Multi-GPU hosts:** each NIM gets its own GPU. Every role claims the lowest-indexed compatible free device at dispatch time; roles do not own fixed device numbers. Embedding placement additionally skips free devices below its configured eligibility floor. Co-location on the same GPU is not supported in v1.
+
+**Preflight:** for every deployment, preflight attempts to verify a runnable model/profile on the assigned GPU via `list-model-profiles`. If a single-model published image omits that optional utility, the probe is recorded as inconclusive and the bounded serve health plus served-model checks become authoritative; a shared image must never use this exception. On occupied-GPU replace, preflight runs AFTER the resident is stopped so the GPU-memory check reflects post-displacement free memory.
 
 **Empirical motivation:** the empirical 2026-05-19 finding (Cosmos Reason2 8B / A100-80GB, recorded in README under "One-NIM-per-GPU policy") demonstrated that Cosmos Reason2's NIM container hardcodes `gpu_memory_utilization=0.9` in its vLLM backend; its profile selector reads currently-free GPU memory and asserts each profile's requirement against it, so any neighbor process — including a 12 GB embedding NIM — drops "free" below the 90%-of-total threshold every profile requires, and Cosmos refuses to start with `Detected 0 compatible profile(s)`. Re-confirmed 2026-07-13 on Cosmos 3 nano / H100 NVL 96 GB: a second teacher-class NIM on an occupied GPU refuses startup (`Free memory … less than desired GPU memory utilization (0.9, 83.78 GiB)`; container exits 0), while the small TRT-based embedding NIM can physically co-locate in the leftover headroom on the larger card — the invariant is therefore enforced as policy, not just physics. The motivation is recorded in README; the invariant above is the contract.
 
@@ -293,6 +325,13 @@ Each project is a self-contained directory under `{workspace_root}/projects/`. O
 
 **Images are not copied into the project directory.** The system records the original filesystem path as `storage_ref` on the Example record (§13.8). The backend provides a filesystem browse endpoint (§10.2.10) that the frontend uses to let the user navigate the backend host's filesystem and select image directories or files. The backend resolves all selections to absolute paths. A direct path entry field is also available for scripting and power-user workflows. Images MUST remain accessible at their recorded paths for the lifetime of the project. If paths change (drive reorganization, NFS remount, container bind-mount change), a bulk path remapping endpoint is available (§10.2.11). `storage_ref` values reflect the backend process's filesystem view; when the backend runs in a container, mount image directories at identical paths (e.g., `-v /data/images:/data/images`) so that `storage_ref` values are valid in both contexts.
 
+`storage_ref` is a locator, not a durable authorization decision. Every
+production read MUST re-apply the current §10.2.10 `IMAGE_ROOT` policy, open a
+regular file without following mutable path components, and consume the bytes
+from that authorized descriptor. A check-then-reopen sequence is not
+sufficient: a rename or symlink retarget between those operations could change
+the inode being served or sent to an external service.
+
 Required configuration:
 
 - `WORKSPACE_ROOT`: absolute path to the workspace root directory. No default; MUST be set before first use. The system MUST create the directory structure if it does not exist.
@@ -303,7 +342,7 @@ Required configuration:
 
 **Backend:** Python + FastAPI. Pydantic for request/response validation and record schemas. SQLAlchemy for ORM and database access. httpx for outbound async HTTP (NIM, TAO, embedding NIM endpoints). Jinja2 for prompt template rendering (Appendix D). Standard `logging` with a JSON formatter for structured operational logs (§11), writing to both stdout and `{project_dir}/logs/*.jsonl`. tiktoken for token counting (`encoding_for_model` when the model maps cleanly, `cl100k_base` fallback); the existing `RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN` (§6.2) absorbs tokenizer mismatch.
 
-**Database:** SQLite per project, stored at `{project_dir}/project.db` (§1.7), with WAL mode enabled. SQLAlchemy models MUST avoid SQLite-specific query behavior to preserve database portability. The public Alembic lineage starts at `v1_0001`, which creates the complete v1 schema; private pre-release revisions and databases are unsupported and require a fresh workspace. On startup, the backend MUST detect pending post-v1 migrations for each opened project database and apply them before proceeding. The schema version MUST be tracked in the database. Public v1+ project databases are upgradeable, not disposable; labeled data, Guidance versions, evaluation history, and training lineage MUST be preserved across schema changes. Before applying a post-v1 migration, the backend MUST copy `project.db` to `project.db.backup.{ISO 8601 timestamp}` (e.g., `project.db.backup.2026-03-30T14-22-07Z`). If a migration fails, the backend MUST surface the error and the backup file path, and MUST NOT proceed with a partially migrated database. On startup, the backend MUST run `PRAGMA quick_check` on each project database; if the check fails, surface a clear error with the database path and instruct the user to restore from backup (do not attempt auto-repair).
+**Database:** SQLite per project, stored at `{project_dir}/project.db` (§1.7), with WAL mode enabled. SQLAlchemy models MUST avoid SQLite-specific query behavior to preserve database portability. The public Alembic lineage starts at `v1_0001`, which creates the complete v1 schema; private pre-release revisions and databases are unsupported and require a fresh workspace. On startup, the backend MUST detect pending post-v1 migrations for each opened project database and apply them before proceeding. The schema version MUST be tracked in the database. Before Alembic revision discovery, a nonempty schema MUST contain one canonical, nonempty revision row; otherwise the backend MUST create a validated recovery backup and refuse the database without applying migrations. Only an empty schema or a sole canonical empty `alembic_version` table may initialize as fresh. Public v1+ project databases are upgradeable, not disposable; labeled data, Guidance versions, evaluation history, and training lineage MUST be preserved across schema changes. Before applying a post-v1 migration, the backend MUST copy `project.db` to `project.db.backup.{ISO 8601 timestamp}` (e.g., `project.db.backup.2026-03-30T14-22-07Z`). If a migration fails, the backend MUST surface the error and the backup file path, and MUST NOT proceed with a partially migrated database. On startup, the backend MUST run `PRAGMA quick_check` on each project database; if the check fails, surface a clear error with the database path and instruct the user to restore from backup (do not attempt auto-repair).
 
 **SQLite write-discipline (v1):** multiple concurrent writers exist within a single backend process (interactive labeling, evaluation result persistence, CLIP embedding updates, Batch Labeling progress writes). SQLite WAL mode permits concurrent reads alongside a single writer, but only one write transaction can make progress at a time. The following guardrails are normative:
 
@@ -353,7 +392,11 @@ Location: `~/.vlm_feedback_loop/config.yaml`. Settings include `workspace_root`,
 
 **First-launch behavior (CLI/bootstrap-first):** deployment-level configuration must exist before normal backend startup. If `~/.vlm_feedback_loop/config.yaml` does not exist, the backend MUST fail fast with a clear message directing the user to run a bootstrap command (e.g., `vlm-feedback-loop init`). The bootstrap command prompts for `WORKSPACE_ROOT`, writes a commented `config.yaml` template (`WORKSPACE_ROOT` is the only active key; every other Appendix A.4 default appears as a commented documentation line, so un-overridden settings keep tracking the shipped defaults across upgrades), generates a commented skeleton `.env` file at `~/.vlm_feedback_loop/.env` (documenting required variables without values), and exits. The backend then starts normally. The application does **not** include a first-launch web setup wizard.
 
-After backend startup, service connection setup remains in the web app. If `NVIDIA_API_KEY` is not already configured via environment variable or `.env` file, the user proceeds through the NIM Connection screen (Overview §6 step 2) on first project creation.
+After backend startup, service connection setup remains in the web app. A new
+project enters the split NIM setup chain (`NIMNvidiaKeyPage` → optional
+`NIMNgcKeyPage` → `NIMSetupGatePage`) when a credential or deployment decision
+is needed; fully resolved configurations auto-skip it. The richer
+`NIMConnectionPage` is the post-onboarding **NIM Configuration** surface.
 
 ---
 
@@ -417,7 +460,7 @@ A reserved subset of Verified examples used for evaluation and excluded from ICL
 Tag indicating a Verified example is assigned to the Test Pool. Managed automatically by the system via pool assignment routing (§4.3).
 
 **Pool assignment routing**
-Automatic routing of newly Verified examples to the Test Pool or non-pool status based on a configured fraction and CLIP-embedding diversity. Verification outcome (Accept/Edit) does not influence pool assignment (§4.3.1–4.3.2).
+Automatic routing based on the configured target fraction: the next Verified example fills an immediate shortfall, while later rebalancing uses the review selector's CLIP/pHash switchover. Verification outcome (Accept/Edit) does not influence pool assignment (§4.3.1–4.3.2).
 
 **Evaluation snapshot (pool version)**
 Frozen, immutable capture of pool membership at the time an evaluation run starts. Ensures reproducible evaluation against a fixed example set (§4.3.3).
@@ -462,7 +505,7 @@ Fixed-length vector representation of an image used for review selector scheduli
 A compact 64-bit perceptual fingerprint computed inline at ingest (CPU-only, no external dependency). Similarity measured by hamming distance. Used as the baseline diversity signal for the review selector. See §5.6.
 
 **pHash-diverse review selector**
-Baseline selection strategy using pHash hamming distance to avoid showing visually similar images consecutively. Always available because pHash is computed inline at ingest. Deterministic given persisted scheduler state (Section 2.1).
+Baseline selection strategy using available pHash values and hamming distance to avoid showing visually similar images consecutively. When no candidate hash is ready, selection falls back to deterministic `example_key` order. Deterministic given persisted scheduler state (Section 2.1).
 
 **CLIP-diverse review selector**
 Selection strategy using CLIP embedding cosine similarity to avoid showing semantically similar images consecutively. Preferred over pHash-diverse when CLIP embeddings are available. Deterministic given persisted scheduler state (Section 2.1).
@@ -529,14 +572,14 @@ All persisted timestamps MUST be stored in UTC using ISO 8601 with a `Z` suffix 
 ### 3.4 Failure & Integrity Invariants
 
 1. Failure semantics distinguish schema-invalid vs timeout vs endpoint/transport error.
-2. Student Training execution is validated independently of the Scale-Up Readiness Gate: the suite-launch endpoint fails closed until TAO/workspace/timeout and training-data checks pass and each selected base model has the `student_base` role. A selected missing TAO base is non-blocking because first-use provisioning is the conditional first Training Jobs stage (§9.7.8).
+2. Student Training execution is validated independently of the Scale-Up Teacher-quality criteria: the suite-launch endpoint fails closed until TAO/workspace/timeout checks pass, at least one active-Guidance Verified training example remains outside the Test Pool, the active-Guidance Test Pool reaches the configured minimum, and each selected base model has the `student_base` role. A selected missing TAO base is non-blocking because first-use provisioning is the conditional first Training Jobs stage (§9.7.8).
 3. Review selector selections MUST be reproducible (Section 13.3).
 
 ### 3.5 Operation Record Invariants
 
 1. Invocation record persistence: system MUST generate `inference_invocation_id` before invoking model and MUST persist an operation record for all outcomes.
 2. Evaluation uses the same prompt pipeline as Interactive Labeling.
-3. Retry attempts produce distinct invocation records: each Retry MUST create a new operation record attributable to same `example_key` and link to prior attempt.
+3. User-requested interactive Retry and evaluation's explicit sequential retry pass produce distinct invocation records linked to the prior attempt. Resuming one unfinished Batch Labeling item is not a new retry: it MUST reuse that item's pending invocation record.
 4. (removed)
 5. TAO job observability is persisted: TAO jobs MUST have durable records, deterministic state mapping, and durable output references.
 
@@ -589,7 +632,7 @@ Omission provenance fields (required when `state="Omitted"`):
 - `omitted_source: "sme_skip" | null` (required when Omitted; MUST be null otherwise)
 - `omitted_at: timestamp | null` (required when Omitted; MUST be null otherwise)
 
-pHash field (required; computed inline at ingest, §5.6):
+pHash field (required; populated by the restartable post-ingest sweep, §5.6):
 
 - `phash: string` (required; 64-bit perceptual hash, hex-encoded; computed inline during ingestion)
 
@@ -868,6 +911,17 @@ Each model config entry binds an endpoint + `model_name` + operational metadata 
 Rules:
 
 - `model_config_id` MUST be backend-generated and unique within the project.
+- **Commercial seed policy:** every model in the fresh-project seed MUST have
+  published model terms that permit commercial use when the catalog is
+  reviewed. A model with non-commercial-only or unknown model terms MUST NOT
+  be preseeded, even when its hosted trial endpoint is technically reachable.
+  Operators MAY add such a model explicitly after reviewing its terms;
+  historical catalog and invocation records remain inspectable. Schema
+  revision `v1_0004` makes one narrow selection repair for projects created
+  before this policy: when MiniMax M3 is still the active Teacher, Step 3.7
+  Flash exists in the same catalog, and the project has no Label rows, the
+  upgrade selects Step. Projects with any Label row are not changed, and the
+  MiniMax catalog record is never deleted or rewritten.
 - `eligible_roles[]` MUST be non-empty. Role filtering is the sole mechanism for determining where a model may be used:
   - Teacher selection: entries where `teacher ∈ eligible_roles`. A model assigned as `teacher_model_config_id` MUST have `supports_image_input=true`; the backend MUST reject Teacher assignment for models that do not support image input. This invariant MUST be enforced at **every** write site that can set `teacher_model_config_id` — project seeding (§13.4), `POST /v1/projects`, and `PATCH /v1/projects/{id}` (§10.2.13) — so the UI top-bar Teacher picker (`TeacherModelPicker.tsx`) and the Retry per-attempt override (§10.2.3) both surface the same 422 error shape on invalid selections.
   - Student Training base: entries where `student_base ∈ eligible_roles`. Currently limited to the seeded Cosmos bases (Cosmos Reason2 8B/2B, Cosmos 3 Nano/Super reasoner); implementations MUST reject `student_base` role assignment for other models.
@@ -878,7 +932,7 @@ Rules:
   - Seeding: Qwen models → `mode="qwen_enable_thinking"`; Mistral VLMs → `mode="none"` (request-level `chat_template_kwargs` override not supported).
 - Model configs MUST include image input capability:
   - `supports_image_input: boolean` (required; whether the model accepts image content in messages). This is distinct from `visual_budget_mode`, which tracks visual *token control* support. A model may accept images (`supports_image_input=true`) without supporting request-level visual token controls (`visual_budget_mode="none"`).
-  - Seeding: Cosmos Reason2 8B/2B, Mistral Large 3, Nemotron Nano VL → `true`.
+  - Seeding: every current catalog entry accepts images; this includes the Cosmos families, Nemotron Nano VL/Omni, Step 3.7 Flash, and Mistral Medium 3.5.
 - Model configs MUST include visual budget metadata (§6.9):
   - `visual_budget_mode`: `"none"` | `"mm_processor_size"` | `"mm_processor_pixels"` | `"mm_processor_tiles"` (required; determines which `mm_processor_kwargs` shape the model accepts)
   - `visual_budget_support`: `"unknown"` | `"supported"` | `"unsupported"` (required; seeded or updated via runtime probe)
@@ -898,22 +952,20 @@ Seeded catalog entries (model names are the exact `model` parameter sent in Open
 
 - `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` (128000; 128K input + output tokens) | teacher | vision: yes | media: `none` | local: `nvcr.io/nim/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:1.7.0-variant`, ≥80 GB GPU and compute capability ≥9.0 | `qwen_enable_thinking`, image cap 8 | ***recommended local Teacher when supported***; Teacher-only (Cosmos remains the Student base)
 - `nvidia/cosmos3-nano-reasoner` (131072) | teacher, student_base | vision: yes | media: `mm_processor_size` | local: `nvcr.io/nim/nvidia/cosmos3-reasoner:1.7.0` (`NIM_MODEL_SIZE=nano`, pinned `NIM_MODEL_PROFILE`), ≥56 GB GPU | *recommended local Teacher when Omni is ineligible*
-- `nvidia/cosmos3-super-reasoner` (131072) | teacher, student_base | vision: yes | media: `mm_processor_size` | local: `nvcr.io/nim/nvidia/cosmos3-reasoner:1.7.0` (`NIM_MODEL_SIZE=super`), >88 GB GPU | *selectable; no longer auto-selected by its larger memory floor*
+- `nvidia/cosmos3-super-reasoner` (131072) | teacher, student_base | vision: yes | media: `mm_processor_size` | local: `nvcr.io/nim/nvidia/cosmos3-reasoner:1.7.0` (`NIM_MODEL_SIZE=super`), ≥88 GB GPU | *selectable; no longer auto-selected by its larger memory floor*
 - `nvidia/cosmos-reason2-8b` (256000; up to 256K input tokens) | teacher, student_base | vision: yes | media: `mm_processor_size` | local: `nvcr.io/nim/nvidia/cosmos-reason2-8b:1.6.0`, ≥56 GB GPU | *fully selectable; no longer the auto-recommended big-GPU default — superseded by CR3-Nano*
 - `nvidia/cosmos-reason2-2b` (256000; up to 256K input tokens) | teacher, student_base | vision: yes | media: `mm_processor_size` | local: `nvcr.io/nim/nvidia/cosmos-reason2-2b:1.6.0`, ≥36 GB GPU | *recommended local Teacher default on 36–55 GB GPUs*
-- `mistralai/mistral-large-3-675b-instruct-2512` (262144; 262,144 input context length) | teacher | vision: yes | media: `none` | *operator-selected alternate Teacher*
 - `nvidia/nemotron-nano-12b-v2-vl` (128000; 128K input + output tokens) | teacher | vision: yes | media: `mm_processor_tiles`
-- `stepfun-ai/step-3.7-flash` (262144) | teacher | vision: yes | media: `none` | *alternate — replaced as hosted default 2026-07-23 after a latency regression (reasoning trace grew ~3-6×, steady p50 6.7 s → 21.0 s); certified avg attempted-EM 0.865 stays strong; reasoning-by-default with no working toggle (`always_on_reasoning`); image cap 8 (provider-enforced)*
-- `minimaxai/minimax-m3` (500000, live-probed floor) | teacher | vision: yes | media: `none` | ***default Teacher on hosted-only deployments*** *(selected 2026-07-23) — deep-ICL hosted Teacher (avg attempted-EM 0.823, top of the reachable field; the only hosted Teacher usable past a 32-image request); no image-count limit found through 33, seeded at the campaign-validated 32 (the ~5 MB request-body cap binds first); adaptive ICL depth ceiling 8; re-measured 15.0 s steady p50*
+- `stepfun-ai/step-3.7-flash` (262144) | teacher | vision: yes | media: `none` | ***default Teacher on hosted-only deployments*** *(selected 2026-08-06 as the strongest commercially permitted reachable hosted Teacher in the retained campaign, avg attempted-EM 0.865; reasoning-by-default with no working toggle (`always_on_reasoning`); image cap 8; re-measured 21.0 s steady p50)*
 - `mistralai/mistral-medium-3.5-128b` (262144) | teacher | vision: yes | media: `none` | *near-ceiling Mistral-family alternate (avg 0.821, 0.0% model-error); image cap 10; measured in the same congestion band as Mistral Large on 2026-07-21 — an accuracy alternate, not a latency escape*
 
-Entries without `local:` metadata do not support system-managed local deployment in v1 (remote endpoint only). Cosmos Reason2 8B remains in the catalog because it is the primary `student_base` and is fully usable via local NIM deployment; hosted build.nvidia.com access is NVCF-account-gated. Nemotron 3 Nano Omni replaced `moonshotai/kimi-k2.5` as the seeded hosted reasoning Teacher after Kimi K2.5 reached end-of-life on 2026-04-30 (HTTP 410 on every call). Omni's specialized local NIM supports its Qwen-style thinking switch. The completed long-horizon local campaign used thinking OFF; the project-level default remains user-controllable. Omni's higher absolute accuracy earns the supported high-GPU tier, while its non-zero schema-error rate is why CR3-Nano remains the robust fallback. Qwen 3.5 is absent from the v1 seed because its hosted API retired with no NVIDIA-hosted successor.
+Entries without `local:` metadata do not support system-managed local deployment in v1 (remote endpoint only). Cosmos Reason2 8B remains in the catalog because it is the primary `student_base` and is fully usable via local NIM deployment; hosted build.nvidia.com access is NVCF-account-gated. Nemotron 3 Nano Omni replaced `moonshotai/kimi-k2.5` as the seeded hosted reasoning Teacher after Kimi K2.5 reached end-of-life on 2026-04-30 (HTTP 410 on every call). Omni's specialized local NIM supports its Qwen-style thinking switch. The completed long-horizon local campaign used thinking OFF; the project-level default remains user-controllable. Omni's higher absolute accuracy earns the supported high-GPU tier, while its non-zero schema-error rate is why CR3-Nano remains the robust fallback. Qwen 3.5 is absent from the v1 seed because its hosted API retired with no NVIDIA-hosted successor. Mistral Large 3 was removed from new-project seeding on 2026-08-03 after NVIDIA marked its free endpoint deprecated, omitted it from the live hosted catalog, and returned HTTP 410. MiniMax M3 was removed from new-project seeding on 2026-08-06 because its published model terms restrict it to non-commercial use. Historical and operator-created configurations remain inspectable; the `v1_0004` zero-Label active-selection repair above does not remove them.
 
-**Default Teacher selection and local availability.** Implementations MUST seed these entries and set `teacher_model_config_id` to the effective hosted `DEFAULT_TEACHER_MODEL` — `minimaxai/minimax-m3` by default — until a preferred local Teacher is selected or adopted. The value is config-overridable (`~/.vlm_feedback_loop/config.yaml`) and is exposed to the frontend as `EnvironmentResponse.default_teacher_model_name` so the Confirm Defaults preselect never hardcodes a model name. The local recommendation is a separate hardware-aware quality policy (§1.5): Omni when its specialized NIM contract is supported, CR3-Nano next, then Cosmos Reason2 2B. Cosmos remains the required base family for Student Training (only entries with the `student_base` role); Omni is Teacher-only. Default Teacher selection prioritises certified multi-domain accuracy, ICL-over-time behavior, live-measured interactive latency, and live-probed reliability (image caps, schema fail rates).
+**Default Teacher selection and local availability.** Implementations MUST seed these entries and set `teacher_model_config_id` to the effective hosted `DEFAULT_TEACHER_MODEL` — `stepfun-ai/step-3.7-flash` by default — until a preferred local Teacher is selected or adopted. A configured default that is not in the commercially permitted fresh-project seed MUST fail project creation with an actionable configuration error; it MUST NOT silently reintroduce a removed seed. The value is config-overridable (`~/.vlm_feedback_loop/config.yaml`) and is exposed to the frontend as `EnvironmentResponse.default_teacher_model_name` so the Confirm Defaults preselect never hardcodes a model name. The local recommendation is a separate hardware-aware quality policy (§1.5): Omni when its specialized NIM contract is supported, CR3-Nano next, then Cosmos Reason2 2B. Cosmos remains the required base family for Student Training (only entries with the `student_base` role); Omni is Teacher-only. Default Teacher selection prioritises commercially permitted model terms, certified multi-domain accuracy, ICL-over-time behavior, live-measured interactive latency, and live-probed reliability (image caps, schema fail rates).
 
 Backend MUST validate that any active selection references an entry with the corresponding role and that the model is reachable and compatible.
 
-**Capability re-probe:** the three capability fields (`structured_generation_support`, `thinking_toggle_support`, `visual_budget_support`) are checked once and persisted. If the NIM endpoint is updated (new model version, new capabilities), the user MUST be able to re-probe without deleting and re-adding the model config. A re-probe action (§10.2.12) resets all three fields to `unknown` and re-runs: the structured-generation probe (§6.2), the thinking override acceptance check (§6.7.4, only when `thinking_toggle.mode` is request-based), and the visual-budget probe (§6.9.2). Re-probe MUST NOT be allowed while the model config is in active use by a running evaluation, batch labeling run, or training job.
+**Capability re-probe:** the three capability fields (`structured_generation_support`, `thinking_toggle_support`, `visual_budget_support`) are checked once and persisted. If the NIM endpoint is updated (new model version, new capabilities), the user MUST be able to re-probe without deleting and re-adding the model config. A re-probe action (§10.2.12) resets all three fields to `unknown` and re-runs: the structured-generation probe (§6.2), the thinking override acceptance check (§6.7.4, only when `thinking_toggle.mode` is request-based), and the visual-budget probe (§6.9.2). Re-probe MUST NOT be allowed while the model config is referenced by a `queued`, `running`, or `canceling` evaluation/Batch run, or by an active training job. A paused Batch run owns a runtime snapshot and does not block re-probe.
 
 Retry MAY override Teacher and/or Guidance per-attempt; per-attempt override support is required.
 
@@ -950,7 +1002,7 @@ Pre-ingest deduplication, NSFW filtering, and metadata enrichment (e.g., via NeM
 - Provider resolution under `EMBEDDING_PROVIDER=auto` (the default) is a fallback cascade: **(1)** a healthy local embedding NIM deployment — recorded on `EmbeddingDeploymentConfig` (§13.17) by the Mode C deploy flow and live-verified at probe time — is the **default whenever present**; **(2)** the hosted embedding NIM at the same base URL as Teacher (`/v1/embeddings`), using the same hosted NIM API key (no additional credential); **(3)** `none` — the review selector runs in pHash-diverse mode (§5.6). Explicit `EMBEDDING_PROVIDER` values pin a single arm and never fall through. The supported model is NVIDIA NeMo Retriever VL 1B v2 (`nvidia/llama-nemotron-embed-vl-1b-v2`, 2048-dim, requires `input_type` in the request body). Model details and image input format are defined in §2.3 "Embedding NIM endpoint."
 - The system resolves the provider by probing at project creation or first ingest (lightweight call to `/v1/embeddings` with minimal input), walking the cascade in order. The local arm is verified with a live request against the recorded endpoint — never trusted from the config record alone — so a stale record (container stopped, displaced, or crashed) fails the verify and the cascade falls through to hosted. If no arm succeeds, set `embedding_provider=none`; the review selector continues with pHash-diverse mode (§5.6). The embedding worker sends requests to the resolved provider's endpoint: the local NIM is unauthenticated (no bearer header — a keyless GPU-only host gets semantic embeddings), while the hosted arm authenticates with the hosted NIM API key.
 - **Re-resolution on the healthy transition:** when the local embedding NIM turns healthy, the system re-resolves the provider for every non-archived project and restarts workers where examples are still unembedded — projects created before the NIM finished starting flip to the local provider without waiting for the next ingest or backend restart. When the NIM stops or dies, the config reset (below) plus the live verify make the next probe fall back to hosted.
-- **Local embedding NIM deployment (§1.5 Mode C):** the system deploys the embedding NIM locally using the same Docker orchestration as local Teacher deployment. Pinned image: `nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0` (NeMo Retriever VL 1B v2; 1B parameters). NIM 2.0.0 preserves the model, modalities, and OpenAI-compatible API while replacing the legacy runtime with automatic architecture-aware kernels; NVIDIA documents an approximately 5.6–9.3 GiB optimized footprint across supported compute capabilities and a 10 GB non-optimized compatibility floor, so the Blueprint seeds a conservative 10 GB eligibility floor. The orchestrator pins `NIM_PRECISION=fp16` because the image's unset-precision SM120 path exits while requiring a cuDNN plan directory that its entrypoint skips creating, and points `NIM_MODEL_PATH` below the persistent `/opt/nim/.cache` mount instead of the disposable `/model/embed` default. Live RTX PRO 6000 Blackwell validation returned a finite 2,048-dimensional image vector at 6.3 GiB VRAM. The embedding NIM deploys to the lowest-indexed **free** GPU at/above that floor — including hosts whose every GPU is below the Teacher floors, which run local embeddings with a hosted Teacher (§1.5 placement policy). On successful deployment, the system sets `embedding_provider=self_hosted_nvclip` (enum value name retained for backwards compatibility) and configures the local endpoint URL automatically; on stop, displacement, or startup failure, the config resets to `provider=none` so the environment assessment and the probe cascade stop advertising a dead endpoint. Local embedding NIM deployment eliminates hosted API rate limits and hosted transport constraints for embedding computation. Switching between hosted and local endpoints serving the same model at the same dimension never invalidates stored embeddings — the no-recompute rule stays keyed on model identity (§5.5.3).
+- **Local embedding NIM deployment (§1.5 Mode C):** the system deploys the embedding NIM locally using the same Docker orchestration as local Teacher deployment. Pinned image: `nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0` (NeMo Retriever VL 1B v2; 1B parameters). NIM 2.0.0 preserves the model, modalities, and OpenAI-compatible API while replacing the legacy runtime with automatic architecture-aware kernels. Its support matrix validates specific GPU SKUs; the smallest listed devices, L4 and A10G, have 24 GB, so the Blueprint seeds a 24 GB eligibility floor. Memory alone does not establish support. The orchestrator pins `NIM_PRECISION=fp16` because the image's unset-precision SM120 path exits while requiring a cuDNN plan directory that its entrypoint skips creating, and points `NIM_MODEL_PATH` below the persistent `/opt/nim/.cache` mount instead of the disposable `/model/embed` default. Live RTX PRO 6000 Blackwell validation returned a finite 2,048-dimensional image vector at 6.3 GiB VRAM. The embedding NIM deploys to the lowest-indexed **free** GPU at/above that floor — including supported hosts whose every GPU is below the Teacher floors, which run local embeddings with a hosted Teacher (§1.5 placement policy). On successful deployment, the system sets `embedding_provider=self_hosted_nvclip` (enum value name retained for backwards compatibility) and configures the local endpoint URL automatically; on stop, displacement, or startup failure, the config resets to `provider=none` so the environment assessment and the probe cascade stop advertising a dead endpoint. Local embedding NIM deployment eliminates hosted API rate limits and hosted transport constraints for embedding computation. Switching between hosted and local endpoints serving the same model at the same dimension never invalidates stored embeddings — the no-recompute rule stays keyed on model identity (§5.5.3).
 
 #### 5.5.2 Background Computation (Non-blocking)
 
@@ -964,7 +1016,7 @@ Pre-ingest deduplication, NSFW filtering, and metadata enrichment (e.g., via NeM
   1. At the start of background embedding computation (after ingestion completes), run the pHash-diverse selection algorithm (Appendix A.3, using `sim_phash`) over all examples without a CLIP embedding (regardless of state) with an empty history to produce a deterministic full ordering.
   2. Enqueue images for CLIP computation in that order.
   3. Process the queue sequentially (or in small batches preserving order). As each embedding completes, persist it in the `ClipEmbedding` table (§13.17) and set `clip_embedding_present=true` on the Example record.
-  4. **Incremental ingestion:** if new images are ingested while CLIP computation is in progress, append the new images to the end of the queue. The new images already have pHash (computed inline at ingest), so they can be interleaved into the remaining queue using pHash diversity relative to already-queued items, or simply appended (simpler; the existing queue already covers the original corpus).
+  4. **Incremental ingestion:** if new images are ingested while CLIP computation is in progress, append the new images to the end of the queue. Their pHash values may still be pending in the independent ingest sweep, so the embedding worker MUST NOT assume the signal exists; simple append is the canonical behavior.
   5. **Resumability:** if computation is interrupted (system restart, transient errors), resume from the first example without a CLIP embedding in the original queue order. Already-computed embeddings are persisted and not recomputed.
 
 - **CLIP switchover:** the selector upgrades from pHash-diverse to CLIP-diverse mode (when `REVIEW_SELECTION_MODE=auto`) once the number of eligible examples with CLIP embeddings reaches `CLIP_SWITCHOVER_MIN_COUNT` (default: 50). Below this count, pHash-diverse mode provides adequate visual diversity without constraining the selector to a small subset of CLIP-computed examples. Above this count, the semantic signal from CLIP is meaningfully better and covers enough of the corpus for effective diversity selection. The switchover is seamless; the selector checks the count before each selection.
@@ -1002,15 +1054,18 @@ Cache lifecycle:
 
 This design is the best fit for the spec's architecture: single-user, SQLite-per-project, thousands-to-tens-of-thousands scale, incremental ingest.
 
-### 5.6 pHash Computation (Inline at Ingest)
+### 5.6 pHash Computation (Background Sweep after Ingest)
 
 #### 5.6.1 Computation
 
-- pHash MUST be computed inline during image ingestion as part of the ingest pipeline (not background).
+- `POST .../examples:ingest` MUST create skeleton Example rows with
+  `phash=null`, return **202 Accepted**, and dispatch restartable background
+  pHash work. The worker MUST scan pending rows in bounded batches and persist
+  each completed hash in a short transaction.
 - pHash is a CPU-only operation with no external dependency (no NIM call, no network, no GPU).
 - The system MUST use DCT-based perceptual hashing producing a 64-bit hash. This is the most widely used variant and provides the best quality among standard pHash algorithms. The algorithm is a permanent commitment: project databases are "upgradeable, not disposable" (§1.8), so persisted hashes must remain compatible across versions. The algorithm identifier `dct_phash_64` MUST be recorded on the Project record so that a future migration can detect and recompute if the algorithm ever changes.
 - The resulting hash MUST be stored as a hex-encoded string on the Example record (`phash` field, §4.2).
-- pHash computation failure for an individual image MUST NOT fail the ingestion; log the failure and set `phash` to null for that image. The selector treats images without pHash the same as it treats images without CLIP embeddings in CLIP-diverse mode: they are still eligible for selection but cannot contribute to or benefit from diversity scoring.
+- pHash computation failure for an individual image MUST NOT fail the ingestion; log the failure and leave `phash` null for that image. Pending/failed rows remain eligible through the selector's deterministic no-signal fallback but cannot contribute to or benefit from diversity scoring.
 
 #### 5.6.2 Similarity
 
@@ -1044,11 +1099,11 @@ SSE events:
 
 - `ingest_progress` — emitted per batch with `{processed, total, pass_index}`.
 - `ingest_completed` — emitted once at the end with `{processed, total}` (covers all passes).
-- `run_failed` — not emitted by this worker; per-row pHash failures leave the row at `phash=null` and the sweep continues. The review selector's `compute_phash_diverse_order` already skips `phash=null` rows (Appendix A.3), so a permanently-bad image is silently ignored by selection rather than fatal to the project.
+- `run_failed` — not emitted by this worker; per-row pHash failures leave the row at `phash=null` and the sweep continues. The review selector scores only rows with the active signal and falls back to deterministic `example_key` order when every candidate hash is null (Appendix A.3), so a permanently bad image remains reviewable rather than fatal to the project.
 
 **Semantic guarantees preserved:**
 
-- pHash is *always populated before the example is selected for labeling.* The selector skips `phash=null` rows so they cannot reach the SME until the sweeper backfills them.
+- pHash work never blocks labeling. The selector uses available hashes and a deterministic no-signal fallback while rows are pending or permanently null.
 - pHash is *still CPU-only with no external dependency* (§5.6.1 still describes the algorithm and storage format authoritatively).
 - pHash computation failure for an individual image *still does not fail ingestion* (§5.6.1) — the failure mode shifts from "row created with phash=null inside the endpoint" to "row created with phash=null at the endpoint, sweep attempts compute, leaves at null on failure." End-state semantics identical.
 
@@ -1061,7 +1116,7 @@ SSE events:
 ### 6.1 Guidance Creation and Image Ingestion
 
 - Create Guidance (new Guidance version record; Guidance records are immutable once persisted).
-- Ingest images into project (Example records: `storage_ref`, `ingested_at`, `source_metadata`). pHash MUST be computed inline during ingestion (§5.6).
+- Ingest images into project (Example records: `storage_ref`, `ingested_at`, `source_metadata`). The 202 response MUST trigger restartable background pHash and optional CLIP computation (§§5.5–5.6).
 - After ingestion, the system MUST trigger background CLIP-style embedding computation for newly ingested examples using the project's configured embedding provider (default: hosted embedding NIM, NeMo Retriever VL 1B v2). Embedding computation failure for individual images MUST NOT fail the ingestion and MUST NOT block labeling.
 - Cold start supported: projects may begin with `Verified = 0`; first Verified examples created via Accept/Edit.
 
@@ -1091,7 +1146,7 @@ Selection determinism by purpose:
 
 ICL selection size:
 
-- **Per-model depth default (`ModelConfig.default_icl_max_examples: int | null`):** each catalog entry MAY carry a default ICL depth cap. The effective selection cap MUST be resolved as: an explicit `icl_max_examples` override (a per-run API field, or a non-null `ICL_MAX_EXAMPLES` setting) wins outright when present — in either direction, so diagnostic depth sweeps can exceed the model default; otherwise the model's `default_icl_max_examples` applies; otherwise (both null) selection is uncapped. Resolution MUST happen at the single shared invocation funnel (`prompt_service.invoke_teacher`) so the proposal, evaluation, and batch labeling pipelines cannot drift. Adaptive-K (step 2 above) still trims per query *within* the effective cap — the default bounds the adaptive mechanism, it does not replace it — and the token/image budget pruning below still applies after selection. *Empirical basis (July 2026 cross-model depth studies; evidence retained in the project's internal engineering archive): useful ICL depth is a model-family property, not a task property. Seeded defaults: Nemotron Nano VL 2; Nemotron 3 Nano Omni 4 (a substantive demonstration ceiling, with Adaptive-K retaining shallower per-query choices); Cosmos CR3 nano/super 8 (monotonic-up through the ~8-shot band in-capacity, overshoot only ≥16); Cosmos CR2-2B 8 (collapses at 16-shot); Cosmos CR2-8B 16 (the only model measured to keep gaining at 16); MiniMax-M3 8 (adaptive operating points averaged 2.5–5.5 examples across the certified five-dataset campaign; a same-pool VisA recheck averaged 5.97 at this ceiling and recovered the prior operating point); Mistral Large tier 2 (ceiling-class teachers are depth-insensitive, so shallow is the cost floor). Null for unmeasured models (operator-registered entries).*
+- **Per-model depth default (`ModelConfig.default_icl_max_examples: int | null`):** each catalog entry MAY carry a default ICL depth cap. The effective selection cap MUST be resolved as: an explicit `icl_max_examples` override (a per-run API field, or a non-null `ICL_MAX_EXAMPLES` setting) wins outright when present — in either direction, so diagnostic depth sweeps can exceed the model default; otherwise the model's `default_icl_max_examples` applies; otherwise (both null) selection is uncapped. Resolution MUST happen at the single shared invocation funnel (`prompt_service.invoke_teacher`) so the proposal, evaluation, and batch labeling pipelines cannot drift. Adaptive-K (step 2 above) still trims per query *within* the effective cap — the default bounds the adaptive mechanism, it does not replace it — and the token/image budget pruning below still applies after selection. *Empirical basis (July 2026 cross-model depth studies; evidence retained in the project's internal engineering archive): useful ICL depth is a model-family property, not a task property. Seeded defaults: Nemotron Nano VL 2; Nemotron 3 Nano Omni 4 (a substantive demonstration ceiling, with Adaptive-K retaining shallower per-query choices); Cosmos CR3 nano/super 8 (monotonic-up through the ~8-shot band in-capacity, overshoot only ≥16); Cosmos CR2-2B 8 (collapses at 16-shot); Cosmos CR2-8B 16 (the only model measured to keep gaining at 16). Historical/operator-created MiniMax M3 records retain 8 and retired Mistral Large records retain 2. Null for unmeasured current seeds.*
 - If `ICL_MAX_EXAMPLES` is set, selection MUST return at most `ICL_MAX_EXAMPLES` examples (it is an explicit override: it also replaces any per-model default, above).
 - If the selected ICL set exceeds the per-model token budget or image budget (`max_images_per_request − 1`, §6.7), prompt packing MUST drop examples from the END of the selection-ordered list — **relevance-tail pruning**: the tail is the least query-similar exemplar (oldest, in the embedding-less newest-first degrade), so budget enforcement removes the weakest corrective signal first. Token pruning may empty the ICL set entirely; the invocation then proceeds at the cold-start render.
 - **Bookend presentation happens after all pruning.** For three or more retained examples, the most relevant example remains first and the second-most relevant moves to the final position; every other retained example keeps its relative order in the middle. Thus `[rank1, rank2, rank3, rank4]` renders as `[rank1, rank3, rank4, rank2]`. With zero, one, or two examples, order is unchanged. Selection, depth, token, and image pruning always operate on relevance order first, so bookending can never protect a weak example from pruning.
@@ -1331,7 +1386,7 @@ Eligibility:
 Selection strategy:
 
 - If CLIP embeddings available and mode is `auto` or `clip_diverse`: use CLIP-diverse algorithm (Appendix A.3).
-- Otherwise: use pHash-diverse algorithm (Appendix A.3, substituting pHash hamming similarity for cosine similarity). pHash is always available (§5.6).
+- Otherwise: use the pHash-diverse algorithm when hashes are available (Appendix A.3, substituting pHash hamming similarity for cosine similarity), with newest-first fallback while the background signal is pending (§5.6).
 
 Skip advances review selector and transitions example to `Omitted`. Retry does not advance review selector.
 
@@ -1378,18 +1433,19 @@ All three cards (Description, SchemaCore, Rules) are always visible. On first lo
 
 **Starter template dropdown:**
 
-A labeled dropdown (**"Start from:"**) above the three cards (not inside a card). Options: Blank (default), Classification, Multi-label classification, Attribute extraction, Damage severity assessment, Recycling classification, Coarse grocery classification. Selecting a template pre-fills Description and proposes a starter schema in SchemaCore. The dropdown defaults to Blank. Once the SME edits any content, the template selection is irrelevant; everything is fully editable and the dropdown has no further effect.
+A labeled dropdown (**"Start from:"**) above the three cards (not inside a card). Options: Blank (default), Classification, Rock, paper, scissors, Multi-label classification, Presence and count, Packaging information audit, Industrial anomaly inspection. Selecting a template pre-fills Description, proposes a starter schema in SchemaCore, and pre-fills Rules. The dropdown defaults to Blank. Everything remains fully editable. If the SME chooses another template after editing, the UI MUST ask before replacing the current Description, Schema, and Rules; canceling MUST preserve the draft and restore the applied selection.
 
-The generic templates use placeholder values; the two dataset-specific templates carry the real class list for the bundled example datasets so an operator can start labeling them without retyping the schema.
+The generic classification templates use unmistakable `replace_me_*` placeholder values. Dataset-referenced templates carry real task contracts: the repository's bundled rock-paper-scissors walkthrough, public Open Food Facts packaging images, and the public VisA industrial-anomaly dataset. The selector shows one concise explanation for the applied choice. Dataset-referenced choices additionally show the dataset name, scope, license, and an external source link when one exists; these details are supporting context and are not prefixed into the option label. The repository bundles no additional sample data for Open Food Facts or VisA.
 
 Template definitions:
 
-- **Classification:** Description: *"Classify each image into one category."* Core: `category: enum` (placeholder values).
-- **Multi-label classification:** Description: *"Select all labels that apply to each image."* Core: `labels: enum_set` (placeholder values).
-- **Attribute extraction:** Description: *"Extract structured attributes from each image."* Core: `attribute_1: string`, `attribute_2: boolean` (placeholder fields).
-- **Damage severity assessment:** Description: *"Classify visible damage types, identify the primary damage, and rate overall severity."* Core: `primary_damage_type: enum` [crush, rip, tear, leak, dent, scratch], `damage_types_present: enum_set` [crush, rip, tear, leak, dent, scratch], `severity: integer` (min: 0, max: 4). Aux: `fragile_content: boolean`, `hazmat_indicators: boolean`.
-- **Recycling classification:** Description: *"Classify each image of a discarded item into its recyclable material category."* Core: `material: enum` [cardboard, glass, metal, paper, plastic, trash] (the TrashNet classes).
-- **Coarse grocery classification:** Description: *"Classify each grocery product image into one product category."* Core: `product_category: enum` [BEANS, CAKE, CANDY, CEREAL, CHIPS, CHOCOLATE, COFFEE, CORN, FISH, FLOUR, HONEY, JAM, JUICE, MILK, NUTS, OIL, PASTA, RICE, SODA, SPICES, SUGAR, TEA, TOMATO_SAUCE, VINEGAR, WATER] (the 25 Freiburg Groceries classes).
+- **Blank:** empty Description, Schema, and Rules.
+- **Classification:** Description: *"Classify each image into one category."* Core: `category: enum` [`replace_me_a`, `replace_me_b`]. Rules instruct the SME to replace both values, assign exactly one category, and Skip rather than invent a category when the image cannot be classified confidently.
+- **Rock, paper, scissors:** Description: *"Classify the hand gesture in each image as rock, paper, or scissors."* Core: `category: enum` [rock, paper, scissors]. Rules define the visible gesture for each value, identify the primary foreground hand as the subject, and direct the SME to Skip occluded or ambiguous gestures. Dataset context: bundled 15-image walkthrough, CC BY 2.0.
+- **Multi-label classification:** Description: *"Select all labels that apply to each image."* Core: `labels: enum_set` [`replace_me_a`, `replace_me_b`]. Rules instruct the SME to replace both values, select every visibly supported label, use an empty set when none apply, and avoid near-synonym labels.
+- **Presence and count:** Description: *"Determine whether the target object is visible in each image and count the visible instances."* Core: `target_present: boolean`, `target_count: integer` (min: 0). Rules require the SME to name the real target, keep the boolean/count pair consistent, define how partial instances are counted, and Skip images that cannot be counted reliably.
+- **Packaging information audit:** Description: *"Read each food-packaging photo, identify the dominant language of the visible text, and determine whether a nutrition-information panel is visible."* Core: `language_on_packaging: enum` [fr, en, es, de, it, nl, other], `contains_nutrition_table: boolean`. Rules define dominant language from legible words, the visible structure required for a nutrition panel, and when unreadable text requires Skip. Dataset context: Open Food Facts images, open product-packaging photos with extracted text, CC BY-SA images, source `https://openfoodfacts.github.io/openfoodfacts-server/api/aws-images-dataset/`; no images are bundled.
+- **Industrial anomaly inspection:** Description: *"Inspect each product image from the VisA dataset, identify the object category, and determine whether a visible manufacturing anomaly is present."* Core: `object_category: enum` [candle, capsules, cashew, chewinggum, fryum, macaroni1, macaroni2, pcb1, pcb2, pcb3, pcb4, pipe_fryum], `has_anomaly: enum` [no, yes]. Rules distinguish visible surface/structural flaws from pose, lighting, and ordinary appearance differences and direct the SME to Skip insufficient evidence. The template deliberately omits free-text defect description and the source annotation's 39-value defect taxonomy: prior Blueprint runs found that taxonomy synonym-fragmented and poorly suited to reliable exact-match evaluation, while optional rationale notes already cover explanatory evidence. Dataset context: Visual Anomaly (VisA), 10,821 images across 12 object categories, CC BY 4.0, source `https://github.com/amazon-science/spot-diff`; no images are bundled.
 
 All templates leave rationale notes disabled. The SME may opt in with the Guidance toggle after selecting any template.
 
@@ -2070,7 +2126,7 @@ ICL baseline tracking: the baseline is the ICL-eligible count at the most recent
 
 **Execution:**
 
-- **Configuration snapshot:** when an evaluation starts, all project configuration referenced by the run MUST be read once and persisted on the Run Record: `teacher_model_config_id`, `active_guidance_id`, `labeling_generation_preset_key`, `thinking_default_on`, `visual_budget_preset_key`, and the effective **Inference Contract** (`output_field_mode`, `icl_field_mode`, `icl_max_examples`; §6.11). The snapshot MUST also record `icl_eligible_count_at_start` (the number of ICL-eligible Edits at run creation). Configuration changes made after run creation MUST NOT affect the in-flight run. This ensures reproducibility: every run's results are attributable to a single, immutable configuration snapshot. Two runs are only directly comparable if their effective Inference Contracts match.
+- **Configuration snapshot:** when an evaluation starts, all semantic project configuration referenced by the run MUST be read once and persisted on the Run Record: `model_config_id`, `guidance_id`, `generation_preset_key`, `thinking_mode_effective`, `visual_budget_preset_key`, the effective **Inference Contract** (`output_field_mode`, `icl_field_mode`, `icl_max_examples`; §6.11), and a credential-free `runtime_config_snapshot`. That snapshot contains every mutable, result-shaping ModelConfig and NIM endpoint input consumed by inference plus the concrete sampling, visual-budget, token-budget, ICL-selection, and image-downscale values. It MUST also record `icl_eligible_count_at_start` (the number of ICL-eligible Edits at run creation). Later semantic configuration changes, capability re-probes, and endpoint rebinding MUST NOT affect the run. Credentials, filesystem authorization, timeouts, retries, concurrency, rate limiting, and emergency capability kill switches remain live operational policy and MUST NOT be persisted in the snapshot. Each Operation Record persists the exact ICL example keys and prompt hash because eligible data and embedding availability may evolve while a run is active. Two runs are only directly comparable if their effective Inference Contracts match.
 - Evaluations MUST run in the background and MUST NOT block Interactive Labeling.
 - Evaluation inferences MUST run concurrently. Concurrency is provider-aware and configurable: hosted endpoints use `EVAL_CONCURRENCY_HOSTED` (default: 1, rate-limit politeness); self-hosted/local NIMs use `EVAL_CONCURRENCY_SELF_HOSTED` (default: 8).
 - **Sequential retry pass:** after the concurrent burst completes, if any per-example inferences failed (`timeout`, `endpoint_error`, or `schema_invalid` after exhausting per-invocation retries per §11), the system MUST retry each failed example sequentially (concurrency=1). Sequential retry avoids the rate-limit storm that may have caused the original failure. Each retry creates a new Operation Record linked to the original via `retry_of_inference_invocation_id`. If any example still fails after the sequential retry, the run is marked **incomplete**.
@@ -2194,7 +2250,7 @@ TAO-sourced quality results use the system's canonical Core-field evaluator for 
 
 The Compare & Benchmark screen (`CompareBenchmarkPage.tsx`) reads results from evaluation runs directly: the Teacher accuracy baseline is the most recent completed run whose Inference Contract equals the fixed Teacher contract (§6.11) and that carries no `student_model_config_id`; each Student card reads its TAO-rescored quality run (`quality_evaluation_run_id`) and its NIM serving run (`serving_evaluation_run_id`, which carries the `metrics.benchmarks` latency sweep).
 
-Every Teacher identity on Compare's baseline card and chart MUST come from the Teacher snapshotted by that selected run's `model_config_id`, never the project's mutable current Teacher. Student deltas MUST be computed from and described as relative to that historical Teacher baseline. If the current Teacher differs, the screen MUST keep the historical attribution and disclose that the baseline predates the current Teacher. Copy describing a forthcoming local-NIM displacement continues to name the current Teacher because that operation acts on live project configuration, not the historical baseline.
+Every Teacher identity on Compare's baseline card and chart MUST come from the Teacher snapshotted by that selected run's `model_config_id`, never the project's mutable current Teacher. Student deltas MUST be computed from and described as relative to that historical Teacher baseline. If the current Teacher differs, the screen MUST keep the historical attribution, name the current Teacher separately, and direct the SME to run a fresh evaluation to refresh the baseline. Copy describing a forthcoming local-NIM displacement continues to name the current Teacher because that operation acts on live project configuration, not the historical baseline.
 
 **Absent from v1.0 — evaluation suites and the Student+ICL arm.** Students deploy and are evaluated bare (`icl_mode="disabled"`; F-W7 in §9.5.2), so an evaluation-suite grouping has no purpose in the public schema. Section number retained so existing cross-references stay resolvable.
 
@@ -2267,11 +2323,25 @@ Non-goals:
 
 ### 8.2 Batch Labeling Run Execution
 
+**Endpoint-use confirmation (UI policy boundary).** The Batch pre-run screen
+MUST resolve the selected Teacher's `NimEndpointResponse.usage_policy` before
+enabling launch and display it in the configuration summary. When the policy is
+`evaluation_only`, clicking **Run Batch Labeling** MUST open a confirmation
+immediately before the create request. The confirmation states that NVIDIA API
+Catalog credits, including additional trial credits, do not authorize
+production use; offers **Continue evaluation**, **Configure production
+endpoint**, and **Cancel**; and links NVIDIA's API Trial Terms. Continue is the
+only action that creates the run. An `operator_managed` endpoint launches
+without this confirmation. `operator_managed` means that entitlement is the
+operator's responsibility; it is not a Blueprint assertion that the endpoint
+is commercially licensed. This disclosure is separate from the Teacher-quality
+gate and does not change the Batch API's server-side readiness rules.
+
 A run MUST:
 
 1. Verify the Scale-Up Readiness Gate: `gate_status` MUST be `ready`. If not, the system MUST reject the run request with a message referencing the gate (§7.3).
 2. Generate `batch_label_run_id`.
-3. **Snapshot configuration:** read and persist on the Run Record: `teacher_model_config_id`, `active_guidance_id`, `labeling_generation_preset_key`, `thinking_default_on`, `visual_budget_preset_key`. All subsequent steps in this run MUST use the snapshotted values, not live project defaults. Configuration changes made after run creation MUST NOT affect the in-flight run.
+3. **Snapshot configuration:** read and persist on the Run Record: `model_config_id`, `guidance_id`, `generation_preset_key`, `thinking_mode_effective`, `visual_budget_preset_key`, and a credential-free `runtime_config_snapshot` containing every mutable, result-shaping ModelConfig and NIM endpoint input consumed by inference plus the concrete sampling, visual-budget, token-budget, ICL-selection, and image-downscale values. All subsequent steps in this run MUST use those semantic values, not live project defaults. Credentials, filesystem authorization, timeouts, retries, concurrency, rate limiting, and emergency capability kill switches remain live operational policy. The v1_0003 migration freezes valid non-terminal legacy NIM runs in snapshot version 1; startup upgrades resumable Batch snapshots to version 2 with the then-current semantic Settings before serving, or fails the affected run closed.
 4. Resolve Generation Controls and Visual Budget from the snapshotted values (§6.7, §6.9). Seed injection uses `batch_label_run_id` as `scope_id` per §2.1 seed policy. Visual budget MUST use the snapshotted preset for all examples (no per-example variation).
 5. Select input examples: by default, all examples with `state="Unlabeled"` (excluding `state="Omitted"`). When `include_auto_labeled=true`, also include examples with `state="Auto-Labeled"` — their existing Label records are replaced with new Auto-Labeled labels from the current Teacher+Guidance+ICL setup (prior Label records are overwritten; prior Operation Records are preserved for audit). This is useful when Guidance has improved (Description/Rules refined, ICL pool grown) and the SME wants Auto-Labeled data regenerated under the improved setup without requiring a Core schema change. When `BATCH_LABEL_RUN_LIMIT` is set, cap the run at that many examples (selected in ingestion order). Default: null (all eligible).
 6. For each selected example (dispatched with provider-aware concurrency: hosted endpoints use `BATCH_LABEL_CONCURRENCY_HOSTED` (default: 1, rate-limit politeness); self-hosted/local NIMs use `BATCH_LABEL_CONCURRENCY_SELF_HOSTED` (default: 8) — same policy as evaluation, §7.1. A per-run `concurrency` override on the start request wins over both and is persisted on the Run Record so restart recovery resumes at the same width):
@@ -2284,8 +2354,10 @@ A run MUST:
   - Create or update a Label record with `label_status=auto_labeled`, `label_json` from the normalized output, `batch_label_run_id`, and `inference_invocation_id` linking to the operation record. Only schema-valid Core outputs produce Label records; schema-invalid outputs are recorded on the Operation Record only.
   - Set Example `state="Auto-Labeled"`.
 7. Provide resumability and idempotency:
-  - Run MUST be restartable without duplicating stored records (keyed by `{batch_label_run_id}:{example_key}`).
-8. **Circuit breaker:** the system maintains a consecutive failure counter that tracks endpoint-availability failures. Counter rules: `timeout` → increment; `endpoint_error` → increment; `schema_invalid` → ignore (does not increment, does not reset); successful example → reset to 0. With concurrent dispatch (step 6), "consecutive" is counted in completion order; when the counter trips, no new work is dispatched, already-in-flight requests complete and are recorded (a dispatch stop, not preemption — the same philosophy as the foreground-priority hold, §1.3), and the run pauses after they drain. If the counter reaches `BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD` (default: 10), the run MUST transition to `paused` with `paused_reason="circuit_breaker_threshold_reached"` and notify the user: *"Endpoint appears unreachable. [Resume] [Cancel]."* On **Resume**, the run transitions `paused` → `running`, the counter resets to 0, and processing continues from the next unprocessed example. On **Cancel**, the run transitions `paused` → `canceling` → `canceled`; already-persisted results are retained. The circuit breaker prevents burning through rate limits and API credits on a down endpoint. See §13.2.2 for the full batch labeling state machine.
+  - `{batch_label_run_id}:{example_key}` identifies one durable logical item. Restart resume MUST reuse its pending `inference_invocation_id`, not create a second Operation Record.
+  - A terminal success is complete only when the same transaction committed the Operation outcome, an Auto-Labeled Label carrying the exact run and invocation IDs, and `Example.state="Auto-Labeled"`. Later `Verified` or `Omitted` SME state also completes the item because human disposition supersedes the machine label.
+  - Recovery MUST validate that the frozen input list contains unique strings, exactly matches `examples_total`, and still resolves to the same project Examples before dispatch. It MUST retry torn or mismatched success under its original invocation ID and MUST fail closed on duplicate, foreign, invalid-status, or ambiguous operation lineage.
+8. **Circuit breaker:** the system maintains a consecutive failure counter that tracks endpoint-availability failures. Counter rules: `timeout` → increment; `endpoint_error` → increment; `schema_invalid` → ignore (does not increment, does not reset); successful example → reset to 0. With concurrent dispatch (step 6), "consecutive" is counted in completion order; when the counter trips, no new work is dispatched, including work released from a foreground-priority hold; already-in-flight requests complete and are recorded (a dispatch stop, not preemption — the same philosophy as the foreground-priority hold, §1.3), and the run pauses after they drain. The run snapshots `BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD` (default: 10), and each authoritative item transaction persists both the updated streak and a durable tripped latch with its Operation/domain outcome. The latch remains true if a later in-flight success drains and resets the streak, so automatic restart recovery preserves the dispatch stop. If the snapshotted threshold is reached, the run MUST transition to `paused` with `paused_reason="circuit_breaker_threshold_reached"` and notify the user: *"Endpoint appears unreachable. [Resume] [Cancel]."* On explicit **Resume**, the run transitions `paused` → `queued` and its executor claims `running`; that user action resets the streak and latch, and processing continues from the next unprocessed example. On **Cancel**, a paused run transitions directly to terminal `canceled`; already-persisted results are retained. The circuit breaker prevents burning through rate limits and API credits on a down endpoint. See §13.2.2 for the full batch labeling state machine.
 
 ### 8.3 ICL Behavior for Batch Labeling
 
@@ -2324,7 +2396,7 @@ Student Training is optional.
 - Known TAO/NIM constraints for reference (not enforced by this system's preflight):
   - NIM for VLMs does not support vGPU environments.
   - Cosmos Reason2 training: 8× A100 80 GB minimum (per NVIDIA Cosmos-Reason documentation; applies to both 8B and 2B unless independently validated otherwise).
-  - 200 GB free disk, Ubuntu 22.04 LTS, Driver 580.65.06+ (R580 branch), CUDA 13.0+. Note: TAO FTMS prerequisites documentation may reference the R570 driver branch, but TAO 6.26.3 containers use CUDA 13.0 which requires R580+. The R570 branch is insufficient.
+  - 200 GB free disk is the installation floor (500 GB practical minimum for one retained train/evaluate/quantize suite; 1 TB preferred for variants/retries). Ubuntu 22.04 LTS is NVIDIA's recommended FTMS 6.26.3 baseline; Ubuntu 24.04 LTS is also Blueprint-live-validated. Driver 580.65.06+ (R580 branch), CUDA 13.0+. Note: TAO FTMS prerequisites documentation may reference the R570 driver branch, but TAO 6.26.3 containers use CUDA 13.0 which requires R580+. The R570 branch is insufficient.
 
 ### 9.2 Training Data Sources
 
@@ -2343,6 +2415,13 @@ Each export artifact is a dataset folder containing:
 - `annotations.json`: the annotation file defining samples and conversations.
 
 Implementations MUST produce archives where every `images[*]` path in `annotations.json` resolves to an existing file in the media payload.
+
+Selection-time existence is not authority to read later. The exporter MUST
+re-authorize every source image under the current `IMAGE_ROOT` while assembling
+the archive and add bytes from that opened regular-file descriptor. A missing
+source MAY be omitted from both annotations and media during selection; a
+policy denial or a source that becomes unavailable after selection MUST fail
+the build and remove partial artifacts.
 
 #### 9.3.2 `annotations.json` Structure (Normative)
 
@@ -2458,11 +2537,20 @@ Seeded entries that are not provisioned remain visible and selectable with
 - `nvidia/cosmos3-nano-reasoner`
 - `nvidia/cosmos3-super-reasoner`
 
+Cosmos 3 Super remains a backend catalog/API Student base and historical
+Student records remain fully inspectable, but it is not selectable for a new
+run in the Training UI. Its qualified path requires Full-weight training and
+no post-training quantization. The Training UI exposes only the qualified LoRA
+matrix—Cosmos Reason2 2B/8B and Cosmos 3 Nano—until Full-weight is qualified
+across that supported UI matrix. Direct API callers remain subject to the
+backend training-mode and quantization compatibility checks below.
+
 At least one base must remain selected. The Scale-Up Hub's **Train a Student**
 button is navigation into this configuration and MUST remain enabled. Both the
 hub and Student Training screen call the backend preflight and render checking,
 ready, data-not-ready, and infrastructure-required states. **Start Training**
-repeats fail-closed TAO/workspace/timeout/data/role validation. An ordinary
+repeats fail-closed TAO/workspace/timeout/data/role validation, including the
+configured Test Pool minimum for the suite's held-out evaluation export. An ordinary
 missing selected base is non-blocking: the server creates a provisional
 TrainingSuite, navigates to Training Jobs, and provisions every selected
 missing base together as one setup stage.
@@ -2472,8 +2560,16 @@ missing base together as one setup stage.
 Each training run records:
 
 - `guidance_id`, pool version, training split definition, dataset export refs
-- resulting Student identifier registered in Student registry
+- resulting Student identifiers registered in the Student registry; every suite-created Student persists the immutable parent `training_suite_id`
 - `nim_vlm_release_version: string` (required on deployed Student record; pin NIM release for reproducibility)
+
+TrainingSuite responses MUST expose the training/evaluation example counts,
+the evaluation archive SHA-256 when available, and `student_model_ids[]`. These
+fields let Models & Results group the project-wide registry and determine
+whether two run groups have compatible evaluation evidence without reading
+workspace manifests in the browser. Existing suite-created Students are
+backfilled from their training TAOJob's `chain_id`; genuinely ad-hoc Students
+remain nullable and render in an unassigned historical group.
 
 Each Student variant MUST be deployable behind a NIM-compatible inference endpoint.
 
@@ -2484,13 +2580,28 @@ TAO runs and Student registrations MUST be represented as first-class records wi
 - **Quality validation (TAO-backed, preferred):** TAO `evaluate` runs automatically after training and after each quantization (§9.7.6). Produces accuracy metrics. No NIM deployment required. The system re-scores TAO per-sample predictions with the canonical Core-field evaluator for authoritative metrics. When TAO eval succeeds, the system flips the paired Student's `quality_status` to `"validated"` and records `quality_evaluation_run_id` pointing at the TAO RunRecord.
 - **Quality validation (NIM-backed fallback, narrow):** NIM-source evaluation MAY satisfy the quality gate **only** when one of the following holds, and never as a generic rescue for arbitrary TAO failures:
   - **Cold start / pending:** `quality_status="pending"` — no TAO eval has terminated yet (e.g., the project is operator-driven through NIM only, or the TAO chain has not finished). A successful NIM-source eval against the Test Pool promotes `quality_status` to `"validated"`.
+  - **Visible cold-start path:** a packaged Student with
+    `quality_status="pending"` remains visible on Compare with a pending-quality
+    explanation and **Deploy and benchmark** action. The action dispatches the
+    normal Student NIM lifecycle; hiding this record would make the permitted
+    NIM-only quality path unreachable from the product UI. Once dispatched,
+    the durable `serving_status="pending"` is authoritative across refresh and
+    SSE loss: Compare MUST keep polling, show an in-progress state, disable
+    project-wide benchmark actions, and offer no duplicate per-Student deploy.
+    A Blueprint-local NIM preflight, startup, or benchmark failure before a
+    quality result exists leaves `quality_status="pending"`; it is an
+    operational serving failure, not a measured quality failure. On retry the
+    backend also repairs the narrow legacy state where such a synthetic
+    `student_nim_local` evaluate row had incorrectly changed quality to
+    `"failed"`, preserving the pending-quality NIM path.
   - **TAO failure with a known upstream model-loader signature:** `quality_status="failed"` AND the prior failed TAO `evaluate` job's failure evidence (`error_ref`, `poll_error_ref`, `chain_halted_reason`, or `outputs.tao_logs_text`) matches a known upstream loader-gap pattern from `services.tao_failure_classifier.MODEL_LOADER_FAILURE_PATTERNS`. Two canonical references today: (1) the cosmos-rl 6.26.3 + Cosmos-Reason2 + Qwen3-VL-dense gap (documented 2026-05-04; evidence retained in the project's internal engineering archive), and (2) the cosmos-rl 6.26.3 + Cosmos-Reason2-8B vLLM weight-init gap (F43, 2026-05-13) — `ValueError: Following weights were not initialized from checkpoint:` listing `visual.blocks.*` + `language_model.model.layers.*` weight names that the cosmos-rl-bundled vLLM doesn't enumerate but NIM 1.6.0's vLLM loads cleanly. The full TAO-team-facing report is retained in the project's internal engineering archive. Other failure classes (dataset shape, OOM, transient infra, schema-validation crashes, etc.) leave `quality_status="failed"` — NIM eval is NOT a fallback for those.
-  - **Implementation:** `services/student_nim_lifecycle._promote_quality_from_nim_eval` consults `services.tao_failure_classifier.matches_known_loader_gap` before flipping `quality_status`. Conservative gate: empty/None failure evidence → no promotion. The promotion writes `quality_evaluation_run_id = <NIM_eval_run_id>` and the corresponding RunRecord carries `evaluation_source="nim"` with the same canonical Core-field metrics (Appendix A.2) plus the latency / throughput / profile-metadata that NIM eval provides for free.
+  - **Implementation:** `services/student_nim_lifecycle._promote_quality_from_nim_eval` consults `services.tao_failure_classifier.matches_known_loader_gap` before flipping `quality_status`. The classifier follows the TAO job that produced the served artifact: the `train` job for a baseline Student and the `quantize` job for a quantized Student, because the latter's failed paired `evaluate` is parented by `quantize`. It inspects the complete bounded 64 KB TAO failure-log payload retained by the polling service; a smaller classifier window MUST NOT discard a signature that the persisted evidence still contains. Conservative gate: empty/None failure evidence → no promotion. The promotion writes `quality_evaluation_run_id = <NIM_eval_run_id>` and the corresponding RunRecord carries `evaluation_source="nim"` with the same canonical Core-field metrics (Appendix A.2) plus the latency / throughput / profile-metadata that NIM eval provides for free.
+  - **Visible recovery path:** a packaged Student with `quality_status="failed"` remains visible on Compare—even when every Student in the project is quality-failed—and, until serving is pending or validated, exposes **Deploy for serving validation**. This dispatches the normal Student NIM lifecycle and renders its live stages. A reopened screen reconciles a persisted `serving_status="pending"` as in progress and MUST NOT offer a duplicate deploy action. The UI never decides whether the NIM result may recover quality; the backend applies the signature gate above. A non-matching TAO failure can become serving-validated but remains quality-failed and ineligible for production handoff.
   - **Failure-evidence capture (REQUIRED for the gate to be useful):** when a TAO `evaluate` reaches `failed`, the polling service MUST best-effort fetch the job's `:logs` body (TAO REST API Overview — `GET /api/v2/orgs/{org_name}/jobs/{job_id}:logs`) and persist the tail (≤ 64 KB) on `TAOJob.outputs.tao_logs_text`. Without this capture, the failure signature cannot be classified and the fallback degrades to "fail conservatively."
   - **Audit invariant:** when `quality_status` is already `"validated"` from a prior TAO eval, the NIM-source eval MUST NOT overwrite `quality_evaluation_run_id` — preserves the audit pointer back to the TAO RunRecord. Both run histories remain queryable.
-- **Serving validation (NIM-backed):** NIM deployment enables latency benchmarks, throughput testing, and profile metadata collection. The system attempts local NIM orchestration (§9.5.2); if that fails, an Action Request provides deployment details for external infrastructure. Serving validation flips `serving_status` and records `serving_evaluation_run_id` independently of the quality path.
+- **Serving validation (NIM-backed):** NIM deployment enables the production-representative real-image latency, throughput, and reliability comparison plus profile metadata collection. The system attempts local NIM orchestration (§9.5.2); if that fails, an Action Request provides cache-disabled deployment details for external infrastructure. Every configured load cell must complete its exact request count with zero failures before `serving_status` flips to `validated`; `serving_evaluation_run_id` and all failed-cell evidence are still recorded independently of the quality path. On an upgraded workspace, a persisted pre-AIPerf `serving_status="validated"` remains historical rather than being rewritten. Student API responses derive `serving_benchmark_current=false` and a blocker from its referenced run, Models & Results offers **Revalidate with AIPerf**, and both production handoff paths fail closed until the current contract passes.
 
-Quality validation establishes "did fine-tuning produce a better model?" Serving validation establishes "can this model serve in production, and at what cost?" The `deployment_handoff` Action Request (§10.3) requires `quality_status="validated"` AND `serving_status="validated"`; either source for quality is acceptable.
+Quality validation establishes "did fine-tuning produce a better model?" Serving validation establishes "can this model serve in production, and at what cost?" The `deployment_handoff` Action Request (§10.3) requires `quality_status="validated"`, `serving_status="validated"`, AND `serving_benchmark_current=true`; either source for quality is acceptable.
 
 **F-B7 amendment (2026-07-15) — Student invocations run at native image resolution.** Fine-tuned Students MUST be evaluated — and SHOULD be served — with the `native` Visual Budget preset (no `mm_processor_kwargs`): §9.3 training consumes images at native size, so any serve-time resize puts the Student off its training distribution. Inheriting the project's then-current Teacher-oriented `high_detail` resize override was measured live to collapse a healthy freiburg CR2-2B student from 0.95 EM (native, matching its FTMS evaluate at 0.90) to 0.367 on the identical 120-key holdout and checkpoint — the resize, not the prompt, was the entire dual-path disagreement after the F-W7 export fix. The Student NIM lifecycle's serving evaluation pins `visual_budget_preset_key="native"` (alongside the existing `icl_mode="disabled"` — together these are the training-parity contract); the corrected area-budget ladder remains for un-tuned Teacher perception. Deployment guidance: production serving of a Student should likewise send no image-resize processor kwargs.
 
@@ -2536,9 +2647,46 @@ Persist on Student registry record:
 - `checkpoint_packaging_status` ∈ {`pending`, `validated`, `failed`}
 - `nim_checkpoint_ref: string` (path/URI to NIM-loadable checkpoint directory)
 
+**Portable production deployment bundle.** A Student that passes the
+`deployment_handoff` quality, serving, checkpoint-packaging, and Inference
+Contract gates exposes
+`GET /v1/projects/{project_id}/student_models/{student_model_id}/deployment_bundle`.
+The response streams an `application/x-tar` attachment without materializing
+a second checkpoint copy. It contains:
+
+- the complete NIM-loadable payload from the validated checkpoint under
+  `checkpoint/`; TAO completion-only `status.json` and
+  `microservices_log.txt` artifacts are excluded because they are not model
+  inputs and may contain infrastructure context;
+- `manifest.json` with the pinned NIM image/release/profile, GPU and inference
+  contract, evaluation snapshot, and TAO/dataset lineage;
+- `SHA256SUMS` covering every checkpoint and generated deployment file;
+- an executable `run-nim.sh` that mounts the bundled checkpoint read-only,
+  forwards `NGC_API_KEY` by name only, and uses the same GPU, shared-memory,
+  user, model-size selector, and profile contract as local Student deployment;
+- `request-template.json`, reconstructed from the exact Guidance version and
+  effective controls of the successful serving evaluation, with one explicit
+  image-data placeholder and the authoritative structured-output schema;
+- an executable health + real-image inference verifier that injects the image,
+  calls NIM, parses the returned label JSON, and fails on a non-structured
+  response, plus a concise README.
+
+The bundle MUST NOT contain the licensed NIM runtime image or any credential.
+Its launch script pulls the exact pinned image from NGC using an
+operator-provided key. The checkpoint must resolve beneath the requested
+project directory and the exporter MUST reject symlinks, special files, path
+escape, a missing pinned runtime image, or any non-validated handoff state.
+The evaluation snapshot's Test Pool checksum MUST resolve from the held-out
+DatasetExport referenced by the evaluate job paired with the artifact-producing
+train or quantize job. `StudentModel.dataset_export_ids[]` remains training-data
+lineage and MUST NOT be overloaded with the held-out export merely to populate
+this checksum. Both `dataset_intent="evaluation"` (training-suite contract) and
+the public `dataset_intent="testing"` variant identify held-out Test Pool
+exports for this purpose.
+
 #### 9.5.2 NIM Local Deployment Orchestration
 
-The system attempts to deploy Student NIM containers locally on the backend host for evaluation and benchmarking. This is temporary infrastructure for the Compare & Deploy workflow, not a production deployment.
+The system attempts to deploy Student NIM containers locally on the backend host for evaluation and benchmarking. This is temporary infrastructure for the Compare & Deploy workflow, not a production deployment. A Student based on a multi-model shared image inherits `NIM_MODEL_SIZE` and validated non-secret `extra_container_env` from its base ModelConfig for preflight, actual launch, canonical handoff, and portable bundle. It does not inherit the base model's pinned `NIM_MODEL_PROFILE`, because that selector targets bundled base weights rather than the read-only custom checkpoint mounted through `NIM_MODEL_NAME`; NIM instead selects a checkpoint-compatible profile. Its `NIM_SERVED_MODEL_NAME` remains the Student-specific identity. Cosmos 3 Super pins `NIM_MAX_MODEL_LEN=65536`: its full-weight BF16 checkpoint used 62.63 GiB on the RTX PRO 6000 96 GB host, while the runtime's native 262,144-token setting required another 64 GiB of KV cache and could not start; the clamp fits the measured 20.47 GiB available cache and exceeds Blueprint prompt budgets.
 
 **NIM deployment preflight:**
 
@@ -2558,12 +2706,12 @@ Preflight result MUST be persisted: `nim_preflight_status` ∈ {`passed`, `faile
 The system manages the full NIM container lifecycle per variant:
 
 0. **Acquire GPU (F49 amendment, 2026-05-19).** Resolve the target device per §1.5. If the device has any `LocalNimDeployment` rows in `starting | running`, the orchestrator MUST stop them in lifecycle order (`running` before `starting`) before constructing the Student `docker run`. Each displaced deployment's `displaced_by_deployment_id` (the Student's `local_nim_deployment_id`) and `displaced_at` are persisted on its row for audit (§13.15). The Student preflight (above) is re-run AFTER displacement when the resident's role was a NIM on the target device so the GPU-memory check reflects post-displacement free memory. On multi-GPU hosts where the auto-placer found a free device, step 0 is a no-op.
-1. **Construct `docker run` command** from the StudentModel record: checkpoint path (`NIM_MODEL_NAME`), served model name (`NIM_SERVED_MODEL_NAME`), NIM cache path, NGC API key, port, `--shm-size=32GB`, `-u $(id -u)`, GPU allocation.
+1. **Construct `docker run` command** from the StudentModel record: checkpoint path (`NIM_MODEL_NAME`), served model name (`NIM_SERVED_MODEL_NAME`), NIM cache path, NGC API key, port, `--shm-size=32GB`, `-u $(id -u)`, GPU allocation, and `NIM_ENABLE_KV_CACHE_REUSE=0`. Cache reuse is disabled for the serving comparison because the same frozen workload is replayed at each concurrency; later cache hits would not be comparable to the first cell.
 2. **Start container** and begin polling `/v1/health/ready` (NIM startup includes runtime artifact build; allow up to `NIM_STARTUP_TIMEOUT_S`, default: 1200s).
 3. **Smoke inference:** send a minimal `/v1/chat/completions` request to confirm the model responds.
 4. **Register temporary endpoint** as a model config entry with the NIM-served URL and Student metadata.
 5. **Run NIM evaluation** against the Test Pool using the standard evaluation pipeline (§7.1) with `evaluation_source="nim"`.
-6. **Run latency benchmarks** at configured concurrencies (Appendix E). Collect `/v1/metrics` Prometheus metrics if available. Persist the sweep results onto the serving evaluation run's `metrics.benchmarks` — the `nim_benchmark_completed` SSE payload is a best-effort courtesy copy (per the SSE non-authoritativeness principle in §1), and the Compare & Benchmark ServingMatrix reads the persisted sweep from the run referenced by `serving_evaluation_run_id`, so it stays consistent after any reload or restart.
+6. **Run the production VLM serving benchmark** at configured concurrencies (Appendix E). Build the workload from the frozen Test Pool and the evaluated Student's active Guidance-derived prompt/schema and Inference Contract: select every image when the pool has at most 200 members, otherwise select 200 without replacement by a stable hash rank. The rendered production prompt hash MUST equal the prompt hash recorded by the immediately preceding serving evaluation; absent or drifted prompt provenance fails the benchmark before load is dispatched. Each concurrency replays that identical ordered image set exactly once through pinned AIPerf `raw_payload` mode. Requests use the Student's no-ICL/native-visual-budget serving controls and omit both `max_tokens` and `max_completion_tokens`. Collect client p50/p90/p99 latency, achieved RPS, request counts/failure percentage, token statistics when available, and best-effort `/metrics` evidence. Persist `metrics.benchmark_workload` provenance plus every `metrics.benchmarks` cell, including failed cells. Missing metrics are `null`, never fabricated zeroes. `serving_status="validated"` requires every configured concurrency to complete the exact request count with zero transport/HTTP/timeout failures and finite latency/RPS; quality promotion from step 5 remains independent when the serving sweep fails.
 7. **Stop container** after evaluation and benchmarks complete. The persistent NIM cache (`~/.cache/nim` or configured path, mounted to `/opt/nim/.cache`) is retained so subsequent startups skip the build step.
 8. **Repeat** for the next variant (one container at a time; GPU resources are shared).
 9. **Auto-restore displaced residents (F49 amendment, 2026-05-19).** After the Student container is stopped, iterate the deployments displaced by step 0 and best-effort re-deploy each using the original `role`, `model_config_id`, and `gpu_assignment`. Each restored deployment is health-polled up to `NIM_STARTUP_TIMEOUT_S`. Restoration failure surfaces as a warning on the StudentModel's `serving_evaluation_run_id` summary but does NOT fail `serving_status` — the benchmark itself succeeded and the operator can manually re-deploy via the NIM Configuration page. Auto-restore is per displaced deployment; an embedding NIM that was displaced by a Student deploy will also be restored.
@@ -2582,7 +2730,7 @@ The system generates a `student_nim_deploy` Action Request (§10.3) containing:
 - Health check and smoke test commands
 - A note that this is temporary evaluation infrastructure
 
-The SME copies the Action Request and sends it to their infrastructure team. Once the NIM endpoint is running, the SME registers the endpoint URL via the UI. The system then runs NIM evaluation and benchmarks against that endpoint.
+The SME copies the Action Request and sends it to their infrastructure team. Once the NIM endpoint is running with `NIM_ENABLE_KV_CACHE_REUSE=0`, the SME registers the endpoint URL and confirms `benchmark_kv_cache_reuse="disabled"`. The system then runs the same NIM evaluation and production benchmark against that endpoint; an external endpoint is not exempt from serving measurements.
 
 **NIM configuration defaults (Cosmos Reason2 custom deployment):**
 
@@ -2969,6 +3117,10 @@ Cosmos-RL supports LoRA-based fine-tuning and requires LoRA configuration to be 
 
 **F-B5 amendment (2026-07-14) — the persisted `lora_config` MUST reach the cosmos-rl wire.** Live evidence from the July 2026 live-validation window: every training job persisted `lora_config` (enable_lora=true, r16) while the cosmos-rl spec never carried a LoRA block — `policy.lora` defaulted to `None`, the trainer's parameter table logged every module TRAINABLE, and an 8B "LoRA" train OOM'd an A100-80GB on full-model optimizer state. Trainings were silently full fine-tunes while records (and this section) claimed LoRA. The contract is now: when `enable_lora=true`, the train action's spec MUST emit `specs.policy.lora` mapped onto cosmos-rl's `LoraConfig` field names — `lora_rank`→`r`, `lora_alpha`→`lora_alpha`, `lora_dropout`→`lora_dropout`, `lora_target_modules`→`target_modules`, `modules_to_save`→`modules_to_save` (nested `policy.*` dicts pass through TAO's spec mapper; `policy.parallelism` uses the same path). When `enable_lora=false` (the training-suite request's explicit opt-out, `POST …/training_suites` body field `enable_lora`), no `policy.lora` key is emitted — the legacy full-weight wire shape — and every chain job's persisted `lora_config` records the opt-out. Canonical implementation: `services.training_suite_service._build_train_payload`.
 
+**F-B12 amendment (2026-08-04) — training-mode compatibility MUST fail before TAO submission.** Live qualification of Cosmos 3 Super against `6.26.3-cosmos-rl` proved that the model's mandatory TP=8 path cannot partition the LoRA-wrapped `q_proj`/`v_proj` modules: PyTorch rejects the wrapper's dotted parameter names before the first training step. `POST …/training_preflight` and the suite's repeated server-side validation MUST therefore return a failed per-model `training_mode_compatible` check when Cosmos 3 Super is selected with `enable_lora=true` on that runtime. This restriction is version-scoped; a later Cosmos-RL runtime may restore LoRA only after independent qualification. Other compatible bases remain LoRA-first.
+
+**F-B14 amendment (2026-08-05) — the Training UI exposes only the qualified LoRA matrix.** Full-weight has not been qualified across the Student bases offered by the Training UI. The UI MUST therefore keep `enable_lora=true`, MUST NOT render the Full-weight selector, and MUST filter Cosmos 3 Super from its base-model choices. The backend `enable_lora=false` contract and Super compatibility checks remain intact for API compatibility, historical evidence, and future qualification. Restoring either UI choice requires an explicit live train→quantize(optional)→package→NIM qualification for the intended model matrix.
+
 Implementation notes:
 
 - `modules_to_save: ["visual"]` fully fine-tunes the vision encoder. There are compatibility constraints between some attention target modules and saving `visual`; implementations validate the combination before job submission.
@@ -3227,7 +3379,7 @@ The Blueprint supports **two provisioning paths**, with Blueprint self-service a
 
 Both paths produce the same end state: a populated workspace with registered base experiments keyed by `tao_base_experiment_id` on each `student_base` ModelConfig. The suite launcher checks that end state to decide whether Training Jobs needs a provisioning stage.
 
-**Per-training operational flow (every training suite, Blueprint-automated — unchanged across both paths).** The Blueprint's dataset upload service (§9.7.8.2) uploads each training suite's training + Test Pool evaluation archive into the workspace's S3 bucket before submitting any TAOJob. The TAOJob's `tao_create_job_request.specs` reference the uploaded S3 paths (training dataset) or dataset IDs (evaluation dataset), NOT the Blueprint host's local filesystem. Uploads are idempotent per `(workspace_id, dataset_export_id)` so that retrying a suite creation does not duplicate uploads. Upload failures are surfaced to the SME as a training-suite creation error (`409 tao_dataset_upload_failed`) with a retriable hint; completed uploads persist the resulting S3 URI on the `DatasetExport` record for auditability and reuse.
+**Per-training operational flow (every training suite, Blueprint-automated — unchanged across both paths).** Before export work, the launcher creates or adopts a durable TrainingSuite owner in `preparing` and links each completed training + Test Pool DatasetExport before workspace transfer. The Blueprint's dataset upload service (§9.7.8.2) validates and uploads each archive/sidecar pair into the workspace's S3 bucket before submitting any TAOJob. The TAOJob's `tao_create_job_request.specs` reference the uploaded S3 paths (training dataset) or dataset IDs (evaluation dataset), NOT the Blueprint host's local filesystem. Uploads are idempotent per `(workspace_id, dataset_export_id)` only when both objects match. A failed pre-chain transfer can therefore resume the same frozen export IDs and repair an incomplete pair without creating new object keys. Completed uploads persist the resulting S3 URI on the `DatasetExport` record for auditability and reuse. A synchronous ready-base creation failure returns `409 tao_dataset_upload_failed` with remediation. When first-use base provisioning has already returned a provisional suite, a later upload failure instead terminalizes that suite as `failed`; its GET response exposes the same error through `setup_error_ref` and the backend-derived recovery decision through `setup_retryable`.
 
 ##### 9.7.8.1a Self-service provisioning (DEFAULT)
 
@@ -3235,11 +3387,11 @@ Self-service is a UI + service contract with an optional eager CLI. The Blueprin
 
 - `POST /v1/projects/{project_id}/training_suites` performs server-side readiness validation. If every selected base is ready, it creates the ordinary suite directly. Otherwise it returns a provisional suite with `status="provisioning"`, `provisioning_run_id`, `provisioning_model_names[]`, null dataset-export ids, and no chains. The Training Job Monitor renders one NVIDIA-green **Provision Student Bases** step only when `provisioning_run_id` is non-null.
 - `POST /v1/projects/{project_id}/tao_base_experiment_provisioning` accepts the selected project-local Student-base ids, filters out ready bases, creates a durable `TAOBaseExperimentProvisioningRun`, and returns 202. `GET .../tao_base_experiment_provisioning/{run_id}` exposes `queued | running | succeeded | failed`, per-target results, and a redacted error. The suite launcher invokes this endpoint's service with the complete selected id list, so all missing targets are batched. Only one deployment-scoped run may be active. Backend restart marks an active run and its provisional suite failed and changes incomplete ModelConfig pull states to `failed`; retry is idempotent.
-- The shared service (1) resolves the selected `student_base` entries and Hugging Face paths, (2) writes a temporary `hf_model://` CSV, (3) invokes `scripts/pull_base_experiments.py` through `uv run --isolated --no-project --with-requirements ...`, (4) recursively uploads the tree to `s3://{bucket}/shared-storage/models/`, (5) calls `POST /orgs/{org}/jobs:load_airgapped`, (6) resolves the registered UUIDs, and (7) patches `tao_base_experiment_id` + `tao_base_experiment_pull_status="pull_complete"` across every project database.
+- The shared service (1) resolves the selected `student_base` entries and Hugging Face paths, (2) writes a temporary `hf_model://` CSV, (3) invokes the packaged `tao_base_experiment_pull/pull_base_experiments.py` helper through `uv run --isolated --no-project --with-requirements ...`, (4) recursively uploads the tree to `s3://{bucket}/shared-storage/models/`, (5) calls `POST /orgs/{org}/jobs:load_airgapped`, (6) resolves the registered UUIDs, and (7) patches `tao_base_experiment_id` + `tao_base_experiment_pull_status="pull_complete"` across every project database. Step 4 opens each regular file beneath the disposable stage root once and uses that descriptor for its hash, size decision, and upload; a changed pathname cannot redirect staged checkpoint bytes after validation, and an in-place change fails the exact-stream hash guard.
 - `vlm-feedback-loop tao-bootstrap --self-service` (default) creates/adopts the workspace and defers bases to first use. `--eager-bases`, or the standalone `tao-pull-base-experiments` command, provisions all supported bases ahead of time.
 - Inputs: NGC Personal API Key (provided as `TAO_API_KEY` through the process environment or canonical `.env`), a reachable Hugging Face endpoint, and S3 credentials for the workspace backing store (`TAO_WORKSPACE_S3_*`, §1.6) from the same approved secret sources. No TAO-registry-scoped NGC credentials required because the HF path sidesteps NGC entirely. Credential-valued CLI flags are not supported.
 - Idempotency: re-running is a no-op on already-registered base experiments (the `load_airgapped` step is skipped when `find_base_experiment_by_arch` finds an existing registration; the CLI reports current state).
-- The subprocess driver's dependencies (`nvidia-tao-core>=6.25.0`, `huggingface_hub>=0.23`, `requests>=2.31`) live in `scripts/pull_base_experiments_requirements.txt` and are resolved in an isolated, cached `uv` environment in both local-source and containerized modes. `tao-pull-base-experiments --skip-install` uses the current interpreter for operator-managed air-gapped environments.
+- The subprocess driver's dependencies (`nvidia-tao-core>=6.25.0`, `huggingface_hub>=0.23`, `requests>=2.31`) live beside the packaged helper in `tao_base_experiment_pull/requirements.txt` and are resolved in an isolated, cached `uv` environment in local-source, containerized, and installed-wheel modes. `tao-pull-base-experiments --skip-install` uses the current interpreter for operator-managed air-gapped environments.
 
 This provisioning path is **live-verified** against FTMS 6.25.11/6.26.3 as of 2026-04-18 (evidence: 1789-byte `ptm_metadatas.json`, `load_airgapped` returned `{"success":true,"experiments_loaded":1,"experiments_failed":0}`, `POST /jobs` accepted with the registered UUID as `base_experiment_ids[0]`). The full design record is retained in the project's internal engineering archive.
 
@@ -3257,12 +3409,27 @@ The `--admin-managed` flag and `docs/tao-ftms-install.md` remain the operator es
 
 When a training suite is created (§10.2 training suite endpoint), the Blueprint:
 
-1. Creates the DatasetExport archives on the Blueprint host (§9.3) — training split + Test Pool evaluation split.
-2. Uploads each archive to the configured workspace's S3 bucket using the workspace's access credentials (retrieved at suite-creation time from TAO via `GET /orgs/{org}/workspaces/{workspace_id}` or configured deployment-level). Upload path convention: `s3://{bucket}/vlm-feedback-loop/projects/{project_id}/dataset_exports/{dataset_export_id}/{archive_name}`.
-3. Persists the resulting S3 URI and per-file paths on the DatasetExport record (`dataset_upload_ref`, `dataset_upload_uri`).
-4. Constructs TAOJob `tao_create_job_request.specs` referencing the uploaded paths via the action-specific dataset-binding fields (§9.3.3): `custom.train_dataset.{media_path, annotation_path}` for `train`; top-level `dataset.{media_dir, annotation_path}` for `evaluate` and `quantize` (F11 amendment 2026-05-05 — quantize migrated from the train-side binding because cosmos-rl-quantize accepts `--media_dir` and rejects `--media_path`). The sidecar `annotations.json` is uploaded as a separate JSON object alongside the tarball so `annotation_path` is a JSON URL (not a path inside the tar.gz).
+1. Creates or adopts the durable TrainingSuite in `preparing` before filesystem or network work.
+2. Creates each DatasetExport archive on the Blueprint host (§9.3) — training split + Test Pool evaluation split — and commits its completed row plus suite link in one transaction before upload. Both export selection snapshots retain the exact suite-request checksum.
+3. Requires each DatasetExport row to be `completed`, obtains both paths exclusively from its `artifact_refs`, and opens both as regular files beneath `{WORKSPACE_ROOT}/projects/{project_id}/exports/`. Non-regular files and paths resolving outside that root are rejected; an in-root symlink is resolved once, then the canonical target is opened through a no-follow directory walk so retargeting cannot change the authorized inode.
+4. Through those same open descriptors, verifies the archive against the row's recorded SHA-256, reads the root regular-file member `annotations.json`, hashes the standalone sidecar, and parses it. The two JSON values MUST be recursively type-sensitive and equal: object key order and source formatting are irrelevant; array order and JSON types remain significant (`true` is not `1`, and `1` is not `1.0`). Both representations MUST validate before any S3 request.
+5. Uploads the archive and sidecar to the configured workspace's S3 bucket using the workspace's access credentials (retrieved at suite-creation time from TAO via `GET /orgs/{org}/workspaces/{workspace_id}` or configured deployment-level). Hashing, parsing, size selection, and upload all consume duplicates of the original open descriptors, so replacing a stored pathname after authorization cannot change the uploaded inode. The exact byte stream is hashed again: a changed single-PUT body is rejected before dispatch, and a changed multipart stream is aborted before completion. Upload path convention: `s3://{bucket}/vlm-feedback-loop/projects/{project_id}/dataset_exports/{dataset_export_id}/{archive_name}`.
+6. Treats the archive and sidecar as one idempotent pair with distinct object keys. A remote object is reused only when its SHA-256 metadata matches; a missing or mismatched member is uploaded. `already_uploaded` is true only when both matched, and local upload lineage is persisted only after both objects succeed. A sidecar failure can leave an unreferenced archive object; a safe retry repairs the pair.
+7. Persists the resulting S3 URI and per-file paths on the DatasetExport record (`dataset_upload_ref`, `dataset_upload_uri`).
+8. Constructs TAOJob `tao_create_job_request.specs` referencing the uploaded paths via the action-specific dataset-binding fields (§9.3.3): `custom.train_dataset.{media_path, annotation_path}` for `train`; top-level `dataset.{media_dir, annotation_path}` for `evaluate` and `quantize` (F11 amendment 2026-05-05 — quantize migrated from the train-side binding because cosmos-rl-quantize accepts `--media_dir` and rejects `--media_path`). The sidecar `annotations.json` is uploaded as a separate JSON object alongside the tarball so `annotation_path` is a JSON URL (not a path inside the tar.gz). The job chains and the suite transition from `preparing` to `initialized` commit atomically.
 
-Upload is streamed (no full-archive in memory); large archives are uploaded via multipart S3 upload. Transient upload failures follow the standard retry policy (§11). Permanent failures (auth rejected, bucket missing, quota exceeded) surface a clear error to the SME referencing the workspace configuration.
+Files above 8 MiB are streamed from the authorized descriptor in multipart chunks; smaller files use one bounded in-memory PUT. Transient upload failures follow the standard retry policy (§11). Permanent failures (auth rejected, bucket missing, quota exceeded) surface a clear error referencing the workspace configuration. For ready-base synchronous creation this is HTTP 409 with code `tao_dataset_upload_failed`. If first-use provisioning already returned a provisional suite, the asynchronous setup task records the error in `setup_error_ref` and makes the suite `failed`.
+
+A `failed` suite with both linked exports, no chain rows, and a transfer or
+workspace-configuration error MAY be atomically reclaimed only by the same
+idempotency key and exact request body. The retry MUST reuse the linked export
+IDs, validate their frozen intent, tier, Guidance, field mode, and request
+checksum, and rely on pair-wide remote hash checks to skip or repair objects.
+A backend restart during this state retains the same retry contract. Integrity
+failures MUST NOT reclaim the compromised exports: after correcting the source,
+the caller creates a new suite with a new idempotency key. Once chain rows
+exist, normal idempotent replay returns the existing suite and never rebuilds
+its setup.
 
 ##### 9.7.8.3 Server-side launch validation
 
@@ -3272,18 +3439,30 @@ The training-suite launch path MUST verify:
 - TAO's v2 request schema accepts the configured safe `timeout_minutes`.
 - Each selected model has the `student_base` role.
 - The training export has at least one eligible Verified example.
+- The active-Guidance Test Pool contains at least
+  `max(1, project.scaleup_min_test_pool_size)` Verified examples. This reuses
+  the project's configured statistical floor without importing the other four
+  Teacher-quality gate criteria into Student Training.
 - For each selected `student_base_model_config_id`, determine either (a) the base is ready (`tao_base_experiment_id` non-null and pull status `pull_complete`) or (b) automatic first-use provisioning is required.
 - When `enable_lora=true`, the Blueprint host has `HF_TOKEN` and a usable
   isolated merge interpreter containing torch, transformers, peft, accelerate,
   and safetensors. This is required even when the TAO copy of the base is
   already provisioned because baseline packaging loads the gated base locally.
+- The exact `quantization_schemes` selection is compatible with every selected
+  base. Cosmos 3 Super accepts only an empty selection (baseline-only) in the
+  qualified release; readiness and final suite materialization both enforce
+  this before export or TAO submission.
 
 These checks are rendered from the same `training_preflight` service on the
 Scale-Up Hub and Student Training screen; they are not reimplemented in
-TypeScript. A valid missing base is non-blocking and produces the conditional
-Training Jobs provisioning stage. Workspace absence and unsafe timeout
-capability remain blocking and return an actionable submission error before
-transfer or TAO-job work begins.
+TypeScript. The suite materialization path MUST repeat the two dataset checks
+after any long-running base provisioning and MUST reject a final training or
+evaluation export that no longer meets them. A valid missing base is
+non-blocking and produces the conditional Training Jobs provisioning stage.
+Workspace absence and unsafe timeout capability remain blocking and return an
+actionable submission error before transfer or TAO-job work begins. Dataset
+shortfalls are data-readiness failures and MUST NOT generate a TAO setup Action
+Request.
 
 ##### 9.7.8.4 Rationale
 
@@ -3326,6 +3505,24 @@ training setup**, producing a full-precision baseline and FP8 variant.
 `W4A16`, `W8A8`, and `W8A16` are explicit additional comparison choices.
 Each scheme is a separate TAO `quantize` job; TAO runs one
 `quantization_scheme` per job.
+
+**F-B13 amendment (2026-08-04) — Cosmos 3 Super is baseline-only until its
+quantization runtime is qualified.** A full-weight Super checkpoint completed
+training, packaging, local Student NIM evaluation, benchmarking, and handoff.
+The same checkpoint's `FP8_DYNAMIC` TAO action completed activation
+calibration across all 65 layers, then Accelerate reported that parameters had
+been CPU-offloaded on the meta device. During weight calibration,
+llmcompressor attempted to calculate a scale from one of those unmaterialized
+weights and failed with `Tensor.item() cannot be called on meta tensors`.
+No quantized checkpoint was produced. The Blueprint MUST therefore keep Super
+available for baseline training/deployment but reject any non-empty
+`quantization_schemes` selection containing Super. The backend-owned
+`quantization_compatible` readiness check is authoritative, suite launch and
+final materialization repeat the rule before exports or TAO work, and the
+Training screen renders a baseline-only notice in its Quantization section
+whenever Super is selected. Clearing every quantization checkbox makes the
+Super configuration valid. A later stack may remove this restriction only
+after an independently qualified Super quantize→package→NIM live run.
 
 **Automatic evaluation:** TAO's `skip_test_generation` (default: `false`) runs a post-quantization smoke check to verify the quantized model can generate. This is a correctness sanity check, not a full accuracy study. The system's automatic TAO `evaluate` job (§9.7.6) runs separately after each quantize job to produce full accuracy metrics against the Test Pool.
 
@@ -3432,6 +3629,7 @@ Rules:
 - `example_key` MUST be unique within project; treated as idempotency key.
 - If `{project_id, example_key}` exists and `storage_ref` matches the existing record: server MUST return existing Example record with `status="exists"`; MUST NOT create duplicate. This is true idempotent re-ingest.
 - If `{project_id, example_key}` exists but `storage_ref` differs: server MUST reject that item with `status="error"`, `error_code="example_key_collision"`, and a message identifying both paths: *"Generated example_key collided with an existing example from a different path. Existing: {old_storage_ref}. New: {new_storage_ref}."* This distinguishes accidental key collision from true re-ingest.
+- If `{project_id, storage_ref}` already exists under a different `example_key`, server MUST reject the new item with `status="error"` and `error_code="storage_ref_already_ingested"`. A single source image cannot enter one project twice merely because a caller supplied or an older scan root produced a different key.
 - If `state` omitted, default `Unlabeled`.
 - `ingested_at` MUST be set by server.
 - `source_metadata` and `metadata` MUST be stored (may be `{}`).
@@ -3672,6 +3870,7 @@ Response:
   "status": "queued | running | paused | canceling | completed | canceled | failed",
   "status_reason": "string | null",
   "paused_reason": "string | null",
+  "circuit_breaker_threshold": "int | null",
   "progress": { "processed": "int", "total": "int" },
   "examples_succeeded": "int",
   "examples_schema_invalid": "int",
@@ -3870,6 +4069,10 @@ Security constraints:
 - The endpoint MUST NOT accept arbitrary filesystem paths from request parameters.
 - The only image source is the `storage_ref` already persisted on the project-scoped Example record.
 - Project scoping is enforced: the Example MUST belong to the requested `project_id`.
+- Authorization and streaming MUST bind to the same regular-file inode. The
+  endpoint MUST re-apply the current `IMAGE_ROOT` policy and MUST NOT reopen the
+  mutable `storage_ref` pathname after authorization. Normal and byte-range
+  responses own and close the descriptor on success or failure.
 
 #### 10.2.10 Filesystem browse endpoint (required)
 
@@ -3931,7 +4134,7 @@ Request:
 }
 ```
 
-`project_id` is optional. When provided, the backend checks each suggested key against existing `example_key` values in that project and reports collision status per image. When omitted, no collision checking is performed.
+`project_id` is optional. When provided, the backend checks both the canonical suggested key and the source path against existing Example records in that project and reports collision status per image. When omitted, no project collision checking is performed.
 
 Response:
 
@@ -3941,7 +4144,7 @@ Response:
   "images": [
     {
       "storage_ref": "/data/images/project_alpha/batch_01/img_001.jpg",
-      "suggested_example_key": "batch_01_img_001--8f31c2d4ab7e",
+      "suggested_example_key": "project_alpha_batch_01_img_001--9528ef04c649",
       "size_bytes": 2048576,
       "key_status": "available | already_exists_same_path | collision_different_path",
       "existing_storage_ref": "string | null"
@@ -3962,8 +4165,8 @@ Response:
 Rules:
 
 - Scan the directory (recursively when `recursive=true`) and return all supported image files with suggested `example_key` values.
-- `suggested_example_key` MUST be deterministic and collision-resistant. Generation rule: (1) normalize the relative path (within the scanned root) to POSIX form; (2) build a readable slug from the relative path without extension, replacing path separators with `_`; (3) compute `hash12 = first_12_hex(sha256(relative_path_with_extension_normalized))`; (4) set `suggested_example_key = "{slug}--{hash12}"`. The 12 hex character suffix (48 bits) provides strong collision resistance for project sizes up to hundreds of thousands of images. The extension participates in the hash input so that `foo.jpg` and `foo.png` in the same folder produce distinct keys. Example: `batch_01/sub/img_001.jpg` scanned from `/data/images/` yields `batch_01_sub_img_001--8f31c2d4ab7e`; `batch_01_sub_img_001.png` in the same tree yields `batch_01_sub_img_001--51a9e0bf3c12`.
-- **Collision checking** (when `project_id` is provided): for each suggested key, the backend checks whether that key already exists in the project's Example records. Per-image `key_status` is set to: `available` (key does not exist), `already_exists_same_path` (key exists and `storage_ref` matches — safe idempotent re-ingest), or `collision_different_path` (key exists but `storage_ref` differs — would be rejected by ingestion). When `collision_different_path`, `existing_storage_ref` is populated so the SME can see what file already owns that key. `total_collisions` counts `collision_different_path` items. When `project_id` is omitted, `key_status` defaults to `available` for all items and `total_collisions` is `0`.
+- `suggested_example_key` MUST be deterministic, collision-resistant, and independent of which ancestor directory the SME selected for scanning. Generation rule: (1) resolve the image path and normalize it to POSIX form; (2) when `IMAGE_ROOT` is configured, use the path relative to that stable deployment root; otherwise use the normalized absolute path; (3) build a readable slug from that canonical path without extension, replacing path separators with `_`; (4) compute `hash12 = first_12_hex(sha256(canonical_path_with_extension))`; (5) set `suggested_example_key = "{slug}--{hash12}"`. The 12 hex character suffix (48 bits) provides strong collision resistance for project sizes up to hundreds of thousands of images. The extension participates in the hash input so that `foo.jpg` and `foo.png` in the same folder produce distinct keys. With `IMAGE_ROOT=/data/images`, `batch_01/sub/img_001.jpg` yields the same key whether `/data/images`, `/data/images/batch_01`, or `/data/images/batch_01/sub` is scanned.
+- **Collision checking** (when `project_id` is provided): source-path identity is checked first. If `storage_ref` is already present, `key_status=already_exists_same_path` and the response reuses the persisted `example_key`, including for projects whose keys were generated by an older release. Otherwise the backend checks the canonical suggested key: `available` means unused and `collision_different_path` means that key belongs to another `storage_ref` and ingestion would reject it. When `collision_different_path`, `existing_storage_ref` is populated so the SME can see what file already owns that key. `total_collisions` counts `collision_different_path` items. When `project_id` is omitted, `key_status` defaults to `available` for all items and `total_collisions` is `0`.
 - Skipped files (unsupported formats, unreadable) are reported in the `skipped` array but do not block the scan.
 - **F47 amendment (2026-05-15).** The standalone "Scan + preview" SME workflow was removed. The scan endpoint is no longer surfaced as a user-visible step; it is an **internal helper** the frontend calls when the SME checks a directory entry in the file browser tree and clicks [Ingest Selected]. The frontend consumes only the `images[]` portion of the response (to extract `storage_ref` + `suggested_example_key` pairs for the ingestion endpoint, §10.2.1); the `skipped[]` array is not rendered to the SME because the wall-of-skipped-files UI failure mode it produced on wide paths (e.g., a home directory) added no SME value once §6.1 ingestion became fast and asynchronous (F46, 2026-05-14). `total_skipped` and `total_collisions` remain in the response for diagnostic purposes. Direct path entry is preserved as a text input above the file browser tree: pressing Enter navigates the tree via `GET /v1/filesystem/browse`, not via this scan endpoint.
 
@@ -3971,10 +4174,14 @@ Rules:
 
 - **Image root (`IMAGE_ROOT`):** one optional absolute directory path that bounds filesystem browsing, scanning, ingestion, image serving, and path remapping.
   - When the backend binds to a loopback address (`127.0.0.1`, `::1`) and `IMAGE_ROOT` is unset, the effective root is `/` (the entire filesystem is browsable). This is the expected local-development mode.
-  - When the backend binds to a non-loopback address (`0.0.0.0`, a LAN IP, etc.), `IMAGE_ROOT` MUST be explicitly configured. If it is unset, filesystem operations MUST return `403` with: *"Filesystem browsing is disabled. Configure IMAGE_ROOT to allow browsing when the backend is network-accessible."*
-- Any `path` that resolves outside `IMAGE_ROOT` MUST be rejected with `403`.
+  - When the backend binds to a non-loopback address (`0.0.0.0`, a LAN IP, etc.), `IMAGE_ROOT` MUST be explicitly configured. If it is unset, browse, scan, image serving, and path remapping MUST return `403` with: *"Filesystem browsing is disabled. Configure IMAGE_ROOT to allow browsing when the backend is network-accessible."* Batch ingestion preserves the §10.2.1 partial-success contract: the request returns `202`, and every disallowed item returns `status="error"`, `error_code="path_not_allowed"`, and the same guidance without persisting an Example.
+- Any `path` that resolves outside `IMAGE_ROOT` MUST be rejected with `403`, except a disallowed item in the batch-ingestion API, which uses the same per-item `path_not_allowed` result described above.
 - The browse endpoint MUST NOT follow symlinks that escape `IMAGE_ROOT`.
 - The browse endpoint MUST NOT expose file contents, only names, types, paths, and sizes.
+- The same root policy applies to every later read of a persisted
+  `storage_ref`, including inference, embeddings, pHash, image serving,
+  benchmark workloads, and dataset export. Persisting an allowed path does not
+  preserve access after `IMAGE_ROOT` changes.
 
 **Frontend integration:**
 
@@ -4065,7 +4272,7 @@ Response:
 
 Rules:
 
-- The endpoint MUST reject the request with `409 Conflict` if the model config is currently referenced by a running evaluation, batch labeling run, or training job.
+- The endpoint MUST reject the request with `409 Conflict` if the model config is currently referenced by a `queued`, `running`, or `canceling` evaluation/Batch run, or by an active training job. A paused Batch run uses its persisted runtime snapshot and does not block re-probe.
 - On invocation, reset `structured_generation_support`, `thinking_toggle_support`, and `visual_budget_support` to `unknown`, then re-run: the structured-generation probe (§6.2), the thinking override acceptance check (§6.7.4, only when `thinking_toggle.mode` is request-based), and the visual-budget probe (§6.9.2).
 - Each check runs independently; a failure in one MUST NOT prevent the others from executing.
 - Probe results are persisted on the ModelConfig as usual. The response returns the updated values.
@@ -4460,7 +4667,7 @@ Rules:
 
 - Export MUST create a DatasetExport record (§13.5).
 - **Background build:** selection and validation run synchronously (validation failures return 4xx with no record); the create response then carries `status="running"` with `artifact_refs`/`manifest_ref` `null`. The multi-GB archive build runs as an in-process background task — the request MUST NOT block on it. `artifact_refs` and `manifest_ref` populate when the record reaches `completed`; consumers poll `GET .../dataset_exports/{id}` or follow the `export_progress` / `export_completed` / `export_failed` SSE events (§1.8). On restart, `running` exports are marked `failed` (`backend_restart_interrupted`) and partial artifact files deleted — exports are not resumable; the SME retries. At most one export builds per project at a time: a create request while another is `running` returns `409` (each build is a multi-GB job; an accidental re-request would silently double it).
-- The training-suite creation path (§9.7.8) is exempt from the background build: its exports build in worker threads and commit in their own short-lived sessions (SQLite write-discipline, §1.8); only the TAOJob chains + TrainingSuite insert remain a single transaction, and a later failure leaves standalone DatasetExport rows (the same shape the exports API produces), and its records are created directly in `status="completed"`.
+- The training-suite creation path (§9.7.8) is exempt from the background build: it first persists a `preparing` TrainingSuite, builds exports in worker threads, and atomically commits each DatasetExport row with its suite link in a short-lived session before workspace upload (SQLite write-discipline, §1.8). Its records are created directly in `status="completed"`. TAOJob chain creation and the suite transition to `initialized` remain one transaction; a retryable pre-chain transfer failure retains the frozen linked exports for an exact idempotent retry.
 - Evaluation and testing intents require `label_tier_filter="verified_only"`; requests for `auto_labeled_only` or `combined` are rejected as validation errors.
 - After a semantic Core change, old labels are deleted (§4.4.1); only examples re-labeled under the current Guidance are exportable.
 - Auto-Labeled exports include only `schema_valid_core=true` outputs (enforced at Label creation — schema-invalid outputs never produce Label records).
@@ -4476,6 +4683,13 @@ Recommended endpoints:
 - `GET /v1/projects/{project_id}/model_configs` — list model configs
 - `POST /v1/projects/{project_id}/model_configs` — create model config
 - `PATCH /v1/projects/{project_id}/model_configs/{model_config_id}` — update model config
+
+New evaluation and Batch Run Records persist a credential-free
+`runtime_config_snapshot` containing every result-shaping model, endpoint, and
+process-config value their inference path consumes. PATCH, capability re-probe,
+and semantic process-config changes affect future runs; delayed execution,
+restart recovery, and explicit Batch Resume continue from the run-owned
+snapshot.
 
 **List model configs:**
 
@@ -4545,9 +4759,9 @@ Recommended endpoints:
 - `POST /v1/projects/{project_id}/student_models/{student_model_id}:deploy_nim` — trigger NIM deployment for evaluation
 - `POST /v1/projects/{project_id}/student_models/{student_model_id}:repackage` — replay checkpoint packaging after an environment fix (F-B10 amendment 2026-07-15; mirrors the F33 `:rerescore` rationale for the packaging stage — canonical case: adapter-only LoRA output with the merge interpreter unprovisioned. 409 unless `checkpoint_packaging_status="failed"`; variant-aware: quantized students replay from their quantize TAOJob)
 
-**List student models:** cursor pagination (`limit`, `cursor`). Response returns StudentModel records per §13.13.
+**List student models:** cursor pagination (`limit`, `cursor`). Response returns StudentModel records per §13.13, including nullable `training_suite_id` for immutable run grouping, plus derived `serving_benchmark_current: bool` and nullable `serving_benchmark_blocker` fields computed from the referenced serving run and current configured concurrency contract.
 
-**Get student model:** full StudentModel record including checkpoint status, quality/serving readiness, NIM deployment state, and evaluation run links.
+**Get student model:** full StudentModel record including checkpoint status, quality/serving readiness, current-benchmark assessment, NIM deployment state, and evaluation run links.
 
 **Deploy NIM:**
 
@@ -4599,7 +4813,8 @@ Request:
 {
   "student_base_model_config_ids": ["string"],
   "include_auto_labeled": true,
-  "enable_lora": true
+  "enable_lora": true,
+  "quantization_schemes": ["FP8_DYNAMIC"]
 }
 ```
 
@@ -4617,7 +4832,7 @@ Response:
   "status": "passed | failed",
   "checks": [
     {
-      "check_name": "tao_reachable | tao_workspace_reachable | student_base_role | tao_base_experiment_ready | verified_train_examples",
+      "check_name": "tao_reachable | tao_job_timeout_supported | tao_workspace_reachable | tao_base_experiment_ready | hf_token_configured | lora_merge_runtime | student_base_role | verified_train_examples | min_test_pool_size",
       "passed": "boolean",
       "message": "string",
       "model_config_id": "string | null",
@@ -4627,6 +4842,7 @@ Response:
   "data_summary": {
     "verified_training_count": "int",
     "test_pool_count": "int",
+    "required_test_pool_count": "int",
     "auto_labeled_eligible_count": "int",
     "auto_labeled_included_count": "int",
     "excluded_test_pool_count": "int",
@@ -4650,10 +4866,19 @@ Check semantics (§9.7.8.3):
 - `student_base_role`: the ModelConfig has `student_base` in `eligible_roles[]`.
 - `tao_base_experiment_ready`: a ready ModelConfig has non-null `tao_base_experiment_id` + `pull_complete` and returns `provisioning_required=false`. A valid missing or incomplete base is non-blocking and returns `passed=true`, `provisioning_required=true`; Start Training must complete the tracked provisioning endpoint before suite creation.
 - `verified_train_examples`: the §9.3 training-export selection is non-empty — at least one Verified label under the active Guidance with no Test Pool assignment (Test Pool members are evaluation-only per §4.3). Global check (`model_config_id: null`). On failure the message tells the SME to continue labeling; the Scale-Up screen renders this failure as "No Verified training examples yet. Continue labeling." instead of a TAO-setup call to action.
+- `min_test_pool_size`: the active-Guidance Test Pool count is at least
+  `max(1, project.scaleup_min_test_pool_size)`. The default is 60. This is a
+  Student dataset-readiness check for the automatic baseline and quantized
+  evaluation jobs; it does not import the Scale-Up gate's Teacher accuracy,
+  per-field, per-value F1, or Accept-rate criteria. On failure, both UI
+  consumers direct the SME to continue labeling and MUST NOT offer a TAO setup
+  Action Request.
 - `data_summary`: authoritative distinct-example counts under the active
   Guidance and request's Auto-Labeled policy. Test Pool members are always
-  excluded from training and reported separately. `usable_training_count`
-  controls whether Start can be enabled.
+  excluded from training and reported separately.
+  `required_test_pool_count` is the backend-resolved effective minimum;
+  `usable_training_count` plus both dataset checks control whether Start can
+  be enabled.
 
 Checks run independently — a failure in one does NOT prevent the others from executing, matching the capability-probe pattern in §10.2.12.
 
@@ -4713,7 +4938,7 @@ Response:
 
 `rendered_text` is the pre-formatted message ready for clipboard copy. MUST NOT contain secrets (§10.3.2).
 
-Rules for `deployment_handoff`: MUST reject with `409` if the Student does not have both `quality_status=validated` AND `serving_status=validated` (§13.13). The `technical_requirements` payload includes the deployment-specific fields defined in §10.3.3.
+Rules for `deployment_handoff`: MUST reject with `409` if the Student does not have `quality_status=validated`, `serving_status=validated`, and a referenced serving run satisfying the current AIPerf workload contract (§9.5.2, §13.13). A historical synthetic result returns `conflict: serving_benchmark_requires_aiperf`. The `technical_requirements` payload includes the deployment-specific fields defined in §10.3.3. The portable deployment bundle applies the identical gate.
 
 **Log copy:**
 
@@ -4766,7 +4991,8 @@ Deployment-scoped (not project-scoped). Returns the environment assessment (§1.
 
 Recommended endpoint:
 
-- `GET /v1/environment`
+- `GET /v1/environment` — reuse the process-local machine snapshot
+- `GET /v1/environment?refresh_hardware=true` — explicitly rebuild the Docker/toolkit/GPU snapshot before responding
 
 Response:
 
@@ -4830,9 +5056,10 @@ Rules:
 - MUST NOT return secret values (API keys). Only reports whether each key is configured.
 - GPU detection uses `nvidia-smi`; unavailable or failing `nvidia-smi` produces an empty `gpus` array.
 - `local_deployable_models` includes only seeded catalog entries with `local_deploy_metadata` (Teacher/Student VLM models from the model catalog).
-- `embedding_deployment` is sourced from `EmbeddingDeploymentConfig` (§13.17), not from the model catalog. The embedding NIM is infrastructure for background embedding computation and is configured separately from user-selectable inference models.
+- `embedding_deployment` is sourced from `EmbeddingDeploymentConfig` (§13.17), not from the model catalog. Its `fits` flag additionally requires a currently claimable GPU whose detected name exactly matches the pinned support matrix. The embedding NIM is infrastructure for background embedding computation and is configured separately from user-selectable inference models.
 - An exact compatible `running` Teacher yields `recommended_teacher_mode="local"` when it matches the current quality recommendation, even when `NVIDIA_API_KEY` is configured. A different resident remains in `active_local_nim_residents` for the explicit keep/replace choice. Without a preferred resident, an API key remains the hosted-primary recommendation.
-- The assessment is recomputed on each call (lightweight; no caching required).
+- Docker, NVIDIA Container Toolkit, and GPU inventory are cached for the backend process lifetime. Credentials, embedding configuration, and active NIM residents are recomposed from current state on every call.
+- `refresh_hardware=true` invalidates and replaces that machine snapshot. It is intended for operator-driven host changes; deployment preflight independently performs fresh live checks.
 
 #### 10.2.26 NIM endpoint endpoints (required)
 
@@ -4842,8 +5069,14 @@ Recommended endpoints:
 - `POST /v1/projects/{project_id}/nim_endpoints` — create endpoint
 - `GET /v1/projects/{project_id}/nim_endpoints/{endpoint_id}` — get endpoint
 - `PATCH /v1/projects/{project_id}/nim_endpoints/{endpoint_id}` — update endpoint
+- `POST /v1/projects/{project_id}/nim_endpoints:configure_self_hosted_teacher` — verify, bind, and select an exact cataloged self-hosted Teacher
 
 There is no standalone probe verb: endpoint health is auto-probed on create and update.
+
+Endpoint updates affect future evaluation and Batch runs. Existing runs use
+their credential-free `runtime_config_snapshot`, including endpoint URL, mode,
+authentication mode, and resolved image cap; credentials themselves remain at
+the deployment boundary and are never copied into a Run Record.
 
 **Create endpoint:**
 
@@ -4870,9 +5103,30 @@ Rules:
 
 Partial update. `endpoint_id` is immutable. Accepts `display_name`, `base_url`, `auth_mode`, `is_enabled`. On update, the system re-probes automatically.
 
+**Configure a self-hosted Teacher:**
+
+Request:
+
+```json
+{
+  "base_url": "http://nim.internal:8000/v1",
+  "model_config_id": "uuid"
+}
+```
+
+The backend normalizes a credential-free HTTP(S) URL, rejects embedded
+credentials/query/fragment data, confirms `GET {base_url}/models` reports the
+exact selected vision-Teacher model, then creates or idempotently reuses a
+`self_hosted` endpoint. It binds that endpoint to the selected ModelConfig,
+selects it on the Project, and re-probes generation capabilities. A connection
+or model mismatch MUST leave the existing project binding unchanged. Repeating
+the same successful request MUST reuse the endpoint rather than duplicate it.
+
 **Auto-probe semantics** (runs on create and update; there is no callable probe route):
 
-- The probe tests `GET {base_url}{models_path}` (default `/v1/models`). For `local_system_managed` endpoints, it also tests `GET {base_url}{health_ready_path}` (default `/v1/health/ready`).
+- The probe tests `GET {base_url}{models_path}` (default `/models`, because
+  `base_url` already includes `/v1`). For `local_system_managed` endpoints, it
+  also tests `GET {base_url}{health_ready_path}` (default `/health/ready`).
 - Successful `GET /v1/models` → `healthy`; 401/403 → `auth_failed`; connection failure → `unreachable`; other errors → `unhealthy`.
 - Probe results are persisted on the NimEndpoint record (`last_probe_at`, `last_probe_status`, `last_probe_error_ref`) and returned as part of the create/update response.
 - Bounded by `HTTP_DEADLINE_INTERACTIVE_S`.
@@ -4999,7 +5253,11 @@ Pre-filled technical requirements:
 
 **`tao_issue`: TAO Job Failure**
 
-Triggered from: Training Job Monitor when a TAO job fails (`TrainingJobMonitorPage.tsx`).
+Triggered from: Training Job Monitor when a remote TAO job fails
+(`TrainingJobMonitorPage.tsx`). A Blueprint-local `student_nim_local`
+evaluation failure is not a TAO issue: its job card links to Compare &
+Benchmark, where the persisted Student exposes the serving-validation retry
+and preflight Action Request paths.
 
 Pre-filled technical requirements:
 
@@ -5011,7 +5269,7 @@ Pre-filled technical requirements:
 
 **`deployment_handoff`: Student Production Deployment**
 
-Triggered from: Compare & Benchmark screen per-variant [Request Production Deployment] button (`CompareBenchmarkPage.tsx`). Requires both `quality_status=validated` AND `serving_status=validated` on the StudentModel. The label's "Production" qualifier disambiguates this from the same screen's [Deploy for serving validation] fallback affordance, which dispatches the gate-less `student_nim_deploy` AR for temporary evaluation infrastructure.
+Triggered from: Compare & Benchmark screen per-variant [Request Production Deployment] button (`CompareBenchmarkPage.tsx`). Requires `quality_status=validated`, `serving_status=validated`, and current AIPerf evidence on the referenced serving RunRecord. A pre-AIPerf historical result instead renders [Revalidate with AIPerf]. The label's "Production" qualifier disambiguates this from the same screen's [Deploy for serving validation] fallback affordance, which dispatches the gate-less `student_nim_deploy` AR for temporary evaluation infrastructure.
 
 Pre-filled technical requirements:
 
@@ -5034,6 +5292,9 @@ Model metadata:
 Evaluation snapshot:
 
 - `evaluation_summary` (at minimum: overall Exact Match rate, per-core-field match rates, per-value precision/recall/F1 for categorical Core fields, latency p50/p90/p99, pool version used, ICL mode, Guidance version)
+- Test Pool dataset SHA-256 from the held-out export paired with the
+  artifact-producing train/quantize job (never inferred from the Student's
+  training-only `dataset_export_ids[]`)
 
 Training lineage:
 
@@ -5044,6 +5305,12 @@ Training lineage:
 - `lora_config` (from TAOJob)
 
 Multiple `deployment_handoff` Action Requests MAY exist per project (different variants, redeployments).
+
+After the Action Request is generated successfully, the inline panel MUST
+offer **Download portable NIM deployment bundle** as its primary action and retain
+**Copy to Clipboard** as the secondary operator-handoff action. The download
+uses the streamed §9.5.1 endpoint so multi-gigabyte checkpoints are never
+buffered in browser JavaScript memory.
 
 #### 10.3.4 UX Contract
 
@@ -5095,7 +5362,7 @@ operation_id = "{batch_label_run_id}:{example_key}"
 - **Missing image files:** if `storage_ref` is not found or unreadable at runtime (image moved/deleted after ingest), the image serving endpoint (§10.2.9) returns an error. The labeling screen shows a broken-image placeholder and offers **Skip**. The system MUST NOT crash or block the labeling session.
 - **Evaluation:** after the concurrent burst, any failed examples are retried sequentially (concurrency=1; §7.1). If any example still fails after the sequential retry pass, the run MUST be marked **incomplete** (no pass/gate). There is no configurable failure tolerance; one persistently failed example means the run cannot satisfy the Scale-Up Readiness Gate. Partial diagnostic metrics MAY be displayed but MUST be labeled as diagnostic only.
 - **Batch Labeling:** per-example failures do not make the run incomplete; the run completes when every example reaches a terminal state (success or failure). A circuit breaker pauses the run after consecutive endpoint failures (§8.2 step 8). Failures MUST persist failure metadata + best-available artifacts/refs; exports MUST include only `schema_valid_core=true` outputs (schema-invalid outputs are never exported).
-- **Review selector:** if CLIP embeddings are missing/unavailable for the active selection mode, selection MUST use pHash-diverse mode (§5.6). pHash is always available for successfully ingested images.
+- **Review selector:** if CLIP embeddings are missing/unavailable for the active selection mode, selection MUST use available pHash values (§5.6), with deterministic `example_key` fallback while every candidate hash is pending or failed.
 - **Embedding computation:** probe failures (403/no model access, network errors) on every arm of the §5.5.1 cascade MUST set `embedding_provider=none`; the review selector continues with pHash-diverse mode. Per-image CLIP embedding failures (payload too large, rate limits, transient errors) MUST be handled gracefully: log the failure, skip the embedding for that image, and continue.
 - **TAO jobs:** submission failures MUST set TAOJob `status="failed"` with an error ref; polling failures MUST NOT corrupt last-known-good status and MUST record/update `poll_error_ref` for diagnostics.
 
@@ -5103,7 +5370,7 @@ operation_id = "{batch_label_run_id}:{example_key}"
 
 Operational logging captures process-level reasoning and decisions that are not part of the durable record model (§13) but are essential for debugging, development, and understanding system behavior. Operation Records capture *what happened*; logs capture *why it happened*, the reasoning at each decision point.
 
-This system is a Blueprint. Implementations MUST produce structured operational logs at key decision points so that developers (including agentic LLM development tools like Claude Code) can trace behavior, diagnose failures, and validate correctness. Structured logging is especially critical for LLM-assisted development: each log entry MUST be a self-contained, parseable unit with enough context to understand the decision without reading surrounding entries.
+This system is a Blueprint. Implementations MUST produce structured operational logs at key decision points so that developers and operators can trace behavior, diagnose failures, and validate correctness. Each log entry MUST be a self-contained, parseable unit with enough context to understand the decision without reading surrounding entries.
 
 *Log structure (required):*
 
@@ -5175,7 +5442,7 @@ Credential values MUST NOT be accepted through command-line arguments or embedde
 
   - (a) **One-time connection test** — the web UI accepts a pasted key for a single connection probe (Screen 2.3 / Screen 2.4 / Screen 2.8). The value MUST be held only in request memory, used for the probe, and discarded after the response. Never written to any persistent store.
   - (b) **Runtime override (in-memory)** — `POST /v1/secrets:set` with `persist=false` installs the key into the deployment-scoped runtime-override layer (§12.1.2). The value applies to the next NIM call (embedding worker spawn, Teacher proposal, local NIM image pull) without a backend restart. Held only in process memory; lost on process exit.
-  - (c) **Persisted to `.env`** — `POST /v1/secrets:set` with `persist=true` AND deployment-level `ALLOW_UI_SECRET_PERSIST=true` upserts the line in `~/.vlm_feedback_loop/.env` with `0600` file / `0700` parent-dir permissions, reloads `Settings`, and clears the runtime override (the persisted disk value becomes canonical). Survives restart. Container / production deployments where `.env` is managed externally SHOULD set `ALLOW_UI_SECRET_PERSIST=false` to disable this path; the endpoint then returns 403 `ui_secret_persist_disabled` and the UI hides the persist checkbox.
+  - (c) **Persisted to `.env`** — `POST /v1/secrets:set` with `persist=true` AND deployment-level `ALLOW_UI_SECRET_PERSIST=true` atomically upserts the line in `~/.vlm_feedback_loop/.env` with `0600` file / `0700` parent-dir permissions and reloads `Settings`. The same value remains in the runtime override for the rest of the process so already-queued work holding an older `Settings` snapshot still sees the new credential; the disk value is canonical after restart. A write or permission failure MUST leave the prior file intact and returns an explicit persistence error; the new value remains a session-only runtime override. Container / production deployments where `.env` is managed externally SHOULD set `ALLOW_UI_SECRET_PERSIST=false` to disable this path; the endpoint then returns 403 `ui_secret_persist_disabled` and the UI hides the persist checkbox.
 
 The web UI MUST NOT write secrets to YAML config, SQLite, browser `localStorage`, or any project-scoped record. The three permitted persistence shapes above are exhaustive.
 
@@ -5198,7 +5465,10 @@ The runtime-override layer lives in `services/runtime_secrets.py`. Services MUST
 
 ## 13. Required Records
 
-Defines 17 minimum persisted record families. Implementations MAY store these in one table/collection per family (or normalized equivalents).
+Twenty numbered sections describe 19 active persisted record families;
+§13.14 documents the removed `PromptPackage` and is not an active family.
+Implementations MAY store these in one table/collection per family (or
+normalized equivalents).
 
 ### 13.1 Operation Record (Required)
 
@@ -5321,7 +5591,7 @@ queued | running | canceling | completed | incomplete | canceled | failed
 
 - `queued`: Run record exists, configuration snapshot and pool version snapshot taken, worker not yet started.
 - `running`: Actively issuing evaluation inferences and/or performing the sequential retry pass.
-- `canceling`: Cancellation requested (supersession or manual cancel). Two-phase: (1) transition to `canceling` immediately, stop dispatching new per-example inferences immediately; (2) wait for all in-flight tasks to settle before transitioning to `canceled`. In-flight inferences are canceled cooperatively (asyncio `CancelledError`). If an in-flight inference completes before cancellation takes effect, its Operation Record MAY be persisted for diagnostics — it remains linked to the canceled run's `evaluation_run_id`, is marked `ignored_due_to_run_cancellation=true` (§13.1), and MUST NOT contribute to authoritative metrics, summaries, comparisons, or the Scale-Up Readiness Gate. Because HTTP calls are bounded by deadlines (`HTTP_DEADLINE_BACKGROUND_S`), the wait for in-flight tasks is finite. The run MUST NOT transition to `canceled` until all in-flight tasks have reached a terminal state and all final writes have committed.
+- `canceling`: Cancellation requested (supersession or manual cancel). Two-phase: (1) transition to `canceling` immediately, stop dispatching new per-example inferences immediately; (2) wait for all in-flight tasks to settle before transitioning to `canceled`. Each outcome transaction MUST classify itself at the durable run-status boundary: only an outcome committed after the parent entered `canceling` is marked `ignored_due_to_run_cancellation=true`; earlier committed outcomes MUST NOT be bulk-reclassified by finalization. Ignored records remain linked to the canceled run for diagnostics and MUST NOT contribute to authoritative metrics, summaries, comparisons, or the Scale-Up Readiness Gate. Because HTTP calls are bounded by deadlines (`HTTP_DEADLINE_BACKGROUND_S`), the wait for in-flight tasks is finite. The run MUST NOT transition to `canceled` until all in-flight tasks have reached a terminal state and all final writes have committed.
 - `completed`: Run finished cleanly; all pool examples reached a terminal per-example outcome with no persistent failures. Results are authoritative and satisfy the Scale-Up Readiness Gate.
 - `incomplete`: Run finished, but at least one example still failed after the sequential retry pass. Metrics are diagnostic only and MUST NOT satisfy the Scale-Up Readiness Gate (§7.1).
 - `canceled`: Run was intentionally stopped, either manually by the SME or because a newer evaluation superseded it. All in-flight tasks have settled. Operation Records persisted during the `canceling` window are retained for audit but are non-authoritative. Canceled runs MUST NEVER produce authoritative aggregate metrics, even if some child Operation Records finished successfully. Evaluation metrics, run summaries, and gate checks MUST be computed only from Operation Records whose `evaluation_run_id` matches a `completed` run.
@@ -5350,7 +5620,7 @@ queued | running | paused | canceling | completed | canceled | failed
 - `queued`: Run record exists, input set and configuration snapshot taken, worker not yet started. Also used after restart recovery (with `recovered_from_restart=true`) before auto-resume.
 - `running`: Actively processing examples.
 - `paused`: Processing intentionally halted because the circuit breaker fired (§8.2 step 8). Resumable from the next unprocessed example. `paused_reason` records the cause (e.g., `"circuit_breaker_threshold_reached"`).
-- `canceling`: Cancellation requested; no new examples may start; in-flight work is unwinding and progress is being persisted.
+- `canceling`: Cancellation requested; no new examples may start, and in-flight work is unwinding. Each outcome transaction uses the durable run status to mark only post-request outcomes `ignored_due_to_run_cancellation=true`; finalization MUST preserve earlier outcomes. A schema-valid ignored outcome MUST NOT create an Auto-Labeled Label.
 - `completed`: All selected examples reached a terminal per-example outcome (success, schema-invalid, timeout, or endpoint_error). This does NOT mean every example succeeded — use counters to show the breakdown. The run itself finished.
 - `canceled`: User stopped the run (from paused or running state); already-persisted results are retained.
 - `failed`: Unrecoverable run-level failure (database/persistence failure, corrupted run state, uncaught runtime exception that prevents safe resume).
@@ -5360,17 +5630,24 @@ Transitions:
 ```text
 queued     -> running | canceling | failed
 running    -> paused | completed | canceling | failed
-paused     -> running | canceling | failed
+paused     -> queued | canceled | failed
 canceling  -> canceled | failed
 ```
 
 Terminal states: `completed`, `canceled`, `failed`.
 
-Restart recovery: batch labeling runs in `queued` or `running` state MUST transition to `queued` with `recovered_from_restart=true`, then auto-resume to `running` from the next unprocessed example using idempotent per-example persistence (§8.2 step 7). Runs in `paused` state remain `paused` (do not auto-resume). Runs in `canceling` state transition to `canceled` if `cancel_requested_at` was persisted; otherwise `failed`.
+Restart recovery: batch labeling runs in `queued` or `running` state MUST transition to `queued` with `recovered_from_restart=true`, then auto-resume to `running` from the next unprocessed example using idempotent per-example persistence and the durable circuit-breaker streak/latch (§8.2 steps 7–8). A set latch pauses before any new invocation even when an already-in-flight success reset the stored streak before interruption. Runs in `paused` state remain `paused` (do not auto-resume). Runs in `canceling` state transition to `canceled` if `cancel_requested_at` was persisted and their exact item lineage can be reconciled; recovery rebuilds counters from non-ignored authoritative items. Missing cancellation intent produces `failed` with `status_reason="backend_restart_interrupted"`; malformed snapshots or invalid durable lineage fail only the affected run with `status_reason="batch_recovery_state_invalid"` and do not abort recovery of other runs.
 
 Additional batch labeling run fields:
 
 - `paused_reason: string | null` (e.g., `"circuit_breaker_threshold_reached"`; null when not paused)
+- `circuit_breaker_threshold: int | null` in the detail response (the
+  run-start snapshot used to explain a circuit-breaker pause truthfully;
+  legacy run records may return null)
+- `circuit_breaker_consecutive` in durable run metadata (updated atomically
+  with each authoritative item outcome; reset by success or explicit Resume)
+- `circuit_breaker_tripped` in durable run metadata (latched atomically with
+  the item that reaches the threshold; cleared only by explicit Resume)
 - `examples_succeeded: int` (default: 0; schema-valid Core outputs with Label records created)
 - `examples_schema_invalid: int` (default: 0; Core-invalid outputs)
 - `examples_timeout: int` (default: 0)
@@ -5395,6 +5672,7 @@ Additional batch labeling run fields:
 - `visual_budget_preset_key: string | null` (required; §6.9; null when model does not support visual budget controls or when `evaluation_source=tao`)
 - `structured_generation_mode_effective` ∈ {`auto`, `prompt_only`} (required; the run-level structured generation mode; §6.2)
 - `inference_contract: object` (required; the effective Inference Contract for this run, §6.11: `output_field_mode`, `icl_field_mode`, `icl_max_examples`; legacy snapshots may additionally carry the retired `icl_pinned_edits_k` key, which comparisons ignore)
+- `runtime_config_snapshot: object | null` (required for new NIM-backed evaluation and Batch runs; null for TAO runs and terminal pre-v1_0003 history). The v1_0003 migration backfills valid non-terminal legacy NIM runs, including paused Batch runs, with version 1: model/endpoint lineage, URL/mode/auth mode, context and capability controls, resolved image cap, and model-default ICL cap. New runs use version 2, which adds a nested `inference_settings` object containing the selected sampling values, effective visual processor arguments, token-budget primitives, effective ICL cap/candidate limit/adaptive thresholds, and image transport edge. Startup upgrades non-terminal or paused Batch version-1 snapshots exactly once before recovery or Resume; terminal version-1 history remains valid. Snapshots MUST NOT contain credentials, filesystem authorization, timeouts, retries, concurrency, rate-limit policy, or emergency capability kill switches. `services.run_config.RuntimeConfigSnapshot` is the executable version-2 schema and MUST reject unknown or malformed persisted shapes.
 - `icl_eligible_count_at_start: int` (required; number of ICL-eligible Edits when the run started)
 - `icl_eligible_count_at_completion: int | null` (required; number of ICL-eligible Edits when the run completed; null while running; used for ICL growth recommendation threshold, §7.1)
 - `tao_job_id: string | null` (required when `evaluation_source=tao`; links to the TAO evaluate job)
@@ -5438,8 +5716,17 @@ A Project is top-level workspace boundary and MUST be partition key for all pers
 - `project_dir: string` (required; absolute path to `{workspace_root}/projects/{project_id}/`; §1.7)
 - `created_at: timestamp` (required)
 - `updated_at: timestamp` (required)
+
+Derived response field (not persisted):
+
+- `usage_policy` ∈ {`evaluation_only`, `operator_managed`} (required on API
+  responses). A hosted endpoint whose `base_url` host is
+  `integrate.api.nvidia.com` is `evaluation_only`; every other endpoint is
+  `operator_managed`. The latter
+  means only that the operator supplied or manages the endpoint. It MUST NOT be
+  presented as proof of a commercial subscription or entitlement.
 - `archived_at: timestamp | null` (default: `null`; set by `POST /v1/projects/{id}:archive`, cleared by `:unarchive`. Source of truth for soft-archive state; the `{project_dir}/.archived` sentinel marker is a lazy index. See §10.2.13.1 for the busy gate, cross-mutation guard, and worker-filter contract.)
-- `setup_completed_at: timestamp | null` (default: `null`; stamped on the first transition through onboarding via `POST /v1/projects/{id}:mark_setup_completed`. ``ProjectIndexRedirect`` routes to `/setup` when null, otherwise straight to labeling / image-ingestion. Stamping is idempotent at the service layer — redundant calls collapse to a single AuditEvent and stable timestamp.)
+- `setup_completed_at: timestamp | null` (default: `null`; stamped on the first transition through onboarding via `POST /v1/projects/{id}:mark_setup_completed`. ``ProjectIndexRedirect`` routes to `/setup` when null; afterward it resumes non-terminal training, opens the state-aware Project Overview when training history or Student models exist, or enters labeling for an early project. Stamping is idempotent at the service layer — redundant calls collapse to a single AuditEvent and stable timestamp.)
 
 Default selections:
 
@@ -5501,7 +5788,7 @@ Scale-Up Readiness Gate configuration (§7.3):
 
 - `scaleup_exact_match_threshold: float` (default: `0.80`)
 - `scaleup_per_field_match_threshold: float` (default: `0.80`)
-- `scaleup_min_per_value_f1_threshold: float` (default: `0.80`)
+- `scaleup_min_per_value_f1_threshold: float` (default: `0.60`)
 - `scaleup_accept_rate_threshold: float` (default: `0.80`)
 - `scaleup_accept_rate_window: int` (default: `50`)
 - `scaleup_min_test_pool_size: int` (default: `60`)
@@ -5533,6 +5820,8 @@ Every record family MUST include `project_id` including at minimum:
 
 - Operation Record (§13.1)
 - Run Record (§13.2)
+- Review Selector Scheduler State (§13.3; embedded on its Project record)
+- Project (§13.4)
 - DatasetExport (§13.5)
 - AuditEvent (§13.6)
 - Label (§13.7)
@@ -5542,14 +5831,18 @@ Every record family MUST include `project_id` including at minimum:
 - Pool (§13.11)
 - TAOJob (§13.12)
 - StudentModel (§13.13)
-- PromptPackage (§13.14 — removed in v1.0)
 - LocalNimDeployment (§13.15)
 - ClipEmbedding (§13.16)
 - NimEndpoint (§13.18)
 
 All APIs MUST enforce project scoping: no cross-project reads/writes; reject cross-project IDs even if syntactically valid.
 
-**Deployment-scoped exception:** `EmbeddingDeploymentConfig` (§13.17) is deployment-scoped (shared across all projects), not project-scoped. It stores infrastructure configuration for the embedding service, not per-project domain data. This follows the pattern of recent NVIDIA Blueprints where embedding services are configured as shared application infrastructure. TAO endpoint configuration (§1.6) is also deployment-scoped but stored in environment variables, not as a database record.
+**Deployment-scoped exceptions:** `EmbeddingDeploymentConfig` (§13.17),
+`TAODeploymentConfig` (§13.19), and
+`TAOBaseExperimentProvisioningRun` (§13.20) are shared across projects and do
+not carry `project_id`. They store deployment infrastructure state, not
+per-project domain data. TAO endpoint configuration (§1.6) is likewise
+deployment-scoped but stored in environment variables rather than a record.
 
 #### 13.4.4 Active Student resolution rules (required)
 
@@ -5564,7 +5857,7 @@ For workflows requiring Student selection:
 All workflow flags are project-scoped and stored in Project `feature_flags`:
 
 - `REVIEW_SELECTION_MODE`: `auto`, `phash_diverse`, or `clip_diverse`
-- `EMBEDDINGS_AUTO_COMPUTE`: when `true` (default when hosted NIM API key is configured), the system automatically computes CLIP embeddings for ingested images in the background. When `false`, CLIP embedding computation is skipped (review selector uses pHash-diverse mode). pHash is always computed inline at ingest regardless of this flag.
+- `EMBEDDINGS_AUTO_COMPUTE`: when `true` (default when hosted NIM API key is configured), the system automatically computes CLIP embeddings for ingested images in the background. When `false`, CLIP embedding computation is skipped (review selector uses pHash-diverse mode). The independent background pHash sweep always runs regardless of this flag.
 - `CLIP_SWITCHOVER_MIN_COUNT`: minimum number of eligible examples with CLIP embeddings before the review selector upgrades from pHash-diverse to CLIP-diverse (default: `50`; §5.5.2).
 
 Deployment capabilities (e.g., TAO installed) are not user-editable flags and are exposed read-only if surfaced (Section 10.2.8).
@@ -5666,9 +5959,9 @@ Minimum fields:
 - `source_metadata: object` (required; JSON; may be `{}`)
 - `state` ∈ {`Unlabeled`, `Auto-Labeled`, `Verified`, `Omitted`} (required)
 
-pHash (§5.6; computed inline at ingest):
+pHash (§5.6; populated asynchronously after ingest):
 
-- `phash: string | null` (required; hex-encoded perceptual hash; null only on computation failure)
+- `phash: string | null` (required; hex-encoded perceptual hash; null while the sweep is pending or after a computation failure)
 
 Omission provenance (required when `state="Omitted"`; null otherwise):
 
@@ -5807,6 +6100,14 @@ Outputs-fetch lifecycle (§1.3 background-task recovery + §9.7.5 required outpu
 - `outputs_fetch_status` ∈ {`pending`, `in_progress`, `completed`, `failed`} (required; default `pending`). Tracks the post-`succeeded` "fetch artifacts + merge resolved fields + emit SSE + run downstream actions" flow that the polling service performs inline once a TAO job reaches `succeeded`. Lifecycle: at handler entry the marker flips `pending → in_progress` in a short transaction so a crash from there on leaves a recovery marker; at successful exit the handler flips it to `completed`; on exception the handler flips it to `failed` and persists the sanitized exception text on `outputs_fetch_error_ref` (the failure is logged but not re-raised so the polling loop continues). Status-machine invariant: `outputs_fetch_status` is INDEPENDENT of `status` — `status="succeeded"` says TAO finished; `outputs_fetch_status="completed"` says the Blueprint finished consuming the result.
 - `outputs_fetch_error_ref: string | null` (sanitized exception text when `outputs_fetch_status="failed"`).
 
+The TAO job detail response and each TrainingSuite chain-job summary MUST expose
+both fields. The Training Job Monitor MUST continue polling a `succeeded` job
+while `outputs_fetch_status` is `pending` or `in_progress`, render that state as
+**Finalizing**, and explain that the downstream `not_started` job is waiting for
+artifact processing. `outputs_fetch_status="failed"` MUST render as the distinct
+**Artifact Failed** state with the sanitized diagnostic; it MUST NOT appear as a
+completed job with a downstream sibling indefinitely "waiting for a predecessor."
+
 Restart-recovery contract (Phase 12 amendment 2026-05-05): the polling service tick MUST scan, per project, for `status="succeeded" AND outputs_fetch_status IN (pending, in_progress)` and re-fire the success handler + chain-advance for each match. This closes the silent-halt failure mode where a backend restart mid-multi-GB-artifact-download leaves the chain frozen indefinitely (the legacy implementation only fired the handler once, on the tick that observed the status flip to `succeeded`). The recovery is idempotent: artifact downloads use atomic `.part` files truncated on retry; `register_from_tao_terminal` and `rescore_evaluate_job` tolerate re-execution; `_advance_after_terminal` only submits jobs still in `not_started`. `outputs_fetch_status="failed"` is terminal — the operator must manually flip back to `pending` to retry, otherwise auto-retry would mask real outages (S3 ACL bug, network partition, etc.). The live failure that motivated the contract (2026-05-04 full-stack validation, finding F7) is documented in the project's internal engineering archive.
 
 **F8 (Phase 12 amendment 2026-05-05) — non-blocking post-success dispatch.** The post-`succeeded` flow (artifact fetch + Student registration / re-scoring + chain advance) MUST run as a non-blocking in-process background task, NOT inline in the polling tick. The tick — which scans every project sequentially per `tao_polling_service.tick()` — would otherwise stall for the duration of a multi-GB safetensors download (typically 5–15 min on the workspace S3), preventing every other project's chain from advancing. Implementation: `services/tao_polling_service._dispatch_post_success_flow` registers `_post_success_flow(...)` (the wrapper around `_handle_succeeded` + `_advance_after_terminal`) via `background_manager.register("post-success-{tao_job_id}", ...)`. The task_id is unique per `tao_job_id` and dedup'd at the registry level: a recovery scan running in the same tick that already saw a fresh `succeeded` transition MUST NOT register a second task for the same job. Both the regular terminal-handling path (`_poll_single_job` line 1294 onward) and the `_recover_stuck_outputs_fetch_in_project` recovery scan use the same dispatch helper. The live head-of-line-blocking failure that motivated the change (2026-05-05 full-stack validation, finding F8) is documented in the project's internal engineering archive.
@@ -5823,6 +6124,7 @@ Minimum fields:
 
 - `project_id` (required)
 - `student_model_id` (required; unique within project)
+- `training_suite_id: string | null` (immutable parent Start Training action; required for suite-created Students, null only for legacy/ad-hoc TAO jobs outside a TrainingSuite)
 - `student_base_model_config_id` (required; catalog entry with `student_base` role)
 - `tao_job_id` (required; training TAOJob that produced this model)
 - `guidance_id` (required; Guidance version used for training data)
@@ -5842,6 +6144,12 @@ Two-part readiness (§9.5):
 - `quality_evaluation_run_id: string | null` (links to the evaluation Run Record from TAO evaluate)
 - `serving_status` ∈ {`pending`, `validated`, `failed`, `not_attempted`} (required; `validated` when NIM deployment + evaluation + benchmark succeed; `failed` when NIM deployment or evaluation fails; `not_attempted` when NIM evaluation has not been run)
 - `serving_evaluation_run_id: string | null` (links to the evaluation Run Record from NIM evaluation)
+
+The Student list/get API projection also derives
+`serving_benchmark_current: bool` and `serving_benchmark_blocker: string |
+null` from this referenced RunRecord. These are not additional persisted
+columns. They fail closed for missing, legacy synthetic, incomplete, failed,
+wrong-version, provenance-drifted, or incomplete-concurrency AIPerf evidence.
 
 NIM deployment state (§9.5.2):
 
@@ -5870,8 +6178,8 @@ Notes:
 
 - Each precision variant is a distinct StudentModel record (§2.3).
 - Quality validation (`quality_status="validated"`) requires TAO evaluate to succeed.
-- Serving validation (`serving_status="validated"`) requires NIM deployment + evaluation to succeed.
-- The `deployment_handoff` Action Request (§10.3) requires both `quality_status="validated"` AND `serving_status="validated"`.
+- Serving validation (`serving_status="validated"`) requires NIM deployment, evaluation, and the current AIPerf workload to succeed. Persisted legacy values remain auditable but project to `serving_benchmark_current=false`.
+- The `deployment_handoff` Action Request (§10.3) and portable bundle require `quality_status="validated"`, `serving_status="validated"`, AND `serving_benchmark_current=true`.
 
 ### 13.14 PromptPackage Record (Removed in v1.0)
 
@@ -5950,7 +6258,7 @@ Minimum fields:
 - `endpoint_url: string | null` (resolved endpoint URL; set for self-hosted or after local deployment succeeds; null for hosted when using the shared `NVIDIA_API_KEY` base URL)
 - `nim_container_image: string` (required; pinned image ref, default `nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0`)
 - `preferred_host_port: int` (required; default `8001`; §1.5 Mode C)
-- `gpu_memory_minimum_gb: int` (required; seeded default: 10 GB for NeMo Retriever VL 1B v2 NIM 2.0.0's non-optimized compatibility configuration; optimized footprints are approximately 5.6–9.3 GiB by architecture/precision.)
+- `gpu_memory_minimum_gb: int` (required; seeded default: 24 GB because the smallest GPU SKUs listed for NeMo Retriever VL 1B v2 NIM 2.0.0, L4 and A10G, have 24 GB. This is an eligibility floor, not a generic compatibility claim.)
 - `gpu_assignment: string | null` (e.g., `device=1`; null when not locally deployed)
 - `created_at: timestamp` (required)
 - `updated_at: timestamp` (required)
@@ -5959,7 +6267,8 @@ Notes:
 
 - The environment assessment endpoint (`GET /v1/environment`, §10.2.25) sources embedding-NIM deployment metadata from this record, not from the model catalog. The `local_deployable_models[]` response field covers catalog models; embedding NIM availability is reported via `recommended_embedding_mode` and the embedding-NIM-specific fields derived from this config.
 - On local embedding NIM deployment, the system creates a `LocalNimDeployment` record (§13.15) with `role="embedding"` for runtime container lifecycle tracking, and updates the Project's `embedding_provider` and `embedding_endpoint_id` to reference the resolved local endpoint.
-- This record is managed via the NIM Connection screen (`NIMConnectionPage.tsx`) and the bootstrap/environment assessment flow, not via project CRUD.
+- This record is managed via the split NIM setup chain and the post-onboarding
+  NIM Configuration screen (`NIMConnectionPage.tsx`), not via project CRUD.
 
 ### 13.18 NimEndpoint Record (Required)
 
@@ -5976,10 +6285,10 @@ Minimum fields:
 - `base_url: string` (required; e.g., `https://integrate.api.nvidia.com/v1`, `http://10.0.1.50:8000/v1`, `http://localhost:8000/v1`)
 - `api_format: "openai_compatible"` (required; all NIM endpoints expose the OpenAI-compatible surface)
 - `auth_mode` ∈ {`bearer`, `none`} (required; `bearer` for hosted with `NVIDIA_API_KEY`; `none` for self-hosted and local endpoints, which are expected to run on a trusted private network or behind an external gateway — the app attaches no credential)
-- `models_path: string` (default `/v1/models`; used for connection tests)
-- `health_ready_path: string` (default `/v1/health/ready`; used for local NIM startup polling)
-- `health_live_path: string | null` (default `/v1/health/live`)
-- `metrics_path: string | null` (default `/v1/metrics`; Prometheus metrics, available on self-hosted/local NIM only)
+- `models_path: string` (default `/models`; appended to a base URL that already includes `/v1`)
+- `health_ready_path: string` (default `/health/ready`; used for local NIM startup polling)
+- `health_live_path: string | null` (default `/health/live`)
+- `metrics_path: string | null` (default `/metrics`; Prometheus metrics, available on self-hosted/local NIM only)
 - `is_enabled: boolean` (default `true`; allows disabling without deletion)
 - `last_probe_at: timestamp | null`
 - `last_probe_status` ∈ {`unknown`, `healthy`, `unhealthy`, `auth_failed`, `unreachable`} (default `unknown`; updated by probe)
@@ -5991,7 +6300,10 @@ Minimum fields:
 
 Foreign key relationships:
 
-- `ModelConfig.endpoint_id` MUST reference `NimEndpoint.endpoint_id` within the same project. This binding is explicit — updated via `PATCH .../model_configs/{id}`, never by hidden cascade on endpoint create/update.
+- `ModelConfig.endpoint_id` MUST reference `NimEndpoint.endpoint_id` within the
+  same project. This binding is explicit: generic endpoint create/update never
+  changes it; `PATCH .../model_configs/{id}` or the dedicated verified
+  self-hosted-Teacher configuration operation changes it intentionally.
 - `OperationRecord.endpoint_id` MUST reference the exact `NimEndpoint` used for that invocation.
 
 Notes:
@@ -5999,7 +6311,10 @@ Notes:
 - On project creation, the system seeds a default `NimEndpoint` with `endpoint_mode="hosted"`, `base_url` from `HOSTED_NIM_BASE_URL` (Appendix A.4), `auth_mode="bearer"`, and `source_kind="seeded_hosted"`. All 8 seeded ModelConfig entries (§4.8) reference this endpoint.
 - When local NIM deployment succeeds (§1.5 Mode C), the system creates a `NimEndpoint` with `endpoint_mode="local_system_managed"`, the resolved local URL, and `source_kind="auto_registered_local"`, linked to the `LocalNimDeployment` record.
 - `NimEndpoint` records do NOT store API key values. The only credential is the deployment-level `NVIDIA_API_KEY` for hosted (`auth_mode="bearer"`) endpoints, resolved at runtime from secret storage (`.env` / environment variables, §12.1). Self-hosted and local endpoints carry no credential.
-- The NIM Connection screen (`NIMConnectionPage.tsx`) creates and updates `NimEndpoint` records when the SME configures self-hosted endpoints or overrides the default hosted endpoint.
+- Post-onboarding NIM Configuration (`NIMConnectionPage.tsx`) durably creates
+  or reuses and binds a verified self-hosted endpoint. The seeded hosted
+  endpoint remains the hosted path; local deployment auto-registers its own
+  endpoint only after verification.
 
 ### 13.19 TAODeploymentConfig Record (Deployment-Scoped; Required When Student Training Enabled)
 
@@ -6088,7 +6403,7 @@ The review selector uses a greedy max-min diversity algorithm with two tiers of 
 **Mode selection** (when `REVIEW_SELECTION_MODE=auto`):
 
 1. If the number of eligible examples with CLIP embeddings ≥ `CLIP_SWITCHOVER_MIN_COUNT` (default: 50) → use CLIP-diverse mode.
-2. Otherwise → use pHash-diverse mode (pHash is always available; §5.6).
+2. Otherwise → use pHash-diverse mode for candidates with hashes; if every candidate hash is null, use deterministic `example_key` order (§5.6).
 
 Forced modes: `REVIEW_SELECTION_MODE=clip_diverse` forces CLIP (falls back to pHash if fewer than `CLIP_SWITCHOVER_MIN_COUNT` CLIP embeddings exist); `phash_diverse` forces pHash.
 
@@ -6150,7 +6465,7 @@ Select:
 - `e* = argmin_e score(e)` over `C`
 - tie-break by stable ordering (ascending `example_key`)
 
-5. If `C` empty (no candidates have the active signal): select first eligible example by `example_key` ascending. This case is expected to be rare because pHash is computed inline at ingest, so only images with pHash computation failures would lack a signal.
+5. If `C` empty (no candidates have the active signal): select first eligible example by `example_key` ascending. This is expected while the post-ingest pHash/CLIP workers are still populating signals and remains the safe fallback after per-image signal failures.
 
 Omit-on-Skip: per §4.5. Omitted examples excluded from review selector and Batch Labeling inputs by default.
 
@@ -6236,6 +6551,11 @@ MODEL_REASONING_HEADROOM_TOKENS: 16384
 
 Note: `RUNTIME_PROMPT_OUTPUT_MAX_TOKENS_OVERRIDE` replaces the derived output budget when set. Under normal operation it is `null` and the system derives `max_output_tokens` per invocation from SchemaCore (§6.2). `RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN` defaults to `0.85` (15% reserved). None of the seeded catalog models have tiktoken encoder mappings; all use the `cl100k_base` fallback, so token counts are approximate. The 0.85 margin absorbs tokenizer mismatch while preserving reasonable context utilization (~217k effective input on a 256k window). Diversity-based ICL pruning (§6.2) handles overflow gracefully: the consequence of a too-tight margin is dropping one extra ICL example, not a system failure. Provider-reported calibration (tracking the ratio of NIM-reported `usage.prompt_tokens` to tiktoken estimates and dynamically adjusting the margin) is a candidate v1.1 enhancement requiring no architectural changes.
 
+Configuration validation requires positive token budgets, fractions and safety
+margins in `(0, 1]`, non-negative structural overhead, and valid sampling
+pairs (`temperature >= 0`, `0 < top_p <= 1`). Invalid values stop startup
+with the affected key instead of reaching an inference run.
+
 `MODEL_REASONING_HEADROOM_TOKENS` defaults to `16384`. This is the fixed headroom added to the schema-derived output budget when `thinking_mode_effective="on"`. Reasoning tokens consume the normal generation budget on vLLM-backed reasoning models (bounded by `max_tokens` unless `thinking_token_budget` is set separately); they are not free even when separated as `reasoning_content` in the response. NVIDIA's Cosmos Reason2 model guidance recommends `max_tokens=4096` or more to avoid truncating chain-of-thought responses. The `16384` default provides generous margin above the `4096` minimum floor, covering multi-field schemas and complex reasoning without requiring adaptive adjustment. Minimum acceptable value: `4096`. The automatic retry on truncation (§6.7.6 Step 6) handles individual invocations that exceed the budget; `RUNTIME_PROMPT_OUTPUT_MAX_TOKENS_OVERRIDE` is the deployment-level escape hatch.
 
 ICL selection:
@@ -6244,7 +6564,7 @@ ICL selection:
 ICL_MAX_EXAMPLES: null
 ```
 
-Note: `ICL_MAX_EXAMPLES: null` (the default) defers the selection cap to the Teacher model's `default_icl_max_examples` (§6.2); setting it non-null is an explicit deployment-wide override that replaces every per-model default. Note: ICL field rendering is governed exclusively by the effective Inference Contract (`icl_field_mode`, §6.11). There is no separate config key for ICL rendering mode. The Teacher always uses `icl_field_mode=core_only`; a Student uses the field mode derived from its training/export lineage. Valid field modes are `all`, `aux_and_core`, and `core_only`.
+Note: `ICL_MAX_EXAMPLES: null` (the default) defers the selection cap to the Teacher model's `default_icl_max_examples` (§6.2); setting it to a positive integer is an explicit deployment-wide override that replaces every per-model default. Zero and negative values are invalid; use the supported per-run `icl_mode="disabled"` where zero-shot execution is required (§7.1, §8.3). Note: ICL field rendering is governed exclusively by the effective Inference Contract (`icl_field_mode`, §6.11). There is no separate config key for ICL rendering mode. The Teacher always uses `icl_field_mode=core_only`; a Student uses the field mode derived from its training/export lineage. Valid field modes are `all`, `aux_and_core`, and `core_only`.
 
 Export field mode:
 
@@ -6260,9 +6580,9 @@ Note: 40% of Verified examples are reserved for evaluation. Both Accepts and Edi
 
 Scale-Up Readiness Gate (§7.3):
 
-Per-project (Project record §13.4): `scaleup_exact_match_threshold: 0.80`, `scaleup_per_field_match_threshold: 0.80`, `scaleup_min_per_value_f1_threshold: 0.80`, `scaleup_accept_rate_threshold: 0.80`, `scaleup_accept_rate_window: 50`, `scaleup_min_test_pool_size: 60`.
+Per-project (Project record §13.4): `scaleup_exact_match_threshold: 0.80`, `scaleup_per_field_match_threshold: 0.80`, `scaleup_min_per_value_f1_threshold: 0.60`, `scaleup_accept_rate_threshold: 0.80`, `scaleup_accept_rate_window: 50`, `scaleup_min_test_pool_size: 60`.
 
-Note: All thresholds are configurable per project (project API §10.2.13 — not process config). Defaults are pinned at 80% across the board: 80% overall accuracy, 80% per-field, 80% minimum per-value F1, 80% Accept rate. This ensures no single quality dimension, from overall accuracy down to individual category performance, is below a consistent bar before scaling. The 60-member Test Pool floor gives the common six-class datasets about ten held-out examples per class when balanced while remaining modest for three-class smoke datasets. Lower thresholds accept more risk in Auto-Labeled data quality; higher thresholds delay Batch Labeling but improve data quality.
+Note: All thresholds are configurable per project (project API §10.2.13 — not process config). The defaults are 80% overall accuracy, 80% per-field, 60% minimum per-value F1, and 80% Accept rate. The lower per-value F1 floor tolerates sparse-category variance while still catching severe systematic failures. The 60-member Test Pool floor gives the common six-class datasets about ten held-out examples per class when balanced while remaining modest for three-class smoke datasets. Lower thresholds accept more risk in Auto-Labeled data quality; higher thresholds delay Batch Labeling but improve data quality.
 
 Batch labeling defaults:
 
@@ -6273,7 +6593,7 @@ BATCH_LABEL_CONCURRENCY_HOSTED: 1
 BATCH_LABEL_CONCURRENCY_SELF_HOSTED: 8
 ```
 
-Note: `BATCH_LABEL_RUN_LIMIT` caps the total number of examples processed in a single batch labeling run. Default `null` means all eligible examples are processed. This is a run-level cost-control and incremental-batching knob, distinct from `ICL_MAX_EXAMPLES` which governs per-invocation ICL selection for all purposes including batch labeling. `BATCH_LABEL_CONCURRENCY_HOSTED` / `BATCH_LABEL_CONCURRENCY_SELF_HOSTED` set the provider-aware dispatch width (§8.2 step 6), overridable per run via the start request's `concurrency` field.
+Note: `BATCH_LABEL_RUN_LIMIT` caps the total number of examples processed in a single batch labeling run and MUST be a positive integer when set. Default `null` means all eligible examples are processed. `BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD` MUST also be positive. These values are validated at startup. The run limit is a cost-control and incremental-batching knob, distinct from `ICL_MAX_EXAMPLES` which governs per-invocation ICL selection for all purposes including batch labeling. `BATCH_LABEL_CONCURRENCY_HOSTED` / `BATCH_LABEL_CONCURRENCY_SELF_HOSTED` set the provider-aware dispatch width (§8.2 step 6), overridable per run via the start request's `concurrency` field.
 
 TAO endpoint (deployment-level; §1.6):
 
@@ -6373,7 +6693,7 @@ LOCAL_NIM_NVCLIP_PORT: 8001
 
 Note: `LOCAL_NIM_TEACHER_PORT` and `LOCAL_NIM_NVCLIP_PORT` are preferred host ports for local NIM deployment (§1.5 Mode C). The container always listens on port 8000 internally. If the preferred host port is occupied, the system uses the next available port and persists the resolved endpoint URL.
 
-`IMAGE_ROOT` is the single absolute directory tree exposed to filesystem browsing, scanning, ingestion, image serving, and path remapping (§10.2.10). When unset and `BIND_HOST` is loopback (`127.0.0.1`, `::1`), its effective value is `/` (local-only development mode). When unset and `BIND_HOST` is non-loopback, filesystem access is disabled until it is configured (§12.2). The shipped Compose stack sets `/data/images`.
+`IMAGE_ROOT` is the single absolute directory tree exposed to filesystem browsing, scanning, ingestion, image serving, and path remapping (§10.2.10). When unset and `BIND_HOST` is loopback (`127.0.0.1`, `::1`), its effective value is `/` (local-only development mode); when the bundled sample is available, the UI's initial view starts at its parent so the sample directory itself is selectable without narrowing that boundary. When unset and `BIND_HOST` is non-loopback, filesystem access is disabled until it is configured (§12.2). The shipped Compose stack sets `/data/images`.
 
 ### A.5 Pool Diversity Selection (Rebalancing)
 
@@ -6384,7 +6704,7 @@ Inputs:
 - Candidate set `P_cand`: non-pool Verified examples (both Accept and Edit)
 - Current pool members `P_curr` (may be empty on first fill)
 - Number of slots to fill: `n_needed`
-- Per-example: CLIP embedding (optional) and pHash (always available, §5.6)
+- Per-example: CLIP embedding (optional) and pHash (nullable while pending or failed, §5.6)
 
 Selection procedure:
 
@@ -6430,7 +6750,7 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: if a migration fails, the backend surfaces the error and the backup file path, does not proceed with the partially migrated database, and the original backup is still intact.
 - Verify: schema version is tracked in the database (Alembic version table present and populated).
 - Verify: write transactions do not span outbound HTTP calls or long-running operations. A synthetic test holding a write lock for >5s triggers `busy_timeout` on a concurrent writer, confirming the timeout is enforced.
-- Verify: on fresh system initialization, exactly one `EmbeddingDeploymentConfig` singleton record exists with all required fields populated with seeded defaults: `model_name="nvidia/llama-nemotron-embed-vl-1b-v2"`, `embedding_dim=2048`, `nim_container_image="nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0"`, `preferred_host_port=8001`, `gpu_memory_minimum_gb=10`, `provider="none"`. Existing deployment rows carrying the shipped 1.x default are upgraded idempotently to the 2.0.0 image and floor. The Phase 3 environment-assessment endpoint (`GET /v1/environment`) returns embedding-NIM metadata from this record without requiring prior user configuration.
+- Verify: on fresh system initialization, exactly one `EmbeddingDeploymentConfig` singleton record exists with all required fields populated with seeded defaults: `model_name="nvidia/llama-nemotron-embed-vl-1b-v2"`, `embedding_dim=2048`, `nim_container_image="nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0"`, `preferred_host_port=8001`, `gpu_memory_minimum_gb=24`, `provider="none"`. Existing deployment rows carrying the shipped 1.x default or former 10 GB floor are upgraded idempotently to the 2.0.0 image and supported-SKU floor. The Phase 3 environment-assessment endpoint (`GET /v1/environment`) returns embedding-NIM metadata from this record without requiring prior user configuration.
 
 **Configuration and bootstrap (§1.9):**
 - Verify: if `~/.vlm_feedback_loop/config.yaml` does not exist, the backend fails fast with a message directing the user to run the bootstrap command (e.g., `vlm-feedback-loop init`).
@@ -6440,7 +6760,7 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: `.env` file values at the canonical location `~/.vlm_feedback_loop/.env` are loaded at startup without requiring `--env-file` or `VLM_FEEDBACK_LOOP_ENV_FILE`.
 - Verify: `--env-file /path/to/custom.env` overrides the canonical location. A key in the custom file is loaded; the same key in the canonical file is not.
 - Verify: the backend does NOT search for `.env` in the current working directory, `WORKSPACE_ROOT`, or project directories. Place a `.env` with a test key in each of CWD, `WORKSPACE_ROOT`, and a project directory; confirm none are loaded (only the canonical or explicit-override file).
-- Verify: if no `.env` file exists at the selected location, startup continues. Missing secrets surface only when a workflow requiring them is used (e.g., hosted NIM inference fails with a clear "NVIDIA_API_KEY not configured" error, not a startup crash).
+- Verify: if no `.env` file exists at the selected location, startup continues. Missing secrets surface only when a workflow requiring them is used (e.g., hosted NIM inference fails locally, before any outbound request, with a clear "NVIDIA_API_KEY not configured" error rather than a startup crash or an unauthenticated probe).
 - Verify: all configurable defaults from Appendix A.4 are present and match their documented values when no overrides are set.
 - Verify: Appendix A.4 defaults are type-validated at load time. Arrays (e.g., `STUDENT_LATENCY_TEST_CONCURRENCIES`) parse as arrays, nested structures (e.g., visual budget preset definitions) are preserved, integers are integers. Setting an array-typed default to a plain string → startup fails with a clear error naming the misconfigured key.
 
@@ -6518,14 +6838,22 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: when projects exist (Screen 1.2), [+ Create Project] appears in the header. Each project renders as a card showing: name, description (when set; omitted when null), summary counts (Verified, Unlabeled, Auto-Labeled, Omitted), created date, and last updated date. The card displays 4 counts; `pending_relabel` is returned in the API response (§10.2.13) for programmatic consumers but is not shown in the card UI.
 - Verify: a project with no activity (just created) shows all counts at zero (Screen 1.2, "Weld Quality" example).
 - Verify: projects without a description show no description line (not an empty line or placeholder).
-- Verify: clicking a project card opens the project to its last active screen. A new project with no activity navigates to the NIM Connection screen (Screen 2).
+- Verify: clicking a project card resolves a state-aware destination. A new project with no activity navigates to the NIM setup choice (Screen 2A). Non-terminal Training Suites resume in Training Jobs; an active Student serving validation resumes Models & Results; any terminal Training Suite history or registered Student opens Project Overview; a labeling-ready project without Student-training history opens Labeling.
 - Verify: [+ Create Project] button (in empty state or header) opens the Create Project dialog (Screen 1.3) as a modal overlay.
 - Verify: Create Project dialog requires Name (marked with *); submitting with an empty name shows a validation error and does not call the backend.
 - Verify: Description field in the dialog is optional; submitting with name only succeeds.
-- Verify: clicking [Create Project] in the dialog calls `POST /v1/projects` with the entered name and description, and on success navigates to Screen 2 (NIM Connection).
+- Verify: clicking [Create Project] in the dialog calls `POST /v1/projects` with the entered name and description, and on success navigates to Screen 2A (NIM setup choice), unless an already-complete setup is auto-skipped.
 - Verify: clicking [Cancel] in the dialog closes it and returns to the project list without creating a project. No backend call is made.
 - Verify: when the backend returns a project lock error (§1.3), the Project Lock Error dialog (Screen 1.4) renders with title "Project In Use", message "This project is already open in another process. Close the other process and try again.", and a single [OK] button. No override, force-open, or retry action exists.
 - Verify: timestamps are displayed in the user's local time (backend stores UTC; frontend converts per §2.4).
+
+**Project Overview (`ProjectOverviewPage.tsx`):**
+- Verify: a mature project (any Training Suite history or registered Student) renders three distinct destinations: Interactive Loop, Models & Results, and Training Runs. Interactive Loop offers [Continue labeling], [Add images], and [Scale-Up]. Models & Results reports Student quality/serving counts and is disabled when no Student exists. Training Runs remains available whenever suite history exists, including failed and canceled runs.
+- Verify: the project header keeps [Overview], [Models & Results], and [NIM Configuration] reachable from every post-setup project screen. The overview is a re-entry choice surface, not a blocking modal.
+
+**Training Runs (`TrainingRunsPage.tsx`):**
+- Verify: Training Runs lists suites newest-first with model identity, preset, completed-job count, local-time start, and user-facing status. Active runs offer [Resume]; terminal runs offer [View details].
+- Verify: Training Runs and Training Job details expose status, metrics, lineage, and logs but no standalone checkpoint or TAO-output download. The portable NIM deployment bundle on Models & Results is the only trained-model delivery download.
 
 **Environment assessment (§1.5, §10.2.25):**
 - Verify: `GET /v1/environment` returns all required fields: `hosted_nim_available`, `local_deploy_available`, `docker_available`, `nvidia_toolkit_available`, `nvidia_api_key_configured`, `ngc_api_key_configured`, `gpus[]`, `local_deployable_models[]`, `embedding_deployment`, `missing_prerequisites[]`, `recommended_teacher_mode`, `recommended_embedding_mode`, and non-secret `active_local_nim_residents[]`.
@@ -6533,17 +6861,18 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: `local_deploy_available` = `true` only when Docker + NVIDIA toolkit + at least one GPU all detected; `false` if any is missing.
 - Verify: `gpus[]` populated from `nvidia-smi` output, including compute capability; empty array when `nvidia-smi` unavailable or fails.
 - Verify: `local_deployable_models[]` includes only seeded catalog entries with `local_deploy_metadata` (Teacher/Student VLM models). Each entry is annotated with `fits: boolean` comparing one physical GPU against both `nim_gpu_memory_minimum_gb` and optional `nim_compute_capability_minimum`. The embedding NIM is NOT in this array (reported separately via `embedding_deployment`).
-- Verify: `embedding_deployment` is sourced from `EmbeddingDeploymentConfig` (§13.17), not from the model catalog. Reports the embedding NIM model name, container image, GPU minimum, `fits` status, and provider. This is the single source for embedding-NIM deployment metadata used by the environment assessment and NIM Connection screen.
+- Verify: `embedding_deployment` is sourced from `EmbeddingDeploymentConfig` (§13.17), not from the model catalog. Reports the embedding NIM model name, container image, GPU minimum, `fits` status, and provider. `fits=true` only when a placement-available GPU both meets the configured floor and has an exact detected-name match in the pinned NIM support matrix. This is the single source for embedding-NIM deployment metadata used by the environment assessment and NIM setup/configuration surfaces.
 - Verify: `missing_prerequisites[]` lists each missing component with an `install_hint`.
-- Verify: quality-first recommendation logic: Omni wins on a GPU meeting ≥80 GB and compute capability ≥9.0; CR3-Nano wins when ≥56 GB but Omni is ineligible; Cosmos Reason2 2B wins on 36–55 GB. Super and Cosmos Reason2 8B remain selectable but do not outrank these defaults by memory size. An exact compatible `running` Blueprint Teacher yields `recommended_teacher_mode="local"` only when it matches that recommendation; a different resident is reported for explicit keep/replace. Without a preferred resident, the API-key + GPU-fit case recommends the fitting local Teacher for latency while using the hosted default as an immediate bridge during download; the local Teacher activates only after verification, and hosted-only remains available. No key + fitting local Teacher recommends `"local"`. A 10–35 GB GPU recommends hosted Teacher plus the local embedding NIM; a GPU below 10 GB does not recommend local embeddings.
+- Verify: quality-first recommendation logic: Omni wins on a GPU meeting ≥80 GB and compute capability ≥9.0; CR3-Nano wins when ≥56 GB but Omni is ineligible; Cosmos Reason2 2B wins on 36–55 GB. Super and Cosmos Reason2 8B remain selectable but do not outrank these defaults by memory size. An exact compatible `running` Blueprint Teacher yields `recommended_teacher_mode="local"` only when it matches that recommendation; a different resident is reported for explicit keep/replace. Without a preferred resident, the API-key + GPU-fit case recommends the fitting local Teacher for latency while using the hosted default as an immediate bridge during download; the local Teacher activates only after verification, and hosted-only remains available. No key + fitting local Teacher recommends `"local"`. A supported 24–35 GB GPU with an exact pinned-matrix name recommends hosted Teacher plus the local embedding NIM; a GPU below 24 GB or with an unrecognized name does not recommend local embeddings.
 - Verify: the endpoint does not return secret values (API keys). Only reports whether each key is configured (`nvidia_api_key_configured`, `ngc_api_key_configured`).
-- Verify: the assessment is recomputed on each call (not cached or persisted).
+- Verify: ordinary endpoint calls reuse one process-local Docker/toolkit/GPU snapshot while recomposing credentials, embedding configuration, and active NIM residents from current state.
+- Verify: `refresh_hardware=true` forces a new machine probe and replaces the cached snapshot; local NIM preflight remains a fresh live check regardless of the cached recommendation.
 - Verify: the endpoint is deployment-scoped (no `project_id` in path).
 
 **Model catalog and seeded defaults (§4.8, §10.2.19):**
-- Verify: on project creation, 10 seeded entries are present with correct values per §4.8: `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` (128000, teacher, vision: true, thinking: qwen, media: none, default ICL cap 4, local image `:1.7.0-variant`, 80 GB / cc9.0 floors), `nvidia/cosmos3-nano-reasoner` (131072, roles: teacher/student_base, vision: true, thinking: qwen, media: mm_processor_size), `nvidia/cosmos3-super-reasoner` (131072, same roles, same capabilities), `nvidia/cosmos-reason2-8b` (256000 tokens, roles: teacher/student_base, vision: true, thinking: qwen, media: mm_processor_size), `nvidia/cosmos-reason2-2b` (256000, same roles, same capabilities), `mistralai/mistral-large-3-675b-instruct-2512` (262144, teacher, vision: true, thinking: none, media: none), `nvidia/nemotron-nano-12b-v2-vl` (128000, teacher, vision: true, thinking: none, media: mm_processor_tiles), `stepfun-ai/step-3.7-flash` (262144, teacher, vision: true, thinking: always_on_reasoning, media: none), `minimaxai/minimax-m3` (500000, teacher, vision: true, thinking: none, media: none), `mistralai/mistral-medium-3.5-128b` (262144, teacher, vision: true, thinking: none, media: none).
-- Verify: `teacher_model_config_id` defaults to the effective `DEFAULT_TEACHER_MODEL` — `minimaxai/minimax-m3` by default — when no preferred healthy Teacher resident exists. With a compatible resident matching the current quality recommendation, project creation attaches its endpoint and returns the matching local model config as the selected Teacher.
-- Verify: all 10 seeded entries reference a default hosted NIM endpoint. The endpoint is a concrete, usable configuration from project creation — not a placeholder that requires Phase 3 to become functional. Capability probes (`unknown` at creation) are run later to validate what the endpoint supports.
+- Verify: on project creation, 8 seeded entries are present with correct values per §4.8: `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` (128000, teacher, vision: true, thinking: qwen, media: none, default ICL cap 4, local image `:1.7.0-variant`, 80 GB / cc9.0 floors), `nvidia/cosmos3-nano-reasoner` (131072, roles: teacher/student_base, vision: true, thinking: qwen, media: mm_processor_size), `nvidia/cosmos3-super-reasoner` (131072, same roles, same capabilities), `nvidia/cosmos-reason2-8b` (256000 tokens, roles: teacher/student_base, vision: true, thinking: qwen, media: mm_processor_size), `nvidia/cosmos-reason2-2b` (256000, same roles, same capabilities), `nvidia/nemotron-nano-12b-v2-vl` (128000, teacher, vision: true, thinking: none, media: mm_processor_tiles), `stepfun-ai/step-3.7-flash` (262144, teacher, vision: true, thinking: always_on_reasoning, media: none), and `mistralai/mistral-medium-3.5-128b` (262144, teacher, vision: true, thinking: none, media: none). No fresh seed has non-commercial-only or unknown published model terms; MiniMax M3 is absent.
+- Verify: `teacher_model_config_id` defaults to the effective `DEFAULT_TEACHER_MODEL` — `stepfun-ai/step-3.7-flash` by default — when no preferred healthy Teacher resident exists. With a compatible resident matching the current quality recommendation, project creation attaches its endpoint and returns the matching local model config as the selected Teacher. An override outside the commercial seed fails with an actionable error.
+- Verify: all 8 seeded entries reference a default hosted NIM endpoint. The endpoint is a concrete, usable configuration from project creation — not a placeholder that requires Phase 3 to become functional. Capability probes (`unknown` at creation) are run later to validate what the endpoint supports.
 - Verify: `GET .../model_configs?eligible_role=teacher` returns only entries with `teacher ∈ eligible_roles` AND `supports_image_input=true`.
 - Verify: `GET .../model_configs?eligible_role=student_base` returns only Cosmos Reason2 8B/2B and Cosmos 3 Nano/Super reasoner.
 - Verify: `POST .../model_configs` with `student_base` role on a non-seeded Cosmos Student base is rejected.
@@ -6557,8 +6886,9 @@ This is the same greedy max-min diversity approach used by the review selector (
 **NIM endpoint modes and connection testing (§1.5):**
 - Verify: Mode A (hosted NIM): base URL defaults to `https://integrate.api.nvidia.com/v1` with `Authorization: Bearer $NVIDIA_API_KEY`. Connection test via `GET /v1/models` returns the model list on valid key.
 - Verify: Mode B (self-hosted NIM): base URL is user-configured (including `/v1`); no credential is sent (self-hosted NIMs run on a trusted network). Connection test via `GET /v1/models` confirms endpoint reachable.
+- Verify: a self-hosted embedding selection is not accepted on model-list reachability alone. Test and Save each obtain one finite 2,048-dimensional vector through the configured NeMo Retriever `/embeddings` operation; Save persists the normalized deployment-scoped URL and re-resolves every non-archived project. A different URL is rejected while a Blueprint-managed embedding resident is active.
 - Verify: connection test failure returns a user-facing error message, not an unhandled exception or stack trace.
-- Verify: Mode C (local deploy): the system constructs `docker run` commands from `local_deploy_metadata` with: pinned container image, name-only `-e NGC_API_KEY`, NIM cache mount (`~/.cache/nim:/opt/nim/.cache`), host-to-container port mapping, `--runtime=nvidia`, GPU assignment, `--shm-size=32GB`, named container (`--name`). The Docker client receives the value only through a private child environment; neither a literal value nor a `KEY=value` assignment appears in argv, generated handoffs, or persisted validation evidence.
+- Verify: Mode C (local deploy): the system constructs `docker run` commands from `local_deploy_metadata` with: pinned container image, name-only `-e NGC_API_KEY`, NIM cache mount (`~/.cache/nim:/opt/nim/.cache`), loopback-only host-to-container port mapping (`127.0.0.1:{host_port}:8000`), `--runtime=nvidia`, GPU assignment, `--shm-size=32GB`, named container (`--name`). The Docker client receives the value only through a private child environment; neither a literal value nor a `KEY=value` assignment appears in argv, generated handoffs, or persisted validation evidence.
 - Verify: the NIM client abstraction supports both `GET /v1/models` (connection test) and `POST /v1/chat/completions` (inference dispatch). Inference dispatch enforces deadline (`HTTP_DEADLINE_INTERACTIVE_S` or `HTTP_DEADLINE_BACKGROUND_S`), applies bounded retries (§11), and parses the OpenAI-compatible response. This abstraction is exercised by capability probes (§6.2, §6.7.4, §6.9.2) and reused for all Teacher/Student invocations.
 
 **Capability probes — initial behavior (§6.2, §6.7.4, §6.9.2):**
@@ -6577,9 +6907,9 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: the image transport service exposes a batched preparation API that accepts all images for one model invocation in one call (ICL examples + query image), preserves input order, and returns prepared content parts plus per-image status/metadata. Callers do not loop one image at a time. Partial preparation failure (read/normalise error on any image) prevents the model request from being sent.
 
 **Local NIM deployment lifecycle (§1.5 Mode C):**
-- Verify: preflight checks run in order: (1) Docker available, (2) NVIDIA Container Toolkit, (3) GPU memory vs `nim_gpu_memory_minimum_gb`, (4) NGC_API_KEY configured, (5) model profile compatible — MUST execute `list-model-profiles` against the target container image; if no runnable profile exists on the current hardware, deployment fails with a clear error, (6) container image pullable. Each check reports pass/fail with diagnostic message.
+- Verify: preflight checks run in order: (1) Docker available, (2) NVIDIA Container Toolkit, (3) GPU memory vs `nim_gpu_memory_minimum_gb`, (4) NGC_API_KEY configured, (5) model profile compatible — MUST attempt `list-model-profiles` against the target container image; if no runnable profile exists on the current hardware, deployment fails with a clear error. A single-model image's exact missing-utility result is an explicit inconclusive pass to bounded serve health/served-model verification; shared-image selection remains blocked without a successful size-aware probe. (6) container image pullable. Each check reports pass/fail with diagnostic message.
 - Verify: `docker run` command includes `--gpus` with device specification (e.g., `device=0`). The resolved GPU assignment is persisted as `gpu_assignment` on the `LocalNimDeployment` record. Without explicit `--gpus`, the container would claim all GPUs, breaking concurrent local services.
-- Verify: GPU placement policy (F49 amendment, 2026-05-19, §1.5 one-NIM-per-GPU invariant) — at most one NIM container is `starting` or `running` on any GPU at any time. On a multi-GPU host, the auto-placer assigns the lowest free index deterministically (Teacher → device=0, embedding → device=1). Same-GPU co-location is not supported in v1. When every GPU is occupied, the auto-placer raises `GpuExhaustedError` and the deploy router returns `409 gpu_exhausted`. An exact compatible `running` Teacher is reused across projects without another reservation or container; the response is `disposition="reused"`, `deployment=null`, and names the owner resident. A different resident produces a structured 409 naming its model/project and is stopped only after the caller explicitly retries with `replace_resident=true`; the FTUE presents Keep vs Stop-and-start actions. An exact compatible `starting` Teacher produces `409 resident_starting` and cannot be replaced from that prompt. Each displaced deployment's `displaced_by_deployment_id` and `displaced_at` are persisted on its `LocalNimDeployment` row (§13.15).
+- Verify: GPU placement policy (F49 amendment, 2026-05-19, §1.5 one-NIM-per-GPU invariant) — at most one NIM container is `starting` or `running` on any GPU at any time. On a multi-GPU host, every role takes the lowest compatible free index at dispatch time; embedding placement additionally skips devices below its configured eligibility floor. Roles do not own fixed device numbers. Same-GPU co-location is not supported in v1. When every GPU is occupied, the auto-placer raises `GpuExhaustedError` and the deploy router returns `409 gpu_exhausted`. An exact compatible `running` Teacher is reused across projects without another reservation or container; the response is `disposition="reused"`, `deployment=null`, and names the owner resident. A different resident produces a structured 409 naming its model/project and is stopped only after the caller explicitly retries with `replace_resident=true`; the FTUE presents Keep vs Stop-and-start actions. An exact compatible `starting` Teacher produces `409 resident_starting` and cannot be replaced from that prompt. Each displaced deployment's `displaced_by_deployment_id` and `displaced_at` are persisted on its `LocalNimDeployment` row (§13.15).
 - Verify: single-GPU FTUE (Run-locally) skips the embedding deploy when a Teacher is queued (frontend defense-in-depth) and falls back to pHash diversity (§5.6); backend rejects the embedding deploy with `409 gpu_occupied` if the frontend somehow sends it without `replace_resident=true`.
 - Verify: Student NIM lifecycle (§9.5.2 step 0) stops every resident deployment on its target GPU before constructing the Student `docker run` and (§9.5.2 step 9) best-effort auto-restores those displaced deployments after the Student stops. Auto-restore failure does NOT fail `serving_status` — surfaces as a warning only.
 - Verify: GPU memory fast-fail: if detected GPU memory is below the model's minimum, deployment fails immediately naming the GPU and the requirement (e.g., "24 GB available, need ≥56 GB").
@@ -6597,16 +6927,18 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: connection probe (`GET /api/v2/orgs/{org_name}/jobs?limit=1`) runs on configuration. Auth failure surfaces: "Could not connect to TAO. Verify the API URL, key, and organization name."
 - Verify: `TAO_API_KEY` never appears in logs, API responses, or UI payloads.
 
-**NIM Connection screen (`NIMConnectionPage.tsx`):**
+**NIM setup chain (`NIMNvidiaKeyPage.tsx`, `NIMNgcKeyPage.tsx`, `NIMSetupGatePage.tsx`) and post-onboarding NIM Configuration (`NIMConnectionPage.tsx`):**
 - Verify: when project creation reused an exact running Teacher, onboarding confirms that the project-selected model matches the recommendation, uses `activePath="local"`, and queues no Teacher deployment. It fully auto-skips when embeddings need no action; a separately recommended local embedding NIM still follows the NGC/setup gate.
-- Verify: auto-configured skip (2.1): when both Teacher and embeddings can be configured without user input, this screen is skipped entirely. A non-blocking dismissable banner appears on the next screen showing the auto-selected configuration. Three banner variants tested: hosted Teacher + local embedding NIM, hosted-only, all-local.
+- Verify: auto-configured skip (2.1): when both Teacher and embeddings can be configured without user input, this screen is skipped entirely, except that a third-party hosted default with point-of-selection usage terms remains visible until the SME continues. A non-blocking dismissable banner appears on the next screen showing the auto-selected configuration. Three banner variants tested: hosted Teacher + local embedding NIM, hosted-only, all-local.
 - Verify: recommendation screen (2.2): two independent service rows (Teacher, Embeddings) each showing recommended mode and a [Configure] override. Only missing credentials prompted — keys already configured show "✓ configured." Detected hardware shown at top. [Continue] navigates forward.
+- Verify: the post-onboarding configuration screen proactively validates each credential required by its currently effective service modes exactly once, including under React Strict Mode. An all-local selection may validate the NGC key but MUST NOT contact a hosted NVIDIA endpoint merely because an unused `NVIDIA_API_KEY` remains configured; an all-hosted selection has the inverse behavior. `EMBEDDING_PROVIDER=none` produces `recommended_embedding_mode="none"`, visibly names pHash diversity, and does not prompt or probe for a hosted embedding key. Changing an override may validate the newly relevant credential.
 - Verify: [Configure] → hosted (2.3): shows API key field when not configured, [Get NVIDIA API Key ->] link, [Test Connection] action. Success shows "✓ Connected to NVIDIA hosted NIM." Failure shows "✗ This key was rejected..." with recovery guidance.
-- Verify: [Configure] → self-hosted (2.4): base URL required (with a helper noting to include `/v1` and that the endpoint must be reachable from the backend) and a trusted-network disclaimer in place of any credential field, [Test Connection]. When no endpoint available, [Request NIM Setup] generates an Action Request (2.7) inline.
+- Verify: post-onboarding [Configure] → self-hosted (2.4): base URL required (with a helper noting to include `/v1` and that the endpoint must be reachable from the backend) and a trusted-network disclaimer in place of any credential field, [Test Connection]. A green test lists only exact vision-Teacher models reported by the endpoint and present in the project catalog. [Save] re-verifies the selection, durably binds/selects it, re-probes capabilities, and returns to the project; a failed save remains on screen with an actionable error. Repeating the same save reuses one endpoint. When no endpoint is available, [Request NIM Setup] generates an Action Request (2.7) inline.
+- Verify: the Embeddings self-hosted override stages no URL until a real NeMo Retriever embedding request returns one finite 2,048-dimensional vector. Editing the URL clears that stage. [Save] repeats the proof, durably updates the deployment-scoped provider, re-resolves projects, and leaves an actionable error on screen without mutation when the endpoint fails or conflicts with an active managed embedding resident.
 - Verify: [Configure] → deploy locally (2.5): shows preflight results. Passed: Docker ✓, GPU ✓ (with model), NGC key ✓, image ref, profile. Failed: identifies which check failed, suggests alternatives ("Use hosted NIM or a self-hosted endpoint").
 - Verify: missing prerequisites (2.6): shown when local deployment recommended but Docker or NVIDIA Container Toolkit is missing. Copy-ready install commands, reference to `setup-local.sh`, [Switch to Hosted] fallback offered.
 - Verify: Action Request (2.7): read-only pre-filled block with project name, current catalog model options (explicitly stating only one is needed), hosting-team NGC key guidance, known GPU minimums, verification steps, and the endpoint/network/contact details to return. [Copy to Clipboard] action. Content does not contain secrets.
-- Verify: [Back] returns to previous screen; [Continue] navigates to Screen 3 (or Screen 4 when Screen 3 is skipped).
+- Verify: in the split setup chain, NGC [Back] returns to the setup choice and successful choices proceed through the setup gate to Confirm Defaults (or skip Confirm Defaults when valid). Post-onboarding NIM Configuration uses [Cancel] to return without applying staged changes and [Save] to apply verified changes before returning to the project.
 
 **Confirm Model Defaults screen (`ConfirmDefaultsPage.tsx`):**
 - Verify: skipped (3.1) when the selected Teacher is valid and its endpoint is connected. The one-shot banner names the actual selected Teacher, including a local resident adopted during project creation.
@@ -6663,8 +6995,9 @@ This is the same greedy max-min diversity approach used by the review selector (
 **Create Guidance screen — detailed UI (`CreateGuidancePage.tsx`, §6.6):**
 - Verify: sticky header shows "Create Guidance", project name, and live-updating status badge: "Valid" when 0 errors, "{N} errors" when errors exist. Badge updates as the SME edits.
 - Verify: sticky footer shows [Cancel] (secondary) and [Save Guidance] (primary). [Save Guidance] disabled when errors exist; enabled when 0 errors.
-- Verify: "Start from:" dropdown above the cards defaults to Blank. Options: Blank, Classification, Multi-label classification, Attribute extraction, Damage severity assessment, Recycling classification, Coarse grocery classification. Selecting a template pre-fills Description and proposes a starter schema; once the SME edits any content, the dropdown has no further effect.
-- Verify: each template pre-fills the correct fields per §6.6.2: Classification (1 enum Core), Multi-label (1 enum_set Core), Attribute extraction (1 string + 1 boolean Core), Damage severity (3 Core + 2 Aux per spec), Recycling classification (1 enum Core with the 6 TrashNet classes), Coarse grocery classification (1 enum Core with the 25 Freiburg Groceries classes). All templates omit `rationale_note` so the default is disabled.
+- Verify: "Start from:" dropdown above the cards defaults to Blank. Options: Blank, Classification, Rock, paper, scissors, Multi-label classification, Presence and count, Packaging information audit, Industrial anomaly inspection. Selecting a template pre-fills Description, Schema, and Rules. After the SME edits any content, changing the selection asks before replacing all three sections; cancel preserves the draft and restores the applied selection.
+- Verify: each template pre-fills the correct fields and Rules per §6.6.2: Classification (1 enum Core with conspicuous replacement values), Rock-paper-scissors (1 enum Core matching the bundled sample), Multi-label (1 enum_set Core with conspicuous replacement values), Presence and count (1 boolean Core + 1 non-negative integer Core), Packaging information audit (1 enum Core + 1 boolean Core), and Industrial anomaly inspection (2 enum Core matching the reduced, evidence-backed VisA contract). All templates omit `rationale_note` so the default is disabled.
+- Verify: one concise explanation appears below the applied selection. Rock-paper-scissors identifies the bundled 15-image walkthrough and CC BY 2.0 license. Packaging information audit identifies Open Food Facts image provenance and CC BY-SA terms. Industrial anomaly inspection identifies VisA, its 10,821-image/12-category scope, CC BY 4.0 license, and official source link. Generic option labels have no Starter/Demo prefix. No Open Food Facts or VisA images are bundled.
 - Verify: Description card shows helper text ("Describe the task..."), placeholder text, soft character counter (awareness only, no hard limit). An empty description does not block save and shows no inline error. No on-blur error.
 - Verify: SchemaCore card shows the explainer strip: "Core fields = required + evaluated · Aux fields = optional + not evaluated" with info tooltip. On create flow, the Core edit policy info banner is visible.
 - Verify: Core Fields section has primary styling; Aux Fields section has muted/secondary styling. The physical separation encodes the role at field creation time.
@@ -6699,19 +7032,20 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: path not found → 404 with "Directory not found: {path}". Path not readable → 403.
 - Verify: omitting `path` opens `IMAGE_ROOT` and returns `parent: null`; on loopback with `IMAGE_ROOT` unset, it opens `/`.
 - Verify: `IMAGE_ROOT` is enforced. Any path resolving outside it (after symlink resolution) → 403. Symlinks escaping it → rejected.
-- Verify: when backend binds to a non-loopback address and `IMAGE_ROOT` is unset, browse, scan, ingest, serve, and remap return 403 with "Filesystem browsing is disabled. Configure IMAGE_ROOT..."
+- Verify: when backend binds to a non-loopback address and `IMAGE_ROOT` is unset, browse, scan, serve, and remap return `403` with "Filesystem browsing is disabled. Configure IMAGE_ROOT..." Batch ingest returns `202` under its partial-success contract, with every disallowed row reported as `status="error"`, `error_code="path_not_allowed"`, and the same guidance; no Example is persisted.
 - Verify: when backend binds to loopback (`127.0.0.1`, `::1`) and `IMAGE_ROOT` is unset, filesystem access defaults to unrestricted.
 - Verify: the browse endpoint is deployment-scoped (no `project_id` in path).
 - Verify: `POST /v1/filesystem/scan` with `path` and `recursive=true` returns `{images[], skipped[], total_images, total_skipped}`. Each image has `storage_ref`, `suggested_example_key`, `size_bytes`.
-- Verify: `suggested_example_key` is deterministic: slug from relative path + `--` + first 12 hex chars of SHA-256 of relative path with extension. Same path always produces the same key.
-- Verify: when `project_id` is provided, scan reports per-image `key_status`: `available` (key unused), `already_exists_same_path` (idempotent re-ingest safe), `collision_different_path` (would be rejected). `total_collisions` counts `collision_different_path` items.
+- Verify: `suggested_example_key` is deterministic: slug from the path relative to configured `IMAGE_ROOT` (or the normalized absolute path when the root is unset) + `--` + the first 12 hex chars of SHA-256 of that canonical path with extension. The same file produces the same key when scanned from the dataset root or any nested directory.
+- Verify: when `project_id` is provided, scan reports per-image `key_status`: `available` (key and path unused), `already_exists_same_path` (source path already present, including under a legacy key), `collision_different_path` (key belongs to another path and would be rejected). `total_collisions` counts `collision_different_path` items.
 - Verify: skipped files (unsupported formats, unreadable) appear in `skipped[]` with reason.
 
 **Image ingestion — detailed behavior (§10.2.1):**
 - Verify: idempotent re-ingest: `{project_id, example_key}` exists with same `storage_ref` → returns existing record with `status="exists"`. No duplicate created.
 - Verify: key collision: `{project_id, example_key}` exists with different `storage_ref` → rejected with `status="error"`, `error_code="example_key_collision"`, message identifying both paths.
+- Verify: source-path duplicate: `{project_id, storage_ref}` exists under a different `example_key` → rejected with `status="error"`, `error_code="storage_ref_already_ingested"`. No duplicate Example is created.
 - Verify: `ingested_at` is server-set; client-provided value is ignored.
-- Verify: pHash computed inline during ingestion — every successfully ingested image has a `phash` value on the Example record before the ingestion response is returned.
+- Verify: ingest returns 202 with skeleton Example rows whose `phash` may be null; the restartable background sweep populates hashes in bounded batches, emits progress/completion SSE, and resumes pending rows after backend restart without duplicating Examples.
 - Verify: after ingestion completes, CLIP embedding background computation is triggered for newly ingested examples.
 - Verify: Example record has `state="Unlabeled"` after successful ingestion.
 
@@ -6802,7 +7136,7 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: proposal failed — endpoint error (7.4): "Endpoint error: could not reach the NIM endpoint." [Report NIM Issue] generates Action Request with endpoint URL, model name, and error details. Same actions available.
 - Verify: missing image (7.5): broken-image placeholder on left. "Image not found at original location." with expected path shown. [Report Missing Files] generates Action Request. Only [Skip] available (no Save/Retry). Proposal not attempted.
 - Verify: after [Save], the system immediately advances to the next image and requests a new proposal. No manual navigation required.
-- Verify: persistent elements on the labeling screen: Verified/Unlabeled/Omitted counts in the status bar; [Add Images] action always available.
+- Verify: persistent elements on the labeling screen: Verified/Unlabeled/Omitted counts in the status bar; [Add Images] action always available. When at least one Student model is registered, [Models & Results] appears beside the Scale-Up readiness action and navigates directly to Compare & Benchmark; it is absent for projects that have not produced a Student.
 
 **Labeling screen — edit flow and rationale (`LabelingPage.tsx`):**
 - Verify: when rationale notes are disabled, modifying a field never renders a rationale display/panel or calls regeneration; [Save] remains available and sends no rationale key or provenance metadata.
@@ -6844,12 +7178,12 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: `GET .../evaluation_runs` lists runs newest-first with cursor pagination. Supports `status` filter.
 - Verify: `POST .../evaluation_runs/{run_id}:cancel` transitions `running` → `canceling` → `canceled`. Returns 409 if already in a terminal state.
 - Verify: Evaluation Run state machine enforces only allowed transitions: `queued → running | canceling | failed`, `running → completed | incomplete | canceling | failed`, `canceling → canceled | failed`. Terminal states (`completed`, `incomplete`, `canceled`, `failed`) never transition out.
-- Verify: canceling is two-phase: stop dispatching new inferences immediately, wait for in-flight tasks to settle, then `canceled`. Operation Records persisted during `canceling` are marked `ignored_due_to_run_cancellation=true` and never contribute to metrics.
+- Verify: canceling is two-phase: stop dispatching new inferences immediately, wait for in-flight tasks to settle, then `canceled`. Only outcomes committed after the durable `canceling` transition are marked `ignored_due_to_run_cancellation=true`; finalization preserves earlier outcome authority, and ignored records never contribute to metrics.
 - Verify: canceled runs never produce authoritative aggregate metrics, even if some child Operation Records finished successfully.
 - Verify: restart recovery: evaluation runs in `queued`, `running`, or `canceling` → `failed` with `status_reason="backend_restart_interrupted"`.
 
 **Evaluation configuration snapshot and reproducibility (§7.1):**
-- Verify: on evaluation start, all project configuration is read once and persisted on the Run Record: `teacher_model_config_id`, `active_guidance_id`, `labeling_generation_preset_key`, `thinking_default_on`, `visual_budget_preset_key`, and the effective Inference Contract (`output_field_mode`, `icl_field_mode`, `icl_max_examples`).
+- Verify: on evaluation start, all semantic project configuration is read once and persisted on the Run Record: model, Guidance, preset keys, thinking mode, effective Inference Contract, and the credential-free version-2 `runtime_config_snapshot` containing model/endpoint values plus concrete sampling, visual, token-budget, ICL, and image-downscale inputs.
 - Verify: `icl_eligible_count_at_start` recorded at run creation.
 - Verify: configuration changes made after run creation do not affect the in-flight run. Change Teacher mid-evaluation → run continues with snapshotted Teacher.
 - Verify: two runs with different Inference Contracts are flagged as not directly comparable.
@@ -6864,6 +7198,12 @@ This is the same greedy max-min diversity approach used by the review selector (
 **Scale-Up Readiness Gate endpoint (§10.2.17):**
 - Verify: `GET .../scaleup_gate` returns `gate_status` ∈ {`not_ready`, `ready`} and `criteria[]` with per-criterion `{criterion_name, passed, current_value, threshold, message}`.
 - Verify: five criterion names: `overall_exact_match`, `per_field_match`, `min_per_value_f1`, `accept_rate`, `min_test_pool_size`.
+- Verify: `details` for `overall_exact_match` identifies the qualifying
+  evaluation run and its snapshotted Teacher model/config, plus whether the
+  current project configuration differs and which tracked fields changed. The
+  Scale-Up Teacher-readiness card names the current Teacher separately from
+  the evaluated Teacher; a historical score is never presented as if the
+  mutable current Teacher produced it.
 - Verify: `details` for `per_field_match` includes `failing_fields[{field_name, current_rate}]`. `details` for `min_per_value_f1` includes `failing_values[{field_name, value, f1, precision, recall}]`.
 - Verify: `message` for each criterion is plain language. No MLOps jargon.
 - Verify: endpoint is lightweight (no model invocation; queries persisted metrics and counts only).
@@ -6884,7 +7224,7 @@ This is the same greedy max-min diversity approach used by the review selector (
 **Evaluation Results detail panel (`LabelingPage.tsx`):**
 - Verify: subsequent run (7.28): "Previous: 82% (15)" → "Same images now: 85% (15)" with green/red delta. New and Overall secondary. Per-field match rate bars. Coverage gaps shown at bottom.
 - Verify: first run (7.29): Overall only (no Returning/New). Per-field match rates.
-- Verify: per-value breakdown expanded (7.30): F1/precision/recall per value of categorical Core fields. Values below 80% flagged "below 80%". Missing test pool values show "— (no examples)". Integer/string show match rate only.
+- Verify: per-value breakdown expanded (7.30): F1/precision/recall per value of categorical Core fields. Values below 60% flagged "below 60%". Missing test pool values show "— (no examples)". Integer/string show match rate only.
 - Verify: incomplete run (7.31): warning "Incomplete: N of M examples failed. Results are diagnostic only." Metrics labeled as diagnostic.
 - Verify: panel shows the run's config snapshot (Teacher, Guidance version, Generation Controls, pool version).
 
@@ -6895,13 +7235,13 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: `GET .../batch_label_runs` lists runs newest-first with cursor pagination.
 - Verify: `POST .../batch_label_runs/{run_id}:resume` transitions `paused` → `running`, resets the consecutive failure counter. Returns 409 if not in `paused` state.
 - Verify: `POST .../batch_label_runs/{run_id}:cancel` transitions `running` or `paused` → `canceling` → `canceled`. Returns 409 if in a terminal state.
-- Verify: Batch Labeling Run state machine enforces: `queued → running | canceling | failed`, `running → paused | completed | canceling | failed`, `paused → running | canceling | failed`, `canceling → canceled | failed`. Terminal: `completed`, `canceled`, `failed`.
+- Verify: Batch Labeling Run state machine enforces: `queued → running | canceling | failed`, `running → paused | completed | canceling | failed`, `paused → queued | canceled | failed`, `canceling → canceled | failed`. Terminal: `completed`, `canceled`, `failed`.
 - Verify: `completed` means all selected examples reached a terminal per-example outcome (success, schema-invalid, timeout, or endpoint_error) — not that all succeeded. Per-outcome counters show the breakdown.
 - Verify: `paused` is reserved for circuit breaker behavior only (§8.2 step 8), not for foreground-priority holds.
-- Verify: restart recovery: `queued`/`running` → `queued` with `recovered_from_restart=true` and auto-resume from next unprocessed. `paused` stays `paused`. `canceling` → `canceled` if `cancel_requested_at` persisted; else `failed`.
+- Verify: restart recovery: `queued`/`running` → `queued` with `recovered_from_restart=true` and auto-resume from the next reconciled item. `paused` stays `paused`. `canceling` → `canceled` only with persisted cancellation intent and valid item lineage; otherwise the affected run fails closed.
 
 **Batch Labeling execution detail (§8.2):**
-- Verify: configuration snapshot persisted on Run Record before processing begins: `teacher_model_config_id`, `active_guidance_id`, `labeling_generation_preset_key`, `thinking_default_on`, `visual_budget_preset_key`. Config changes after run creation do not affect the in-flight run.
+- Verify: configuration snapshot persisted on Run Record before processing begins: model, Guidance, preset keys, thinking mode, and credential-free version-2 `runtime_config_snapshot`. Model/endpoint and semantic process-config changes after run creation affect future runs only, including after restart or explicit Resume; live operational boundaries remain excluded.
 - Verify: input selection defaults to `state="Unlabeled"` excluding `state="Omitted"`. When `include_auto_labeled=true`, previously Auto-Labeled examples are also included; their existing Label records are replaced with new output.
 - Verify: when `BATCH_LABEL_RUN_LIMIT` is set, the run caps at that many examples (selected in ingestion order). Default null = all eligible.
 - Verify: `structured_generation_mode` is snapshotted as `structured_generation_mode_effective` on the Run Record.
@@ -6925,15 +7265,20 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: Auto-Labeled exports include only `schema_valid_core=true` outputs.
 - Verify: DatasetExport record persisted with `dataset_intent`, `export_field_mode`, `guidance_id`, `selection_definition_snapshot`, `example_count`.
 - Verify: `GET .../dataset_exports/{id}` retrieves the full record. `GET .../dataset_exports` lists exports with pagination, filterable by `dataset_intent`.
+- Verify: `GET .../dataset_exports/{id}/archive` streams only a completed
+  project-contained `.tar.gz` with `application/gzip`, an attachment filename,
+  and `X-Checksum-SHA256`; it works through both the Vite and nginx same-origin
+  paths without requiring client access to the backend workspace filesystem.
 
 **Scale-Up Hub (`ScaleUpHubPage.tsx`):**
 - Verify: gate not ready (10.1): "Not ready for Batch Labeling." with plain-language next steps (1–2 items). Examples: "Continue labeling — the test pool needs 17 more images." / "The model struggles with 'scratch' in damage_type — 67% accuracy (need 80%)." [Go to Labeling] and [Details] shown. [Details] opens full 5-criterion breakdown.
 - Verify: gate ready (10.2): "Ready for Batch Labeling." [Details] available. [Run Batch Labeling] enabled — clicking it IS the SME's confirmation.
-- Verify: primary CTAs (10.3): [Run Batch Labeling] disabled when gate not ready (reason shown below); [Train a Student] always enabled as navigation. The suite-launch endpoint owns authoritative TAO/workspace/timeout/data/role validation after [Start Training]. Both hub CTAs are always visible.
+- Verify: primary CTAs (10.3): [Run Batch Labeling] disabled when gate not ready (reason shown below); [Train a Student] always enabled as navigation. The suite-launch endpoint owns authoritative TAO/workspace/timeout/data/role validation after [Start Training], including at least one non-pool Verified training example and the configured Test Pool minimum. Both hub CTAs are always visible.
 - Verify: TAO setup Action Request (10.4): [Request TAO Setup] expands read-only pre-filled block with required config fields, target models, verification endpoint. [Copy to Clipboard]. Content does not contain secrets.
 
 **Batch Labeling pre-run screen (`BatchPreRunPage.tsx`):**
 - Verify: configuration review (11.1): shows Teacher, Guidance version, ICL edit count, Visual Budget (when supported), input count (Unlabeled excluding Omitted). Auto-Labeled notice always present: "Batch Labeling generates Auto-Labeled outputs. These are not ground truth until reviewed."
+- Verify: the selected Teacher endpoint's derived `usage_policy` resolves before launch. A seeded hosted API Catalog endpoint displays `Endpoint Use: NVIDIA API Catalog · evaluation only`; Run opens a confirmation naming the planned image count, trial-credit limitation, production-endpoint path, and NVIDIA API Trial Terms. Cancel and Configure do not create a run; Continue evaluation creates exactly one. Operator-managed endpoints launch without the confirmation and are not described as entitlement-verified.
 - Verify: advanced filters collapsed by default. Expanded: ingestion date range, "Include previously Auto-Labeled images" checkbox (off by default). When checked, input count updates to show both pools.
 - Verify: no-unlabeled state (11.2): input count 0 for Unlabeled. If Auto-Labeled exist, SME can check the include toggle. Otherwise [Add Images] / [Cancel].
 - Verify: [Run Batch Labeling] launches the run and navigates to Run Status screen (12).
@@ -6991,10 +7336,21 @@ This is the same greedy max-min diversity approach used by the review selector (
 **Training diagnostics and student model endpoints (§10.2.22, §10.2.20):**
 - Verify: `POST .../training_preflight` returns the same checks enforced by
   suite launch plus authoritative Verified Training Pool, Test Pool,
-  Auto-Labeled eligible/included, excluded, and usable totals.
+  required Test Pool minimum, Auto-Labeled eligible/included, excluded, and
+  usable totals.
+- Verify: selecting Cosmos 3 Super with any quantization scheme returns a
+  failed `quantization_compatible` check and starts no export, provisioning,
+  or TAO job; the same full-weight selection with an empty scheme list passes
+  that check as baseline-only.
+- Verify: `min_test_pool_size` fails when the active-Guidance Test Pool is
+  below `max(1, project.scaleup_min_test_pool_size)`; the failure blocks suite
+  launch and base provisioning without creating a TAO setup Action Request.
+- Verify: suite materialization rechecks the data requirements after base
+  provisioning and rejects a final evaluation export below the snapshotted
+  required minimum before uploads or TAO job creation.
 - Verify: `POST .../training_presets:resolve` returns deterministic per-model patches without probing TAO.
 - Verify: `GET .../student_models` lists StudentModel records with cursor pagination.
-- Verify: `GET .../student_models/{id}` returns full record: `student_base_model_config_id`, `tao_job_id`, `dataset_export_ids[]`, `training_preset`, `lora_config`, `checkpoint_packaging_status`, `quality_status`, `serving_status`, `quantization_method`.
+- Verify: `GET .../student_models/{id}` returns full record: `student_base_model_config_id`, `tao_job_id`, `dataset_export_ids[]`, `training_preset`, `lora_config`, `checkpoint_packaging_status`, `quality_status`, `serving_status`, derived `serving_benchmark_current` / `serving_benchmark_blocker`, and `quantization_method`.
 - Verify: `quality_status` set to `validated` when TAO evaluate succeeds and canonical re-scoring produces metrics. Set to `failed` when evaluate fails. Does not require NIM.
 
 **TAO re-scoring detail (§9.7.6):**
@@ -7009,6 +7365,9 @@ This is the same greedy max-min diversity approach used by the review selector (
   workload. Unprovisioned seeded entries remain visible and selectable.
 - Verify: **Compare candidate variants** is the explicit multi-base,
   Standard-preset, multi-quantization advanced intent.
+- Verify: the base selector excludes Cosmos 3 Super even when the backend
+  catalog response includes it, and both validation and comparison submissions
+  keep `enable_lora=true`. No Full-weight selector is rendered.
 - Verify: training data displays backend-authoritative Verified Training Pool,
   Test Pool, Auto-Labeled eligible/included, exclusion reasons, and final
   usable count. Auto-Labeled remains deselectable; Test Pool never trains.
@@ -7018,27 +7377,34 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: Start is fail-closed on form or preflight/data failure.
 - Verify: Start first opens a mandatory confirmation with selected models,
   resolved preset, variants, exact train/evaluate/quantize/benchmark job count,
-  usable/Test Pool counts, and long-running remote-infrastructure warning.
+  usable/Test Pool counts, and long-running remote-infrastructure warning. The
+  selected-model names preserve the exact request/execution order instead of
+  being re-sorted into catalog order.
 - Verify: explicit confirmation creates the suite and navigates to the
   Training Job Monitor. Missing bases are provisioned together under one
   conditional setup step before dataset exports and TAO chains.
 
 **Training Job Monitor (`TrainingJobMonitorPage.tsx`):**
 - Verify: `provisioning_run_id != null` renders one compact **Provision Student Bases** step with the selected missing model names and an NVIDIA-green running/completed status. No blue info treatment is used. If `provisioning_run_id == null`, the entire setup section is absent.
+- Verify: a failed pre-chain workspace transfer with both frozen export IDs linked returns backend-derived `setup_retryable=true` and renders its actionable `setup_error_ref` plus **Retry Dataset Upload**. The action resubmits every persisted suite-request field with the same idempotency key. Integrity failures return `setup_retryable=false` and render the diagnostic without a retry action because they require fresh exports and a new key.
 - Verify: project re-entry while a Training Suite is non-terminal (`provisioning`, `preparing`, `initialized`, or `running`) resumes the newest active suite in the Training Job Monitor. The monitor does not show a **Back to Scale-Up** action; the global **Projects** link is the deliberate exit, and reopening that project resumes its active Training Jobs.
 - Verify: a secondary **Cancel Jobs** action occupies the former **Back to Scale-Up** position for a non-terminal suite. A confirmation explains that completed work is preserved and remote cancellation is best effort. On confirmation, the UI calls the suite-level cancel endpoint, hides the action after the suite becomes `canceled`, and reports any unconfirmed TAO cancellations as a warning. The terminal banner exposes a right-aligned, bold white **Back to Projects** action. Reopening the project after local cancellation follows the normal project entry route instead of resuming Training Jobs.
 - Verify: the Training Job Monitor uses a display-label layer: canonical TAOJob statuses map to user-facing labels per the mapping in `src/ui/src/lib/training/statusDisplay.ts`. Every canonical status has a documented display label. Raw backend enum values never appear as badge text.
+- Verify: after TAO reports `succeeded`, the monitor shows **Finalizing** and
+  continues polling until `outputs_fetch_status` reaches `completed` or
+  `failed`; the downstream card identifies artifact handoff rather than
+  incorrectly claiming the TAO predecessor is unfinished.
 - Verify: not started (14.0): `not_started` renders as **Not Started** (neutral badge). Visible in the chain display for jobs awaiting predecessor completion.
 - Verify: submitting (14.0): `submitting` renders as **Submitting** (info badge + spinner). Brief transitional state while the system sends the job to TAO.
 - Verify: submitted (14.1): `submitted` renders as **Submitted** (info badge). Queued (14.1): `queued` renders as **Queued** (info/neutral badge). Both shown on the same card layout; badge updates as status transitions. Card shows model, preset, policy, dataset info. "Waiting for TAO to start..."
 - Verify: running (14.2): `running` renders as **Running** (success/info badge + spinner). Epoch progress, ETA, latest metrics, and [View Logs] render independently only when TAO supplies each value; absent telemetry produces no label, dash placeholder, empty body, or reserved action row.
 - Verify: paused (14.3): `paused` renders as **Paused** (warning badge). Progress frozen. "Job paused by TAO." [View Logs] / [Cancel Job].
-- Verify: completed (14.4): `succeeded` renders as **Completed** (success badge), not "Succeeded." Final metrics, duration, and a link to the action-specific output artifacts under `{project_dir}/artifacts/tao_jobs/{tao_job_id}/` (per §9.7.5: merged HF checkpoint for `train`/`quantize`; extracted `evaluate_results.tar.gz` + synthesized `per_sample_predictions` for `evaluate`). [View Logs].
-- Verify: failed (14.5): `failed` (without `chain_halted_reason`) renders as **Failed** (error badge). Sanitized error details. [View Logs] / [Report TAO Issue] Action Request.
-- Verify: canceled (14.6): `canceled` renders as **Canceled** (neutral badge). Cancellation timestamp and complete current/total progress render only when supplied; partial or absent telemetry is omitted.
+- Verify: completed (14.4): `succeeded` renders as **Completed** (success badge), not "Succeeded." Final metrics and duration remain visible with [View Logs]. Backend artifact references and workspace paths are not rendered, and no per-file download action exists; retrieved outputs remain internal inputs to evaluation, recovery, and portable NIM bundle construction.
+- Verify: failed (14.5): `failed` (without `chain_halted_reason`) renders as **Failed** (error badge). Sanitized error details. Remote TAO failures expose [View Logs] / [Report TAO Issue]. A `student_nim_local` evaluation failure instead identifies Student NIM serving validation and links to Compare & Benchmark; it never reports the local failure as a TAO issue.
+- Verify: canceled (14.6): an operator/upstream `canceled` job renders as **Canceled** (neutral badge). Cancellation timestamp and complete current/total progress render only when supplied; partial or absent telemetry is omitted. A durable `auto-skip:` evaluation instead renders as **Not Required** and explains that local Student NIM validation continues in Compare; it is success-equivalent chain policy, not a cancellation.
 - Verify: deleted (14.7): `deleted` renders as **Deleted** (subdued/neutral badge). "Job removed from TAO. Record preserved locally for audit."
-- Verify: full chain display (14.8): all jobs for each base model grouped under model header. Chain progress line ("8B: done  2B: 5 of 6"). Jobs show display labels inline (Not Started, Submitting, Submitted, Queued, Running, Completed, Failed, Halted, Canceled, Deleted). [Compare Students] appears when all chains complete with at least one completed evaluation.
-- Verify: chain halted (14.9): failed job shown with **Failed** badge and error. Subsequent jobs marked **Halted** (warning badge) with "Chain halted: {failed_job} failed." **Halted** is used for `failed` + `chain_halted_reason != null` — distinct from **Failed** (job ran and errored). "Skipped" MUST NOT be used.
+- Verify: full chain display (14.8): all jobs for each base model grouped under model header. Chain progress line uses compact family labels (for example, "8B: done  2B: 5 of 6" and "Nano: done  Super: 2 of 4"). Job headings humanize canonical quantization enums (for example, `FP8_DYNAMIC` is displayed as **FP8 Dynamic**) while API and persistence values remain unchanged. Jobs show display labels inline (Not Started, Submitting, Submitted, Queued, Running, Completed, Failed, Halted, Canceled, Deleted). Once every job is terminal, [Compare Students] is enabled when at least one finalized training artifact exists, even if an independent model chain failed; Compare remains responsible for each Student's quality and serving eligibility.
+- Verify: chain halted (14.9): failed job shown with **Failed** badge and error. Subsequent jobs marked **Halted** (warning badge) with a concise outcome such as "Chain halted: {failed_job} failed." or "Chain halted: {canceled_job} canceled by SME." Durable sequence numbers and job IDs remain available through the API but do not appear in SME-facing copy. **Halted** is used for `failed` + `chain_halted_reason != null` — distinct from **Failed** (job ran and errored). "Skipped" MUST NOT be used.
 
 **Student NIM deploy endpoint (§10.2.20):**
 - Verify: `POST .../student_models/{id}:deploy_nim` with `nim_endpoint_url=null` triggers local orchestration (Tier 1). Returns `nim_preflight_status`, `nim_preflight_details`, `nim_deployment_mode="local"`, `status="deploying"`.
@@ -7074,8 +7440,10 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: NIM logs profile selection at startup; the system records it on the StudentModel.
 
 **Compare & Benchmark screen — default and fallback views (`CompareBenchmarkPage.tsx`):**
-- Verify: default view (15.1): TAO quality results available immediately. Teacher shown as accuracy baseline with Exact Match and per-field rates, sourced from the most recent completed Teacher-contract evaluation run (empty state when none exists). Each Student variant card shows: Exact Match with delta vs Teacher, per-field rates. "Not benchmarked" for variants without NIM results. Scope controls: [Benchmark All], [Benchmark Selected] (checkboxes on cards), per-card [Benchmark]. Metric selector dropdown controls per-field section across all cards. [Chart] toggle renders grouped bar chart.
+- Verify: default view (15.1): TAO quality results available immediately. Teacher shown as accuracy baseline with Exact Match and per-field rates, sourced from the most recent completed Teacher-contract evaluation run (empty state when none exists). The view is project-wide: every retained Student remains visible and actionable, grouped under newest-first Training Run headings that show local-time start, preset, Guidance version, selected bases, and training/Test Pool counts. Each Student variant card shows Exact Match and per-field rates; the delta vs Teacher renders only when Guidance, frozen Test Pool, and effective Inference Contract match. Historical cards use their own immutable Guidance schema. "Not benchmarked" appears for variants without NIM results. Scope controls: [Benchmark All (N)], [Benchmark Selected] (checkboxes on cards), per-card [Benchmark]. Metric selector dropdown controls per-field sections across all cards. [Chart] toggle renders a grouped bar chart whose Student series labels include the Training Run timestamp; duplicate candidates remain uniquely identified.
+- Verify: cross-run provenance (15.1b): when an older run differs from the latest run's Guidance, export field mode, or evaluation dataset checksum—or the evaluation set cannot be verified—the run heading states that cross-run score differences are directional. When a Student's quality run and the Teacher baseline differ in Guidance, Pool version, or effective Inference Contract, its numeric Teacher delta is hidden and the run heading explains why. The chart repeats a mixed-context warning whenever any visible run carries one of these warnings; it never silently presents mixed evidence as directly comparable.
 - Verify: NIM preflight fallback (15.1a): when preflight failed, per-card [Benchmark] replaced by [Deploy for serving validation] (per §10.3.4 label list). Clicking expands `student_nim_deploy` Action Request with `docker run` command. Once deployed externally and endpoint registered, [Benchmark] becomes available.
+- Verify: a packaged quality-failed Student remains visible and can run [Deploy for serving validation] through the normal NIM lifecycle while serving is not yet validated. The card shows live stages and states that only a backend-classified upstream loader gap may let the resulting clean NIM evaluation recover quality; arbitrary TAO failures remain quality-failed.
 - Verify: benchmark in progress (15.2): card shows sequential stages: Starting container → Health check (with elapsed time) → Smoke inference → Running evaluation (N/M) → Running latency benchmarks (c=1, c=8, c=24) → Stopping container. Only one variant benchmarks at a time.
 
 **Compare & Benchmark screen — metric drill-down and chart (`CompareBenchmarkPage.tsx`):**
@@ -7084,7 +7452,12 @@ This is the same greedy max-min diversity approach used by the review selector (
 
 **Compare & Benchmark screen — serving results and deployment (`CompareBenchmarkPage.tsx`):**
 - Verify: serving latency (15.5): a serving-validated variant renders p50/p90/p99 at each configured concurrency level (default c=1, c=8, c=24), read from its serving run's persisted `metrics.benchmarks`.
-- Verify: deployment handoff (15.6): [Request Production Deployment] on a variant card with both `quality_status=validated` AND `serving_status=validated`. Renders `deployment_handoff` Action Request inline: checkpoint path, NIM config (NIM_MODEL_NAME, NIM_MODEL_PROFILE, backend, release), model metadata (base model, quantization, TP, GPU), evaluation snapshot (Exact Match, per-field, per-value, latency per concurrency, pool version, ICL mode, Guidance), training lineage (TAO job, quantize job, datasets, preset, LoRA). [Copy to Clipboard].
+- Verify: Student identity rows present canonical quantization in readable product
+  copy (for example, `FP8 Dynamic`) while APIs and lineage retain the exact wire
+  enum (`FP8_DYNAMIC`), and label the persisted GPU type/count as benchmark
+  hardware rather than leaving it ambiguous as a deployment requirement.
+- Verify: deployment handoff (15.6): [Request Production Deployment] on a variant card with `quality_status=validated`, `serving_status=validated`, and `serving_benchmark_current=true`. A historical synthetic serving result instead shows its evidence plus **AIPerf revalidation required** / [Revalidate with AIPerf], and both handoff and portable bundle reject it. An eligible card renders the `deployment_handoff` Action Request inline with the five headings Checkpoint, NIM Configuration, Model, Evaluation, and Training Lineage; includes checkpoint path, NIM config (NIM_MODEL_NAME, NIM_MODEL_PROFILE, backend, release), model metadata (base model, quantization, TP, GPU), evaluation snapshot (Exact Match, per-field, per-value, latency per concurrency, pool version, ICL mode, Guidance), and training lineage (TAO job, quantize job, datasets, preset, LoRA). [Download portable NIM deployment bundle] [Copy to Clipboard]. This is the sole trained-model delivery download; raw TAO outputs are not downloadable separately.
+- Verify: closing validation may re-execute the same deterministic handoff name. It removes an exact exited validation container before launch and removes the container it started after stopping it. A running container with that name is never force-removed or displaced; the rerun fails with an actionable name-conflict result. Failure to stop or remove a container started by the validation is itself a failed handoff result rather than a hidden successful run with a stranded GPU resident.
 - Verify: [Request Production Deployment] returns 409 if Student does not have both quality and serving validated.
 - Verify: label-disambiguation invariant — [Deploy for serving validation] (15.1a) and [Request Production Deployment] (15.6) are visually + textually distinct. The same Student card MUST NOT render both buttons simultaneously, and neither label MUST ever appear as the bare "Request Deployment" string used by the legacy spec wireframes.
 
@@ -7142,7 +7515,7 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: overall Exact Match criterion uses the most recent completed evaluation run; fails when no evaluation exists.
 - Verify: per-core-field match rate criterion checks every Core field individually; reports which field(s) failed.
 - Verify: minimum per-value F1 criterion checks every value of every categorical Core field; reports which value(s) failed with F1, precision, and recall.
-- Verify: per-value F1 threshold is configurable per project (default 80%).
+- Verify: per-value F1 threshold is configurable per project (default 60%).
 - Verify: Accept rate computed as rolling window over most recent `SCALEUP_ACCEPT_RATE_WINDOW` Verified labels; uses actual count as denominator when fewer exist.
 - Verify: minimum Test Pool size criterion checks live Test Pool member count.
 
@@ -7240,7 +7613,7 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: configuration change detection is lightweight (compares persisted values only; no model invocation).
 
 **pHash computation (§5.6):**
-- Verify: pHash is computed inline during image ingestion (not background).
+- Verify: pHash is computed by the restartable background ingest sweep after the 202 skeleton response; pending rows carry `phash=null`.
 - Verify: pHash is CPU-only with no external dependency.
 - Verify: pHash stored as hex-encoded string on Example record (`phash` field).
 - Verify: pHash computation failure for an individual image does not fail the ingestion.
@@ -7250,7 +7623,7 @@ This is the same greedy max-min diversity approach used by the review selector (
 
 **CLIP embedding computation (§5.5):**
 - Verify: default-on via hosted embedding NIM when API key is configured.
-- Verify: when `EMBEDDINGS_AUTO_COMPUTE=false` (feature flag), CLIP-style background computation is entirely skipped after ingestion. No embedding-NIM calls are made. The review selector uses pHash-diverse mode. pHash is still computed inline (unaffected by the flag).
+- Verify: when `EMBEDDINGS_AUTO_COMPUTE=false` (feature flag), CLIP-style background computation is entirely skipped after ingestion. No embedding-NIM calls are made. The independent pHash background sweep still runs, and the review selector uses available pHash values with deterministic no-signal fallback while hashes are pending.
 - Verify: the embedding-NIM probe runs at project creation when `embedding_provider` is configured. If the probe fails at project creation, the system re-attempts at first ingest. A single early failure does NOT permanently disable embeddings for the project. If the re-attempt at first ingest also fails, `embedding_provider` is set to `none`.
 - Verify: after both probe attempts fail and `embedding_provider=none`, the review selector continues with pHash-diverse mode. The SME can trigger a re-probe by reconfiguring the embedding provider.
 - Verify: background computation; labeling not blocked (§5.5.2).
@@ -7301,7 +7674,7 @@ This is the same greedy max-min diversity approach used by the review selector (
 - Verify: `generation_preset_key`, `sampling_params_effective`, `thinking_mode_effective`, `thinking_request_fields_effective`, and `max_tokens_effective` persisted on every Operation Record.
 
 **Visual Budget Controls (§6.9):**
-- Verify: `visual_budget_mode` seeded per model in the catalog: the Cosmos family (Reason2 8B/2B, Cosmos 3 Nano/Super) → `mm_processor_size`; Nemotron Nano VL → `mm_processor_tiles`; all other seeded teachers (Mistral Large 3 / Medium 3.5, Nemotron 3 Nano Omni, Step 3.7 Flash, MiniMax M3) → `none`.
+- Verify: `visual_budget_mode` seeded per model in the catalog: the Cosmos family (Reason2 8B/2B, Cosmos 3 Nano/Super) → `mm_processor_size`; Nemotron Nano VL → `mm_processor_tiles`; all other seeded teachers (Mistral Medium 3.5, Nemotron 3 Nano Omni, Step 3.7 Flash) → `none`.
 - Verify: runtime probe uses a two-stage flow (baseline without `mm_processor_kwargs`, then capability with mode-specific kwargs) using a 512×512 RGB PNG probe image (§6.9.2). Baseline success + capability success → `supported`; baseline success + capability failure → `unsupported`; baseline failure → `unknown`. `visual_budget_mode=none` auto-sets `unsupported` without probing.
 - Verify: preset selection resolves to model-specific `mm_processor_kwargs` based on `visual_budget_mode`.
 - Verify: when `visual_budget_support=unsupported`, no `mm_processor_kwargs` sent and UI hides Visual Budget controls.
@@ -7407,8 +7780,8 @@ Each log point is tested as part of its owning phase. The owning step verifies t
 
 **Two-part Student readiness (§9.5, §13.13):**
 - Verify: `quality_status` on StudentModel is set to `validated` after TAO evaluate succeeds; does not require NIM.
-- Verify: `serving_status` on StudentModel is set to `validated` after NIM deployment + evaluation succeed.
-- Verify: `deployment_handoff` Action Request requires both `quality_status="validated"` AND `serving_status="validated"`.
+- Verify: `serving_status` on StudentModel is set to `validated` after NIM deployment + evaluation + every current AIPerf concurrency cell succeeds; legacy synthetic evidence remains historical and derives `serving_benchmark_current=false`.
+- Verify: `deployment_handoff` Action Request and portable deployment bundle require `quality_status="validated"`, `serving_status="validated"`, AND a current AIPerf serving run; legacy/missing/drifted evidence fails closed.
 - Verify: `deployment_handoff` evaluation snapshot includes per-value precision/recall/F1 for categorical Core fields (not just per-field match rates). §10.3.3 requires "at minimum: overall Exact Match rate, per-core-field match rates, per-value precision/recall/F1 for categorical Core fields, latency p50/p90/p99."
 - Verify: Compare & Deploy screen shows TAO quality results immediately; NIM serving results shown when available.
 - Verify: Teacher appears as accuracy baseline only; Teacher latency is not included in Student comparison (may be hosted externally).
@@ -7430,6 +7803,12 @@ Each log point is tested as part of its owning phase. The owning step verifies t
 - Verify: `student_nim_deploy` Action Request includes exact `docker run` command, checkpoint path, GPU requirements, NIM release, environment variables, health check commands, and temporary infrastructure note.
 - Verify: `deployment_handoff` Action Request includes checkpoint ref, NIM config, model metadata, evaluation snapshot, and training lineage.
 - Verify: `deployment_handoff` references only checkpoints with `checkpoint_packaging_status="validated"`.
+- Verify: the portable deployment bundle applies every `deployment_handoff`
+  gate, streams the complete project-contained NIM-loadable checkpoint payload
+  (excluding TAO completion logs/state) plus manifest,
+  checksums, README, launch, schema-aware serving request, health, and
+  real-image structured-label verification helpers, and rejects symlinks/path
+  escape without including a NIM image or credential.
 - Verify: `deployment_handoff` `technical_requirements` populates the four §10.3.3 customer-facing keys: `nim_model_profile_recommended` (sourced from `student.nim_model_profile_selected ?? nim_model_profile_requested`), `gpu_requirements` (formatted `f"{gpu_count}× {gpu_type} (≥{memory_gb} GB)"` with the per-base-model memory minimum), `tensor_parallelism` (integer; sourced from `nim_profile_metadata.tp` with default 1), and `nim_env_vars_recommended` (dict with at minimum `NGC_API_KEY` placeholder + `NIM_MODEL_NAME`, plus `NIM_SERVED_MODEL_NAME` and `NIM_MODEL_PROFILE` when set).
 - Verify: `deployment_handoff` `technical_requirements.docker_run_command` and `docker_run_args` are sourced via the canonical `local_nim_service.build_student_docker_run_*` wrappers — byte-equivalent (modulo the literal `NGC_API_KEY` value) to what `:deploy_nim` actually executed for that Student. The rendered command MUST include `-u $(id -u)`, the read-only `:ro` flag on the checkpoint mount, and the canonical `--gpus "device={n}"` form.
 - Verify: Action Request content is read-only (no SME form fields); copy-to-clipboard is the only action.
@@ -7451,24 +7830,42 @@ closes only when live-validated evidence lands.
   `:deployment_handoff`, subprocess-exec it (live mode) or send the
   request to the mock NIM (mock mode), poll `/v1/health/ready`, send a
   `POST /v1/chat/completions` round-trip, assert the response contains
-  schema-valid label JSON parseable as an object. Live execution requires
+  schema-valid label JSON parseable as an object. When `--rps-root` is
+  supplied, use the unquantized baseline Student as each base's stable
+  representative and require one schema-parseable prediction from an image in
+  each `rock`, `paper`, and `scissors` directory. Accept both raw JSON and a single
+  surrounding Markdown JSON fence through the product's canonical fence
+  stripper; HTTP success with missing or malformed category JSON is not a pass.
+  Record the directory-ground-truth match independently; a wrong category is
+  truthful model-quality evidence governed by the held-out evaluation and does
+  not turn a successfully deployed NIM into an infrastructure failure.
+  Live execution requires
   the operator's configured `NGC_API_KEY` in the validation process
   environment; the parsed argv stays unchanged and contains only
   name-only `-e NGC_API_KEY` forwarding. Both 2B and 8B MUST round-trip
-  successfully.
+  successfully and, when the RPS proof is requested, all six per-class
+  predictions MUST be schema-parseable.
 - C21 (2B vs 8B handoff content differentiation): The
   `:deployment_handoff` payload's `technical_requirements` MUST
   differentiate between 2B and 8B representative variants across:
-  `nim_model_profile_recommended` (different NIM-auto-picked profile),
+  `nim_container_image` (different per-base NIM image),
+  `nim_model_profile_recommended` (different pinned profiles when present, or
+  both `null` when custom-checkpoint NIM images perform compatible automatic
+  selection),
   `gpu_requirements` (different memory hint — 2B `≥36 GB`, 8B `≥56 GB`),
   `nim_env_vars_recommended` (different `NIM_SERVED_MODEL_NAME` and
-  `NIM_MODEL_PROFILE`), and `tensor_parallelism` (present + integer;
+  `NIM_MODEL_PROFILE` only when a profile is pinned), and
+  `tensor_parallelism` (present + integer;
   may equal across single-GPU deploys — population is what matters).
 - Verify: `closing_acceptance.json` schema includes `execution_mode ∈
   {"mock", "live"}`, `phase_a_complete: bool`, `phase_b_validated_count:
   int`, `phase_b_target_count: int`, `c21_differentiation: dict`,
   `c20_handoff_rerun: {two_b: bool, eight_b: bool, detail_2b: str,
-  detail_8b: str}`, `final_integration_checkpoint: bool`,
+  detail_8b: str, predictions_2b: list, predictions_8b: list}`. Each
+  prediction carries `image_class`, `image_path`, parseability `ok`,
+  `predicted_category`, nullable `matches_ground_truth`, bounded `raw_content`,
+  and `detail`. The remaining top-level fields are
+  `final_integration_checkpoint: bool`,
   `final_integration_skipped: bool`, `error: str`.
 - Verify: Final integration checkpoint (Phase E) covers the full pipeline
   via `scripts/full_pipeline_smoke.py`: create project → configure NIM
@@ -7488,37 +7885,49 @@ closes only when live-validated evidence lands.
   `role="student"`; Teacher and embedding deployments are not affected.
 
 **CI / pre-commit pipeline (Phase 13 Step 13.1):**
-- Verify: `.github/workflows/ci.yml` exists at the repo root and
-  declares exactly five jobs: `backend-lint`, `backend-tests`,
-  `frontend-lint`, `frontend-tests`, `frontend-build`. Triggers are
-  `push` to `main`, `pull_request` to `main`, and `workflow_dispatch`.
-  The integration-tests stage from `docs/AdvancedTests.md` §1's
-  pre-13.1-rewrite history is intentionally NOT in CI scope —
-  integration tests require credentials or a live Docker daemon and
-  run via Phase 13 Step 13.6 AutoRun on a separate schedule.
-- Verify: every job in `ci.yml` declares `timeout-minutes: 10`. No
-  job-level `continue-on-error: true`. The five jobs run in parallel
-  on `ubuntu-latest`; total wall-clock target is under 10 minutes.
-- Verify: the `backend-tests` job runs `uv run pytest tests/unit/ -q
-  --maxfail=5` against the committed code and exits 0. The
-  `backend-lint` job runs `uv run ruff check .` and `uv run ruff
-  format --check .` (whole-repo scope, matching the pre-commit hook
-  scope so CI and pre-commit cannot drift).
-- Verify: the `frontend-lint` job runs all three of `pnpm exec
-  eslint .`, `pnpm run format:check` (Prettier), and `pnpm run
-  typecheck` (`tsc --noEmit`) inside `src/ui` and each step exits 0.
-  The `frontend-tests` job runs `pnpm test -- --run` and exits 0
-  with a summary line of the form `Test Files N passed (N) | Tests
-  N passed (N)`. The `frontend-build` job runs `pnpm build` and
-  produces `src/ui/dist/index.html` plus the JS+CSS bundles.
-- Verify: `.pre-commit-config.yaml` declares exactly five hooks in
-  this order: `trailing-whitespace`, `end-of-file-fixer`,
-  `check-yaml`, `ruff` (lint with `--fix` + `ruff-format`), and
-  `gitleaks`. Running `pre-commit run --all-files` against the
-  committed code reports `Passed` for every hook. The pre-commit
-  ruff `rev:` matches the project's resolved ruff minor (currently
-  `v0.15.10`) so pre-commit and the CI `ruff check` agree on
-  enabled rules.
+- Verify: `.github/workflows/ci.yml` exists at the repo root, triggers on
+  `push` and `pull_request` to `main` plus `workflow_dispatch`, and declares
+  the eight release jobs: `backend-lint`, `backend-tests`,
+  `backend-typecheck`, `frontend-lint`, `frontend-tests`, `frontend-build`,
+  `dependency-audit`, and `compose-smoke`.
+- Verify: all jobs run on `ubuntu-latest` without job-level
+  `continue-on-error: true`. The seven non-Compose jobs use a 10-minute
+  timeout; `compose-smoke` uses 20 minutes to accommodate cold image builds.
+- Verify: `backend-tests` runs the unit suite with the configured coverage gate
+  on Python 3.11, 3.12, and 3.13. `backend-lint` runs `ruff check`,
+  `ruff format --check`, and the `AGENTS.md` / `CLAUDE.md` twin check.
+  `backend-typecheck` runs strict pyright on `src/backend/`.
+- Verify: `frontend-lint` runs ESLint, Prettier, and `pnpm typecheck` inside
+  `src/ui`; `frontend-tests` runs `pnpm test`; and `frontend-build` runs
+  `pnpm build` and produces the production JS/CSS bundles and `index.html`.
+- Verify: `dependency-audit` checks the complete frozen backend lock with
+  `pip-audit --no-deps --disable-pip` (uv, not pip, remains the resolver)
+  and production frontend dependencies with `pnpm audit --prod --audit-level
+  high`. The only package-native audit exception is
+  `GHSA-qwww-vcr4-c8h2`: the affected unstable React Server Components APIs
+  are absent from this client-only Vite SPA, and the upstream patched major
+  requires a Node/React baseline beyond the Blueprint's current support
+  contract. Remove that exception when React Router 8 is adopted.
+  The default `aiperf` operational group overrides AIPerf 0.10.0's stale
+  aiohttp/Pillow caps to the audited aiohttp 3.14.3+ and Pillow 12.3+
+  releases; the real raw-payload integration test MUST pass with that locked
+  environment.
+  `compose-smoke` builds the Compose images, starts the stack, requires a
+  healthy edge at `http://localhost:3000/health`, prints diagnostics on
+  failure, and always tears the stack down.
+- Verify: integration tests remain outside the default CI workflow because
+  they start live services on fixed ports and may require credentials or
+  Docker. The operator validation command is `uv run pytest
+  tests/integration/ -q -n 0`; the suite rejects xdist execution.
+- Verify: `.pre-commit-config.yaml` declares the seven hooks in execution
+  order: `trailing-whitespace`, `end-of-file-fixer`, `check-yaml`, `ruff`,
+  `ruff-format`, `gitleaks`, and `agents-claude-twins`. Formatting exclusions
+  are hook-specific so gitleaks still scans every shipping text file. The
+  pre-commit ruff revision tracks the resolved project minor.
+- Verify: `scripts/ci-local.sh` reproduces the six deterministic core jobs
+  (backend lint/tests/typecheck and frontend lint/tests/build). Network-bound
+  dependency audits and the Docker Compose smoke remain explicit release
+  commands rather than hidden local-script side effects.
 
 **Secret scanning + SonarQube delegate (Phase 13 Step 13.1):**
 - Verify: `.github/workflows/sonarqube.yml` exists at the repo root
@@ -7543,39 +7952,28 @@ closes only when live-validated evidence lands.
   matching `nvapi-(test|fake|stub|placeholder|example|dummy)…` MUST
   NOT trigger the rule (the `[allowlist]` block in `.gitleaks.toml`
   exempts them).
-- Verify: the repo contains NO `bandit` invocation, NO `pip-audit`
-  invocation, NO `npm audit` step, NO `eslint-plugin-security`
-  dependency, and NO `security-ignore.yaml` ledger. These are
-  intentionally OUT of Step 13.1 scope — SonarQube replaces all of
-  them at the org level. A negative-coverage grep
-  (`grep -rE 'bandit|pip-audit|npm audit|security-ignore'
-  .github/ scripts/ pyproject.toml src/ui/package.json`) returns
-  no matches outside of Spec / AdvancedTests prose that documents
-  the deliberate exclusion.
+- Verify: the public-fork CVE backstop is the locked-set-only `pip-audit` plus
+  `pnpm audit` CI job. SAST remains delegated to the NVIDIA organization
+  SonarQube workflow; the repo does not add a parallel `bandit`,
+  `eslint-plugin-security`, or custom suppression-ledger program.
 
 **Backend type checking (Phase 13 Step 13.2 — COMPLETE):**
 - Verify: `pyproject.toml` declares a `[tool.pyright]` block with
-  `typeCheckingMode = "strict"`, `pythonVersion = "3.12"`,
+  `typeCheckingMode = "strict"`, `pythonVersion = "3.11"`,
   `include = ["src/backend"]`, and excludes (at minimum) `**/__pycache__`,
   `**/node_modules/**`, and `src/backend/vlm_feedback_loop/migrations/**`.
-  Mirrors `Retail-Agentic-Commerce/pyproject.toml`'s `[tool.pyright]`
-  block (Retail is the only one of the three reference NVIDIA Blueprints
-  that runs strict pyright in CI as a hard gate). PASS.
+  The version matches the package's minimum supported interpreter.
 - Verify: `pyright>=1.1.408` is declared in `[dependency-groups.dev]`
-  and resolves to a 1.1.408+ release in `uv.lock`. No `boto3-stubs` or
-  any other stub package is installed (Retail uses zero stub packages;
-  we follow). No `mypy` is declared. PASS.
-- Verify: `uv run pyright src/backend/` from the repo root exits 0 with
-  zero errors, zero warnings, and zero informations on the head commit
-  of `main`. PASS as of PR-7 merge. Total `# pyright: ignore[code]`
-  count across `src/backend/`: 20 (at the hard cap, mirroring
-  Retail-Agentic-Commerce's 16 footprint).
+  and resolves to a compatible release in `uv.lock`; no second Python type
+  checker is configured.
+- Verify: `uv run pyright src/backend/` exits 0 with zero errors and zero
+  warnings. Every suppression includes its bracketed diagnostic code and a
+  defensible local reason; the checklist does not pin a historical suppression
+  count that would become false as code evolves.
 - Verify: `.github/workflows/ci.yml` declares a `backend-typecheck` job
   that runs `uv run pyright src/backend/` as a required gate (no
-  `continue-on-error: true`), with `timeout-minutes: 10`, mirroring the
-  existing `backend-lint`'s uv-cached install shape. Runs in parallel
-  with the existing 5 CI jobs. PASS — the job is the 6th workflow job
-  and went green on PR-7's first push.
+  `continue-on-error: true`), with `timeout-minutes: 10`, in parallel with the
+  other CI jobs.
 
 ---
 
@@ -7594,8 +7992,8 @@ export NVIDIA_API_KEY=”nvapi-...”
 
 - Hosted base URL: `https://integrate.api.nvidia.com/v1`
 - Model catalog seeded with default entries.
-- `teacher_model_config_id` seeded to the effective `DEFAULT_TEACHER_MODEL` — `minimaxai/minimax-m3` by default.
-- pHash computed inline at ingest (CPU-only); review selector uses pHash-diverse mode immediately. CLIP-style embeddings computed automatically via hosted embedding NIM (default: NeMo Retriever VL 1B v2; same API key); selector upgrades to CLIP-diverse mode as embeddings become available.
+- `teacher_model_config_id` seeded to the effective `DEFAULT_TEACHER_MODEL` — `stepfun-ai/step-3.7-flash` by default.
+- Ingest returns 202 after skeleton persistence; CPU-only pHash and optional CLIP-style embeddings then compute in background. The review selector uses deterministic no-signal fallback immediately, pHash diversity as hashes arrive, and CLIP diversity once embedding coverage reaches the configured threshold.
 - Point the system at image directories via the in-app file browser or direct path entry. Images are stored by reference (not copied). Begin labeling; ICL becomes effective as Verified accumulates.
 - SMEs can Retry to compare Teachers/Guidance versions and re-run proposals on same example.
 - SMEs can Skip to omit images so they do not reappear.
@@ -7732,9 +8130,16 @@ Required provenance captured for every run:
 
 NOTE: NIM logs profile selection and metadata at startup; record it.
 
-Recommended driver: Use NVIDIA's recommended `genai-perf` to simulate production load for VLM endpoints.
+Required driver: pinned `aiperf==0.10.0`, installed by the default `uv`
+operational group in source and container modes. Its upstream dependency caps
+are overridden to the audited aiohttp 3.14.3+ and Pillow 12.3+ releases; the
+real raw-payload integration test is the compatibility gate. The standalone
+backend wheel intentionally omits the external load-driver executable. The
+adapter uses AIPerf `raw_payload` JSONL so the complete multimodal OpenAI
+request body is replayed verbatim. There is no synthetic-text or `httpx`
+fallback.
 
-Additionally supported instrumentation: Read NIM Prometheus metrics at `/v1/metrics` to collect server-side TTFT/ITL/e2e latency, `request_success_total`/`request_failure_total`, and KV cache usage.
+Additionally supported instrumentation: sample NIM Prometheus metrics at `/metrics` before and after each cell. Counter series are aggregated and stored as deltas; cache gauges use the observed value. Unavailable metrics remain `null`. TTFT/ITL remain `null` for this non-streaming production contract.
 
 ### E.1 Experiment 1 - Quality Delta vs 16-bit Baseline
 
@@ -7761,21 +8166,23 @@ Goal: measure raw speed/memory gain.
 Method:
 
 - Min latency is captured at concurrency=1 (single stream) per NVIDIA benchmarking convention.
-- Collect P50/P90/P99 e2e latency at the client boundary, and TTFT/ITL via NIM metrics when available.
+- Collect P50/P90/P99 end-to-end latency at the client boundary using the real image workload. Report integer milliseconds in the UI so sub-second results are not collapsed by decimal-second rounding.
 
 Output: `variant_id`, `p50_e2e_ms`, `p90_e2e_ms`, `p99_e2e_ms`, `ttft_p50_ms` (if collected), `itl_p50_ms` (if collected), `peak_gpu_mem_MB`, `model_resident_MB`
 
-### E.3 Experiment 3 - Concurrency Scaling / SLO Miss Rate
+### E.3 Experiment 3 - Concurrency Scaling and Reliability
 
 Goal: quantify behavior under load.
 
 Method:
 
-- Drive load using `genai-perf` (preferred) at multiple concurrencies.
-- Record request throughput (req/s) and latency distribution.
-- Track failures (5xx/timeouts) and NIM `request_failure_total` if scraping metrics.
+- Drive the same deterministic, real-image AIPerf workload at every configured concurrency.
+- Record achieved request throughput, latency distribution, exact attempted/successful/failed counts, and failure percentage.
+- A cell passes only when every selected image completes exactly once with no transport, HTTP, or timeout failure.
 
-Output: `variant_id`, `concurrency`, `rps`, `p50_e2e_ms`, `p90_e2e_ms`, `p99_e2e_ms`, `slo_target_ms`, `slo_miss_pct`, `failure_pct`
+Output: `variant_id`, `concurrency`, `rps`, `p50_e2e_ms`, `p90_e2e_ms`, `p99_e2e_ms`, `attempted_requests`, `successful_requests`, `failed_requests`, `failure_pct`
+
+No SLO-miss metric is reported in v1 because the project defines no latency SLO target.
 
 NOTE: NVIDIA defines "Max Throughput" as throughput at the maximum concurrency that saturates throughput.
 
@@ -7795,7 +8202,7 @@ Method:
 
 - Use two micro-suites (internal default: 30 each): Long-Input, Long-Output.
 - Enforce timeouts; count error rate and truncation.
-- NVIDIA warns that `max_tokens` can cause truncated JSON in structured outputs; treat truncation as schema-invalid.
+- Serving requests are uncapped: omit both output-limit spellings and let EOS/server policy terminate generation. Timeouts and malformed outputs remain explicit failures/evidence.
 
 Output: `variant_id`, `suite`, `error_pct`, `trunc_pct`, `avg_len_tokens`, `quality_proxy_metric`
 
@@ -7804,12 +8211,16 @@ Output: `variant_id`, `suite`, `error_pct`, `trunc_pct`, `avg_len_tokens`, `qual
 - Same prompts and decoding params across variants.
 - Same input distributions (image sizes, token lengths).
 - Same `visual_budget_preset_key` across variants; effective `mm_processor_kwargs` recorded per invocation (§6.9.5).
-- Same KV cache reuse setting across variants; if enabled, record `NIM_ENABLE_KV_CACHE_REUSE`.
+- KV cache reuse disabled (`NIM_ENABLE_KV_CACHE_REUSE=0`) across variants and external endpoints confirmed equivalent.
 - Same pinned/selected NIM profile metadata recorded for reproducibility.
 - Same `quantization_method` compared across variants of the same base model for meaningful comparison.
 
 ---
 
-## End of Engineering Specification (v1.10.0)
+## End of Engineering Specification (v1.10.2)
+
+*v1.10.2 (2026-08-04): Student serving benchmarks now replay deterministic real Test Pool images through the active Guidance-derived production prompt using pinned AIPerf, uncapped output, disabled KV reuse, strict all-concurrency reliability gating, durable workload provenance, RPS/failure metrics, and honest nulls for unavailable telemetry. External endpoints run the same benchmark; quality promotion remains independent.*
+
+*v1.10.1 (2026-08-04): Models & Results remains a single project-wide comparison while grouping retained Students by immutable Training Suite lineage. Run headings expose provenance, mixed evaluation contexts are labeled directional, incompatible Teacher deltas fail closed, and chart labels remain unique across repeated candidates.*
 
 *v1.10.0 (2026-05-19): F49 amendment — one-NIM-per-GPU invariant codified in §1.5 (replaces the prior "same-GPU co-location is never automatic" prose with explicit replace semantics); §9.5.2 step 0 + step 9 added (Student lifecycle acquires the GPU before docker_run and auto-restores the displaced Teacher after stop); §13.15 LocalNimDeployment gains `displaced_by_deployment_id` and `displaced_at` diagnostic fields. Implementation: `services/local_nim_service.acquire_gpu()`. Empirical motivation: README "One-NIM-per-GPU policy".*

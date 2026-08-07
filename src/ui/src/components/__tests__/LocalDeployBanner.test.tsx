@@ -14,9 +14,14 @@ import type { ReactNode } from "react";
 import { LocalDeployBanner } from "@/components/LocalDeployBanner";
 
 const mockListLocalNimDeployments = vi.fn();
+const mockListStudentModels = vi.fn();
 
 vi.mock("@/api/nim", () => ({
   listLocalNimDeployments: (...args: unknown[]) => mockListLocalNimDeployments(...args),
+}));
+
+vi.mock("@/api/students", () => ({
+  listStudentModels: (...args: unknown[]) => mockListStudentModels(...args),
 }));
 
 function wrap(path: string) {
@@ -28,6 +33,10 @@ function wrap(path: string) {
       <QueryClientProvider client={queryClient}>
         <MemoryRouter initialEntries={[path]}>
           <Routes>
+            <Route
+              path="/projects/:projectId/compare"
+              element={<div data-testid="compare-route" />}
+            />
             <Route path="/projects/:projectId/*" element={children} />
             <Route path="/" element={children} />
           </Routes>
@@ -64,6 +73,7 @@ describe("LocalDeployBanner", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     window.localStorage.clear();
+    mockListStudentModels.mockResolvedValue({ items: [], next_cursor: null });
   });
 
   it("renders nothing on non-project routes", async () => {
@@ -115,6 +125,57 @@ describe("LocalDeployBanner", () => {
     const banner = await screen.findByTestId("local-deploy-banner");
     expect(banner).toHaveTextContent(/cosmos-reason2-8b deploying/i);
     expect(banner).toHaveTextContent(/switchable from the Teacher picker/i);
+  });
+
+  it("describes a temporary Student NIM as serving validation, not a Teacher", async () => {
+    mockListLocalNimDeployments.mockResolvedValue({
+      items: [
+        {
+          ...failedDeployment(),
+          local_nim_deployment_id: "student-starting",
+          role: "student",
+          status: "starting",
+          status_reason: null,
+        },
+      ],
+    });
+    const Wrapper = wrap("/projects/test-pid/training/suite-1");
+    render(<LocalDeployBanner />, { wrapper: Wrapper });
+
+    const banner = await screen.findByTestId("local-deploy-banner");
+    expect(banner).toHaveTextContent(/Student NIM deploying/i);
+    expect(banner).toHaveTextContent(/temporary serving validation is running/i);
+    expect(banner).not.toHaveTextContent(/Teacher picker/i);
+  });
+
+  it("routes a failed Student validation to Compare", async () => {
+    mockListLocalNimDeployments.mockResolvedValue({
+      items: [failedDeployment({ role: "student" })],
+    });
+    const Wrapper = wrap("/projects/test-pid/training/suite-1");
+    render(<LocalDeployBanner />, { wrapper: Wrapper });
+
+    const cta = await screen.findByTestId("local-deploy-banner-fix-cta");
+    expect(cta).toHaveTextContent("Open Compare");
+    fireEvent.click(cta);
+    expect(await screen.findByTestId("compare-route")).toBeInTheDocument();
+  });
+
+  it("does not show an older Student deployment failure during durable lifecycle preflight", async () => {
+    mockListLocalNimDeployments.mockResolvedValue({
+      items: [failedDeployment({ role: "student", local_nim_deployment_id: "old" })],
+    });
+    mockListStudentModels.mockResolvedValue({
+      items: [{ student_model_id: "student-new", serving_status: "pending" }],
+      next_cursor: null,
+    });
+    const Wrapper = wrap("/projects/test-pid/training/suite-1");
+    render(<LocalDeployBanner />, { wrapper: Wrapper });
+
+    await waitFor(() =>
+      expect(mockListStudentModels).toHaveBeenCalledWith("test-pid", { limit: 200 }),
+    );
+    expect(screen.queryByTestId("local-deploy-banner")).toBeNull();
   });
 
   it("renders the failure banner with reason when the failed config is still the active Teacher", async () => {

@@ -59,7 +59,7 @@ PROBE_TEXT_INPUT = "hello"
 INTER_BATCH_SLEEP_S = 0.05
 
 
-def _prepare_embedding_input(storage_ref: str) -> str:
+def _prepare_embedding_input(storage_ref: str, settings: Settings) -> str:
     """Read, normalize, and base64-encode one embedding image off-loop.
 
     Base64 encoding previously ran on the asyncio event loop after the image
@@ -68,7 +68,7 @@ def _prepare_embedding_input(storage_ref: str) -> str:
     response streaming and interactive request completion despite the worker
     being nominally background-only.
     """
-    img_bytes, mime = read_and_normalize(storage_ref)
+    img_bytes, mime = read_and_normalize(storage_ref, settings=settings)
     return to_base64_data_url(img_bytes, mime)
 
 
@@ -300,15 +300,6 @@ class _EmbeddingCache:
         result = (index, matrix)
         self._normalized[project_id] = result
         return result
-
-    def invalidate(self, project_id: str) -> None:
-        """Drop a project's cached embeddings (tests only).
-
-        No production caller — tests use this to reset the module-global
-        cache between cases, mirroring ``locks.clear_lock_state``.
-        """
-        self._store.pop(project_id, None)
-        self._normalized.pop(project_id, None)
 
     def is_loaded(self, project_id: str) -> bool:
         return project_id in self._store
@@ -726,6 +717,7 @@ async def _embedding_worker(
                         data_url = await run_in_low_priority_thread(
                             _prepare_embedding_input,
                             storage_ref,
+                            settings,
                         )
                         input_items.append(data_url)
                         valid_keys.append(key)

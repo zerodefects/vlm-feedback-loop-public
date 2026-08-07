@@ -37,6 +37,33 @@ EXPECTED_TABLES = {
 }
 
 
+class TestProjectResourceCleanup:
+    def test_disposes_cached_engines_and_releases_locks(self, monkeypatch):
+        """Graceful cleanup closes databases before dropping lock ownership."""
+        from vlm_feedback_loop.services import project_service
+
+        class FakeEngine:
+            disposed = False
+
+            def dispose(self) -> None:
+                self.disposed = True
+
+        engine = FakeEngine()
+        locks_released: list[bool] = []
+        project_service._engine_cache["project-1"] = engine
+        monkeypatch.setattr(
+            project_service,
+            "release_all_locks",
+            lambda: locks_released.append(True),
+        )
+
+        project_service.close_project_resources()
+
+        assert engine.disposed is True
+        assert project_service._engine_cache == {}
+        assert locks_released == [True]
+
+
 # ── POST creates directory with subdirs ────────────────────────────────
 
 
@@ -94,7 +121,7 @@ class TestCreateProjectDefaults:
         assert data["phash_algorithm"] == "dct_phash_64"
         assert data["scaleup_exact_match_threshold"] == pytest.approx(0.80)
         assert data["scaleup_per_field_match_threshold"] == pytest.approx(0.80)
-        assert data["scaleup_min_per_value_f1_threshold"] == pytest.approx(0.80)
+        assert data["scaleup_min_per_value_f1_threshold"] == pytest.approx(0.60)
         assert data["scaleup_accept_rate_threshold"] == pytest.approx(0.80)
         assert data["scaleup_accept_rate_window"] == 50
         assert data["scaleup_min_test_pool_size"] == 60
@@ -128,15 +155,19 @@ class TestCreateProjectDefaults:
 
         monkeypatch.setattr(
             environment_service,
-            "probe_gpu_inventory",
+            "get_cached_machine_assessment",
             AsyncMock(
-                return_value=[
-                    GpuInfo(
-                        name="RTX PRO 6000 Blackwell",
-                        memory_total_mb=98304,
-                        compute_capability=12.0,
-                    )
-                ]
+                return_value=environment_service.MachineAssessment(
+                    docker_available=True,
+                    nvidia_toolkit_available=True,
+                    gpu_inventory=(
+                        GpuInfo(
+                            name="RTX PRO 6000 Blackwell",
+                            memory_total_mb=98304,
+                            compute_capability=12.0,
+                        ),
+                    ),
+                )
             ),
         )
 
@@ -200,7 +231,7 @@ class TestCreateProjectDefaults:
         non_secret["THINKING_DEFAULT_ON"] = False
         settings = Settings(WORKSPACE_ROOT=str(tmp_path / "workspace"), **non_secret)
         app.dependency_overrides[get_current_settings] = lambda: settings
-        project_service.clear_engine_cache()
+        project_service.close_project_resources()
         try:
             from fastapi.testclient import TestClient
 
@@ -209,7 +240,7 @@ class TestCreateProjectDefaults:
             assert data["thinking_default_on"] is False
         finally:
             app.dependency_overrides.clear()
-            project_service.clear_engine_cache()
+            project_service.close_project_resources()
 
 
 # ── POST with missing name → 422 ──────────────────────────────────────
@@ -221,6 +252,27 @@ class TestCreateProjectValidation:
         assert resp.status_code == 422
         errors = resp.json()["detail"]
         assert any("name" in err.get("loc", []) for err in errors), errors
+
+    def test_default_teacher_outside_commercial_seed_fails_before_writing(
+        self, test_app_client
+    ):
+        """A stale/non-commercial default cannot leak into a fresh project."""
+        from vlm_feedback_loop.routers.projects import get_current_settings
+
+        provider = test_app_client.app.dependency_overrides[get_current_settings]
+        settings = provider()
+        invalid_settings = settings.model_copy(
+            update={"DEFAULT_TEACHER_MODEL": "minimaxai/minimax-m3"}
+        )
+        test_app_client.app.dependency_overrides[get_current_settings] = lambda: (
+            invalid_settings
+        )
+
+        response = test_app_client.post("/v1/projects", json={"name": "Blocked"})
+
+        assert response.status_code == 400
+        assert "commercially permitted fresh-project seed" in response.json()["detail"]
+        assert not (Path(settings.WORKSPACE_ROOT) / "projects").exists()
 
 
 # ── GET non-existent → 404 ────────────────────────────────────────────
@@ -465,6 +517,27 @@ class TestProjectResponseIncludesCounts:
 
 
 class TestUpdateProject:
+    def test_successful_patch_checks_backend_auto_evaluate_triggers(
+        self, test_app_client
+    ):
+        """Tracked settings changes feed the backend Auto-Evaluate authority."""
+        from unittest.mock import AsyncMock, patch
+
+        data = create_project_via_api(test_app_client)
+        pid = data["project_id"]
+        with patch(
+            "vlm_feedback_loop.services.evaluation_service.maybe_start_auto_evaluation",
+            new_callable=AsyncMock,
+        ) as maybe_start:
+            resp = test_app_client.patch(
+                f"/v1/projects/{pid}",
+                json={"thinking_default_on": False},
+            )
+
+        assert resp.status_code == 200
+        maybe_start.assert_awaited_once()
+        assert maybe_start.await_args.args[0] == pid
+
     def test_accepts_valid_fields(self, test_app_client):
         data = create_project_via_api(test_app_client)
         pid = data["project_id"]
@@ -709,7 +782,7 @@ class TestProjectLockedHandler:
             "/v1/projects", json={"name": "Lock Message Test"}
         )
         project_id = create_resp.json()["project_id"]
-        project_service.clear_engine_cache()
+        project_service.close_project_resources()
 
         def fake_lock(project_dir):
             raise ProjectLockedError(str(project_dir))
@@ -786,14 +859,14 @@ class TestProjectScoping:
 
         with Session(engine_a) as s:
             configs_a = s.query(ModelConfig).all()
-            assert len(configs_a) == 10
+            assert len(configs_a) == 8
             for mc in configs_a:
                 assert mc.project_id == proj_a["project_id"]
 
         engine_b = get_project_engine(proj_b["project_id"], ws)
         with Session(engine_b) as s:
             configs_b = s.query(ModelConfig).all()
-            assert len(configs_b) == 10
+            assert len(configs_b) == 8
             for mc in configs_b:
                 assert mc.project_id == proj_b["project_id"]
 
@@ -837,7 +910,7 @@ class TestSeededCatalog:
         engine = get_project_engine(data["project_id"], ws)
         with Session(engine) as s:
             configs = s.query(ModelConfig).order_by(ModelConfig.model_name).all()
-            assert len(configs) == 10
+            assert len(configs) == 8
 
             by_name = {mc.model_name: mc for mc in configs}
 
@@ -897,14 +970,12 @@ class TestSeededCatalog:
             cr3_super = by_name["nvidia/cosmos3-super-reasoner"]
             assert "student_base" in cr3_super.eligible_roles
             assert cr3_super.local_deploy_metadata["nim_model_size"] == "super"
+            assert cr3_super.local_deploy_metadata["extra_container_env"] == {
+                "NIM_MAX_MODEL_LEN": 65536
+            }
 
-            # mistral
-            mistral = by_name["mistralai/mistral-large-3-675b-instruct-2512"]
-            assert mistral.context_window_tokens == 262144
-            assert set(mistral.eligible_roles) == {"teacher"}
-            assert mistral.thinking_toggle_mode == "none"
-            assert mistral.visual_budget_mode == "none"
-            assert mistral.local_deploy_metadata is None
+            # Retired hosted endpoints are not seeded into new projects.
+            assert "mistralai/mistral-large-3-675b-instruct-2512" not in by_name
 
             # nemotron
             nemo = by_name["nvidia/nemotron-nano-12b-v2-vl"]
@@ -925,17 +996,8 @@ class TestSeededCatalog:
             assert step.image_cap_support == "supported"
             assert step.local_deploy_metadata is None
 
-            # minimaxai/minimax-m3 — deep-ICL hosted Teacher: no image-count
-            # boundary found through 33 (the ~5 MB body cap bites first),
-            # seeded at the pv-validated 32 with cap support "unknown".
-            minimax = by_name["minimaxai/minimax-m3"]
-            assert minimax.context_window_tokens == 500000
-            assert set(minimax.eligible_roles) == {"teacher"}
-            assert minimax.thinking_toggle_mode == "none"
-            assert minimax.max_images_per_request == 32
-            assert minimax.image_cap_support == "unknown"
-            assert minimax.default_icl_max_examples == 8
-            assert minimax.local_deploy_metadata is None
+            # Non-commercial models are not preseeded into new projects.
+            assert "minimaxai/minimax-m3" not in by_name
 
             # mistralai/mistral-medium-3.5-128b — near-ceiling Mistral-family
             # alternate; same no-thinking contract as Large, live-probed
@@ -1013,12 +1075,9 @@ class TestDefaultSelections:
                 .first()
             )
             assert teacher is not None
-            # Default Teacher is MiniMax-M3, superseding Step 3.7 Flash after
-            # its hosted endpoint's reasoning-length regression
-            # tripled interactive latency): best-fit reachable hosted Teacher —
-            # top of the certified accuracy field, deep-ICL capable, and lower
-            # measured interactive latency.
-            assert teacher.model_name == "minimaxai/minimax-m3"
+            # The curated path defaults to the strongest commercially
+            # permitted hosted Teacher in the retained campaign evidence.
+            assert teacher.model_name == "stepfun-ai/step-3.7-flash"
 
 
 # ── All seeded entries reference the hosted NIM endpoint ──────────────
@@ -1306,6 +1365,41 @@ class TestSetupCompletedAt:
         ProjectIndexRedirect routes the SME through the setup screens."""
         data = create_project_via_api(test_app_client, "FTU")
         assert data["setup_completed_at"] is None
+
+    def test_generic_patch_cannot_bypass_setup_transition(self, test_app_client):
+        """Only the named transition may stamp or clear onboarding state."""
+        from sqlalchemy.orm import Session
+
+        from vlm_feedback_loop.db.models.audit_event import AuditEvent
+        from vlm_feedback_loop.services.project_service import get_project_engine
+
+        data = create_project_via_api(test_app_client, "FTU")
+        pid = data["project_id"]
+        ws = str(Path(data["project_dir"]).parent.parent)
+
+        for value in ("2026-08-05T00:00:00Z", None):
+            response = test_app_client.patch(
+                f"/v1/projects/{pid}",
+                json={"setup_completed_at": value},
+            )
+            assert response.status_code == 422
+            assert any(
+                "setup_completed_at" in error.get("loc", [])
+                for error in response.json()["detail"]
+            )
+
+        assert (
+            test_app_client.get(f"/v1/projects/{pid}").json()["setup_completed_at"]
+            is None
+        )
+        engine = get_project_engine(pid, ws)
+        with Session(engine) as session:
+            assert (
+                session.query(AuditEvent)
+                .filter_by(event_type="setup_completed")
+                .count()
+                == 0
+            )
 
     def test_mark_setup_completed_first_call_stamps_and_emits_audit(
         self, test_app_client

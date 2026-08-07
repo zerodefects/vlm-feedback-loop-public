@@ -13,7 +13,7 @@
 import { Text } from "@kui/react";
 
 import { CHART_TEACHER_COLOR } from "@/lib/chart-palette";
-import { formatPct } from "@/lib/format-percent";
+import { formatMetricPct } from "@/lib/format-percent";
 import type { EvaluationMetrics, MetricsBucket } from "@/types/evaluation";
 import type { SchemaFieldResponse } from "@/types/guidance";
 
@@ -34,6 +34,8 @@ export interface TeacherBaselineCardProps {
   coreFields: SchemaFieldResponse[];
   /** Active metric selection from the page-level ScopeBar. */
   metricSelection: MetricSelection;
+  perFieldMatchThreshold: number;
+  minPerValueF1Threshold: number;
 }
 
 export function TeacherBaselineCard({
@@ -43,6 +45,8 @@ export function TeacherBaselineCard({
   staleNote,
   coreFields,
   metricSelection,
+  perFieldMatchThreshold,
+  minPerValueF1Threshold,
 }: TeacherBaselineCardProps) {
   const overall: MetricsBucket | null = metrics?.overall ?? null;
 
@@ -107,7 +111,7 @@ export function TeacherBaselineCard({
               style={{ color: "var(--accent-green)" }}
               data-testid="teacher-baseline-exact-match"
             >
-              {formatPct(overall.exact_match_rate)}
+              {formatMetricPct(overall.exact_match_rate)}
             </Text>
           </div>
 
@@ -115,6 +119,8 @@ export function TeacherBaselineCard({
             overall={overall}
             coreFields={coreFields}
             metricSelection={metricSelection}
+            perFieldMatchThreshold={perFieldMatchThreshold}
+            minPerValueF1Threshold={minPerValueF1Threshold}
             data-testid-prefix="teacher-baseline"
           />
         </>

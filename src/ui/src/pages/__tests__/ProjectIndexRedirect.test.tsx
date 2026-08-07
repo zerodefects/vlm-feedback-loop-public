@@ -21,6 +21,7 @@ import { makeEnvironmentResponse, makeProjectResponse } from "@/test/fixtures";
 const mockFetchProject = vi.fn();
 const mockFetchEnvironment = vi.fn();
 const mockListTrainingSuites = vi.fn();
+const mockListStudentModels = vi.fn();
 
 vi.mock("@/api/projects", () => ({
   fetchProject: (...args: unknown[]) => mockFetchProject(...args),
@@ -36,6 +37,10 @@ vi.mock("@/api/nim", () => ({
 
 vi.mock("@/api/training", () => ({
   listTrainingSuites: (...args: unknown[]) => mockListTrainingSuites(...args),
+}));
+
+vi.mock("@/api/students", () => ({
+  listStudentModels: (...args: unknown[]) => mockListStudentModels(...args),
 }));
 
 const ENV = makeEnvironmentResponse({
@@ -79,6 +84,14 @@ function createWrapper() {
               path="training/:trainingSuiteId"
               element={<div data-testid="training-jobs-page">Training Jobs</div>}
             />
+            <Route
+              path="overview"
+              element={<div data-testid="project-overview-page">Overview</div>}
+            />
+            <Route
+              path="compare"
+              element={<div data-testid="compare-page">Models</div>}
+            />
           </Route>
         </Routes>
       </MemoryRouter>
@@ -90,6 +103,7 @@ describe("ProjectIndexRedirect", () => {
   beforeEach(() => {
     mockFetchEnvironment.mockResolvedValue(ENV);
     mockListTrainingSuites.mockResolvedValue({ items: [], next_cursor: null });
+    mockListStudentModels.mockResolvedValue({ items: [], next_cursor: null });
   });
 
   it("routes to /setup when setup_completed_at is null", async () => {
@@ -169,7 +183,7 @@ describe("ProjectIndexRedirect", () => {
     expect(mockListTrainingSuites).toHaveBeenCalledWith("test-pid");
   });
 
-  it("routes a project with only terminal Training Suites to labeling", async () => {
+  it("opens the project overview when terminal Training Suite history exists", async () => {
     const p = baseProject("2026-05-12T17:00:00Z");
     p.counts.unlabeled = 42;
     p.active_guidance_id = "guidance-1";
@@ -192,7 +206,43 @@ describe("ProjectIndexRedirect", () => {
     render(<div />, { wrapper: Wrapper });
 
     await waitFor(() => {
-      expect(screen.getByTestId("labeling-page")).toBeInTheDocument();
+      expect(screen.getByTestId("project-overview-page")).toBeInTheDocument();
+    });
+  });
+
+  it("resumes Models & Results while Student serving validation is active", async () => {
+    const p = baseProject("2026-05-12T17:00:00Z");
+    p.counts.unlabeled = 42;
+    p.active_guidance_id = "guidance-1";
+    mockFetchProject.mockResolvedValue(p);
+    mockListStudentModels.mockResolvedValue({
+      items: [{ student_model_id: "student-1", serving_status: "pending" }],
+      next_cursor: null,
+    });
+
+    const Wrapper = createWrapper();
+    render(<div />, { wrapper: Wrapper });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("compare-page")).toBeInTheDocument();
+    });
+  });
+
+  it("opens the project overview when a Student exists without suite history", async () => {
+    const p = baseProject("2026-05-12T17:00:00Z");
+    p.counts.unlabeled = 42;
+    p.active_guidance_id = "guidance-1";
+    mockFetchProject.mockResolvedValue(p);
+    mockListStudentModels.mockResolvedValue({
+      items: [{ student_model_id: "student-1", serving_status: "not_attempted" }],
+      next_cursor: null,
+    });
+
+    const Wrapper = createWrapper();
+    render(<div />, { wrapper: Wrapper });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("project-overview-page")).toBeInTheDocument();
     });
   });
 });

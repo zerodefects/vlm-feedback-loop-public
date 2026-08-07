@@ -23,7 +23,7 @@ import {
 import { updateProject } from "@/api/model-configs";
 import { evaluationKeys, projectKeys } from "@/api/query-keys";
 import { formatTimestamp } from "@/lib/format-date";
-import { formatDeltaPoints, formatPct } from "@/lib/format-percent";
+import { formatDeltaPoints, formatMetricPct } from "@/lib/format-percent";
 import { runStatusRefetchInterval } from "@/lib/run-status-polling";
 import type {
   EvaluationRunListResponse,
@@ -220,7 +220,8 @@ export function EvaluationStrip({
           <Text kind="label/bold/sm">
             Test Pool: {poolCount}
             {poolTarget != null && poolTarget > poolCount && (
-              <span
+              <Text
+                kind="label/regular/sm"
                 style={{ color: "rgba(255,255,255,0.62)", fontWeight: 400 }}
                 title={
                   "The Test Pool grows toward " +
@@ -233,7 +234,7 @@ export function EvaluationStrip({
               >
                 {" "}
                 → grows to {poolTarget} as you verify
-              </span>
+              </Text>
             )}
           </Text>
           {latestRun && (isCompleted || isIncomplete) && (
@@ -407,7 +408,8 @@ export function EvaluationStrip({
               }
             >
               <Text kind="body/regular/sm">
-                Evaluation complete: {formatPct(overall.exact_match_rate)} accuracy
+                Evaluation complete: {formatMetricPct(overall.exact_match_rate)}{" "}
+                accuracy
                 {latestRun.previous_overall_exact_match != null &&
                 completedMetrics?.returning?.exact_match_rate != null ? (
                   // The badge claims "on same images", so it must compare the
@@ -515,15 +517,22 @@ export function EvaluationStrip({
         >
           <div className="flex flex-col gap-1">
             <Text kind="body/regular/sm">
-              Evaluation failed
               {latestRun.status_reason === "structured_generation_rejected"
-                ? ": structured generation rejected."
-                : "."}
+                ? "Evaluation failed: structured generation rejected."
+                : latestRun.status_reason === "backend_restart_interrupted"
+                  ? "Evaluation stopped: backend restarted."
+                  : "Evaluation failed."}
             </Text>
             {latestRun.status_reason === "structured_generation_rejected" && (
               <Text kind="body/regular/sm" style={{ color: "var(--text-secondary)" }}>
                 The model rejected json_schema output for this run. Prompt-only asks for
                 JSON in the prompt instead of enforcing a schema.
+              </Text>
+            )}
+            {latestRun.status_reason === "backend_restart_interrupted" && (
+              <Text kind="body/regular/sm" style={{ color: "var(--text-secondary)" }}>
+                This interrupted run is not an authoritative result. Start a new
+                evaluation to measure the full Test Pool.
               </Text>
             )}
             {restartPromptOnly.isError && (
@@ -755,8 +764,12 @@ function DeltaBadge({ current, previous }: { current: number; previous: number }
   // Subsequent-run banner: "(+3 pts vs previous on same images)" —
   // the delta compares the Returning subset against the previous run.
   return (
-    <span style={{ color, marginLeft: 4 }} data-testid="delta-badge">
+    <Text
+      kind="label/regular/sm"
+      style={{ color, marginLeft: 4 }}
+      data-testid="delta-badge"
+    >
       ({formatDeltaPoints(delta)} vs previous on same images)
-    </span>
+    </Text>
   );
 }

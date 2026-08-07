@@ -17,9 +17,19 @@
  */
 
 import type { ReactNode } from "react";
+import { Badge } from "@kui/react";
 
 import { MiniSpinner } from "@/components/common/MiniSpinner";
 import { TONE_STYLES, type Tone } from "@/lib/tone";
+
+const TONE_BADGE_COLORS = {
+  neutral: "gray",
+  info: "blue",
+  success: "green",
+  warning: "yellow",
+  error: "red",
+  subdued: "gray",
+} as const;
 
 export interface StatusPillProps {
   tone: Tone;
@@ -42,10 +52,13 @@ export function StatusPill({
 }: StatusPillProps) {
   const style = TONE_STYLES[tone];
   return (
-    <span
-      className="inline-flex w-fit items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium"
+    <Badge
+      color={TONE_BADGE_COLORS[tone]}
+      kind="solid"
+      className="inline-flex w-fit items-center gap-1.5 px-3 py-1 text-xs font-medium"
       style={{
         backgroundColor: style.background,
+        borderRadius: 999,
         color: style.color,
       }}
       data-testid={testid}
@@ -54,6 +67,6 @@ export function StatusPill({
     >
       {spinner && <MiniSpinner />}
       {label}
-    </span>
+    </Badge>
   );
 }

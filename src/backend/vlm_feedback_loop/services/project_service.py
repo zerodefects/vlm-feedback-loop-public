@@ -38,8 +38,6 @@ from vlm_feedback_loop.model_catalog_constants import (
     COSMOS_REASON2_8B,
     COSMOS_REASON2_8B_GPU_MIN_GB,
     COSMOS_REASON2_8B_NIM_IMAGE,
-    MINIMAX_M3,
-    MISTRAL_LARGE_3,
     MISTRAL_MEDIUM_3_5,
     NEMOTRON_3_NANO_OMNI_COMPUTE_CAPABILITY_MIN,
     NEMOTRON_3_NANO_OMNI_GPU_MIN_GB,
@@ -48,7 +46,7 @@ from vlm_feedback_loop.model_catalog_constants import (
     NEMOTRON_NANO_12B_VL,
     STEP_3_7_FLASH,
 )
-from vlm_feedback_loop.services.locks import acquire_project_lock, clear_lock_state
+from vlm_feedback_loop.services.locks import acquire_project_lock, release_all_locks
 from vlm_feedback_loop.services.nim_client import NIM_DEFAULT_HEADERS
 
 logger = logging.getLogger("vlm_feedback_loop.services.project")
@@ -121,12 +119,12 @@ _LOCAL_NIM_BUSY_STATUSES = frozenset({"starting", "running"})
 _engine_cache: dict[str, Engine] = {}
 
 
-def clear_engine_cache() -> None:
-    """Clear cached engines and lock state. For testing only."""
+def close_project_resources() -> None:
+    """Dispose cached database engines and release every project lock."""
     for engine in _engine_cache.values():
         engine.dispose()
     _engine_cache.clear()
-    clear_lock_state()
+    release_all_locks()
 
 
 def set_project_engine(project_id: str, engine: Engine) -> None:
@@ -155,8 +153,6 @@ def get_project_engine(project_id: str, workspace_root: str) -> Engine | None:
 # never land in projects at "unknown". Sources, per model:
 #
 # LIVE-PROBED against hosted NIM (integrate.api.nvidia.com):
-#   * qwen/qwen3.5-397b-a17b          → sg=supported, tt=supported, vb=unsupported
-#   * mistralai/mistral-large-3       → sg=supported, tt=unsupported, vb=unsupported
 #   * nvidia/nemotron-nano-12b-v2-vl  → sg=supported, tt=unsupported, vb=supported
 #   * nvidia/nemotron-3-nano-omni-30b-a3b-reasoning → sg=supported,
 #     tt=supported, vb=unsupported. NIM 1.7.0 documents and the local campaign
@@ -310,6 +306,12 @@ SEEDED_MODEL_CATALOG: list[dict[str, Any]] = [
             "nim_model_size": "super",
             "nim_gpu_memory_minimum_gb": COSMOS3_SUPER_REASONER_GPU_MIN_GB,
             "preferred_host_port": 8000,
+            # The 32B BF16 checkpoint occupies ~62.6 GiB. The image's native
+            # 262k-token default asks vLLM for another 64 GiB of KV cache and
+            # cannot start on the supported 96 GB single-GPU host. A 65,536
+            # token serving window needs well below the measured 20.47 GiB
+            # remaining cache and still exceeds Blueprint prompt budgets.
+            "extra_container_env": {"NIM_MAX_MODEL_LEN": 65536},
             # ~30B tier needs BOTH tensor parallelism AND a bf16 optimizer
             # master to fit 8×80 GB. tp=8 × dp_shard=1 maxes activation/load
             # sharding; master_dtype=bfloat16 halves the AdamW master/m/v
@@ -332,30 +334,11 @@ SEEDED_MODEL_CATALOG: list[dict[str, Any]] = [
     },
     # Qwen 3.5 397B was removed from the catalog on 2026-07-23: NVIDIA retired
     # its hosted API on 2026-07-27 with no NVIDIA-hosted successor, and the endpoint
-    # already 404s/DEGRADEs on the standard key. The QWEN_3_5 constant stays
-    # in model_catalog_constants for the AutoRun-compare display map.
-    {
-        "model_name": MISTRAL_LARGE_3,
-        "context_window_tokens": 262144,
-        "eligible_roles": ["teacher"],
-        "supports_image_input": True,
-        "thinking_toggle_mode": "none",
-        "thinking_toggle_support": "unsupported",
-        "visual_budget_mode": "none",
-        "visual_budget_support": "unsupported",
-        "structured_generation_support": "supported",
-        # Live-probed: hosted Mistral Large 3 returns
-        # ``HTTP 400: At most 8 image(s) may be provided in one prompt``
-        # at N=9 — the real cap is 8.
-        "max_images_per_request": 8,
-        "image_cap_support": "supported",
-        # July 2026 depth studies: ceiling-class teachers are depth-
-        # insensitive (Mistral Medium 3.5 scored 1.000 at k=2 and k=9 on
-        # rps), so shallow is the cost floor — every exemplar past 2 buys
-        # tokens/latency and nothing else.
-        "default_icl_max_examples": 2,
-        "local_deploy_metadata": None,
-    },
+    # already 404s/DEGRADEs on the standard key. Mistral Large 3 was removed
+    # on 2026-08-03 after NVIDIA marked its free endpoint deprecated, omitted
+    # it from GET /v1/models, and returned HTTP 410 on repeated live probes.
+    # Existing project records remain valid because model identities are stored
+    # as strings; neither retired model is seeded into new projects.
     {
         "model_name": NEMOTRON_NANO_12B_VL,
         "context_window_tokens": 128000,
@@ -458,50 +441,6 @@ SEEDED_MODEL_CATALOG: list[dict[str, Any]] = [
         "local_deploy_metadata": None,
     },
     {
-        # The hosted default Teacher since 2026-07-23. Deep-ICL-capable — the
-        # only hosted Teacher measured past a 32-image request,
-        # so it keeps benefiting as Verified Edits accumulate (every other
-        # hosted Teacher is provider-capped at 8-10 images). 5-dataset
-        # attempted-EM avg 0.823 — the top of the reachable field (Qwen 3.5
-        # 397B's 0.891 was higher, but its hosted API is retired 2026-07-27
-        # and it is removed from the seed). Re-measured
-        # 2026-07-23 at 13.9 s cold / 15.0 s steady p50 (p90 19.9 s), down
-        # from July's 27/36 s. Practical request ceiling is the provider's
-        # ~5 MB body cap, not an image count (pv relaunch notes 2026-07-04).
-        "model_name": MINIMAX_M3,
-        # Live-probed floor: max_tokens=500000 accepted, 1M+ answered
-        # with 200-and-empty-choices (MiniMax's over-limit shape). Seeded
-        # at the proven floor rather than a vendor claim.
-        "context_window_tokens": 500000,
-        "eligible_roles": ["teacher"],
-        "supports_image_input": True,
-        # ``chat_template_kwargs`` neither errors nor acts as a real
-        # toggle (enable_thinking true and false both emit the same
-        # trace; baseline emits none) — no usable knob.
-        "thinking_toggle_mode": "none",
-        "thinking_toggle_support": "unsupported",
-        # Live-probed: mm_processor_kwargs silently ignored
-        # (prompt_tokens identical across budgets).
-        "visual_budget_mode": "none",
-        "visual_budget_support": "unsupported",
-        # Live-probed: strict json_schema response_format returns valid
-        # schema-shaped JSON.
-        "structured_generation_support": "supported",
-        # Live-probed ladder found NO 400 boundary through 33 images —
-        # 32 is the pv-campaign-validated operating point, kept because
-        # the ~5 MB body cap bites first on real photos; support stays
-        # "unknown" (no provider-enforced count to pin).
-        "max_images_per_request": 32,
-        "image_cap_support": "unknown",
-        # The certified 5-dataset campaign exercised adaptive depths above
-        # two on every dataset (2.5-5.5 average). A same-pool VisA recheck
-        # on 2026-07-27 recovered the prior operating point at cap 8
-        # (5.97 average), while cap 2 left measurable ICL quality unused.
-        # Adaptive-K still trims easy queries below this ceiling.
-        "default_icl_max_examples": 8,
-        "local_deploy_metadata": None,
-    },
-    {
         # Near-ceiling Mistral-family alternate (5-dataset attempted-EM
         # avg 0.821; 0.0% model-error on every campaign dataset; 1.000 at
         # k=2 and k=9 on rps). NOTE: measured 2026-07-21 at 62 s cold /
@@ -533,27 +472,23 @@ SEEDED_MODEL_CATALOG: list[dict[str, Any]] = [
     },
 ]
 
-# Default Teacher selection — MiniMax-M3 (2026-07-23, superseding Step 3.7
-# Flash). The value is read
+SEEDED_MODEL_NAMES = frozenset(
+    str(entry["model_name"]) for entry in SEEDED_MODEL_CATALOG
+)
+
+# Default Teacher selection — Step 3.7 Flash. It became the commercial-first
+# hosted default on 2026-08-06 when MiniMax M3 was removed from the curated
+# seed because NVIDIA's model card limits that hosted model to non-commercial
+# use. The value is read
 # from settings.DEFAULT_TEACHER_MODEL (config-overridable), NOT hardcoded
 # elsewhere — the auth probe and the Confirm Defaults screen both resolve it
 # from that setting / the /v1/environment default_teacher_model_name field.
-# The reseat evidence:
-#   * step regressed: its always-on reasoning trace grew ~3-6× (≈700 chars in
-#     July → 2,000-4,200 now), tripling latency (steady p50 6.7 s → 21.0 s,
-#     p90 28.1 s, one truncation) — the speed edge that won it the default is
-#     gone
-#   * accuracy: MiniMax-M3 is 0.823 avg attempted-EM across the certified
-#     5-dataset pv 2×2 campaign — the top of the reachable field now that
-#     Qwen 3.5 397B (0.891) is retired from the hosted API (2026-07-27) and
-#     removed from the seed
-#   * ICL-over-time: MiniMax-M3 is the ONLY hosted Teacher that uses a deep
-#     ICL pool (>8 images; every other hosted Teacher is provider-capped at
-#     8-10), so it keeps benefiting as Verified Edits accumulate
-#   * latency: 15.0 s steady p50 / 19.9 s p90 (re-measured 2026-07-23, down
-#     from July's 36 s) — lower and tighter than the regressed incumbent
-# Step 3.7 Flash and the Mistral models remain reachable alternates via the
-# top-bar Teacher picker. Local selection is separate and quality-first:
+# Step remains the strongest commercially permitted reachable hosted Teacher
+# in the retained certified campaign evidence (0.865 attempted-EM average).
+# Its always-on reasoning trace makes it slower than the retired MiniMax seed,
+# but model-use compatibility is a prerequisite for the Blueprint's curated
+# onboarding path. Mistral Medium and Nemotron remain reachable alternates via
+# the top-bar Teacher picker. Local selection is separate and quality-first:
 # Omni on supported ≥80 GB / cc≥9.0 GPUs, CR3-Nano at ≥56 GB when Omni is
 # ineligible, and Cosmos Reason2 2B at 36–55 GB (see
 # environment._pick_local_teacher_recommendation).
@@ -721,6 +656,14 @@ def create_project(
     preferred_local_teacher_model_name: str | None = None,
 ) -> Project:
     """Create a project and adopt an exact running local Teacher when present."""
+    if settings.DEFAULT_TEACHER_MODEL not in SEEDED_MODEL_NAMES:
+        allowed = ", ".join(sorted(SEEDED_MODEL_NAMES))
+        raise ValueError(
+            "DEFAULT_TEACHER_MODEL must name a model in the commercially "
+            f"permitted fresh-project seed. Got {settings.DEFAULT_TEACHER_MODEL!r}. "
+            f"Choose one of: {allowed}."
+        )
+
     project_id = generate_uuid4()
     project_dir = project_dir_path(settings.WORKSPACE_ROOT, project_id)
 

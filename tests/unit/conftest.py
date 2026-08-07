@@ -44,16 +44,16 @@ from vlm_feedback_loop.db.models.nim_endpoint import NimEndpoint
 from vlm_feedback_loop.db.models.project import Project
 from vlm_feedback_loop.db.models.tao_job import TAOJob
 from vlm_feedback_loop.services.project_service import (
-    clear_engine_cache,
+    close_project_resources,
     set_project_engine,
 )
 from vlm_feedback_loop.services.prompt_service import TeacherInvocationResult
 
 
 @pytest.fixture(autouse=True)
-def _clear_project_engine_cache():
+def _close_project_resources():
     """Reset process-global state after every test: the project-engine
-    cache and the FastAPI app's dependency overrides.
+    engines, project locks, and the FastAPI app's dependency overrides.
 
     yield-first teardown, so it runs even when the test body fails —
     replacing the old per-test trailing ``_cleanup()`` idiom, which leaked
@@ -67,14 +67,42 @@ def _clear_project_engine_cache():
     already clear (e.g. ``test_app_client``) just make this a no-op.
 
     Function-scoped, so it is correct under ``pytest-xdist --dist
-    loadfile``: each worker process holds its own engine cache and clears
-    it after each of its own tests.
+    loadfile``: each worker process holds its own project resources and
+    closes them after each of its own tests.
     """
     yield
+    from vlm_feedback_loop.db.engine import close_deployment_db_resources
     from vlm_feedback_loop.main import app
 
     app.dependency_overrides.clear()
-    clear_engine_cache()
+    close_project_resources()
+    close_deployment_db_resources()
+
+
+@pytest.fixture(autouse=True)
+def _dispose_test_engines(monkeypatch: pytest.MonkeyPatch):
+    """Dispose every SQLite engine created by a unit test.
+
+    Most service tests create databases through helpers rather than the two
+    shared engine fixtures, so fixture-local teardown alone cannot close their
+    connection pools. Python 3.13 reports those surviving DBAPI connections as
+    ``ResourceWarning`` during garbage collection. Track the real factory at
+    the test boundary and release every engine after the test; explicit
+    per-test disposal remains safe because ``Engine.dispose()`` is idempotent.
+    """
+
+    created: list[Engine] = []
+    real_create_engine = db_engine_module._create_engine
+
+    def tracked_create_engine(*args: Any, **kwargs: Any) -> Engine:
+        engine = real_create_engine(*args, **kwargs)
+        created.append(engine)
+        return engine
+
+    monkeypatch.setattr(db_engine_module, "_create_engine", tracked_create_engine)
+    yield
+    for engine in reversed(created):
+        engine.dispose()
 
 
 # ── Template project DB ──────────────────────────────────────────────────────
@@ -292,7 +320,7 @@ def make_api_client(
     unless an explicit ``settings`` is passed, installs it as the
     ``get_current_settings`` dependency override, and clears the
     project-engine cache. Both are reset after the test by the autouse
-    ``_clear_project_engine_cache`` fixture.
+    ``_close_project_resources`` fixture.
     """
     from vlm_feedback_loop.main import app
     from vlm_feedback_loop.routers.projects import get_current_settings
@@ -303,7 +331,7 @@ def make_api_client(
         settings = make_settings(workspace, **settings_overrides)
 
     app.dependency_overrides[get_current_settings] = lambda: settings
-    clear_engine_cache()
+    close_project_resources()
 
     return TestClient(app, raise_server_exceptions=False)
 
@@ -437,7 +465,7 @@ _PROJECT_ROW_DEFAULTS: dict[str, Any] = {
     "test_pool_fraction": 0.40,
     "scaleup_exact_match_threshold": 0.80,
     "scaleup_per_field_match_threshold": 0.80,
-    "scaleup_min_per_value_f1_threshold": 0.80,
+    "scaleup_min_per_value_f1_threshold": 0.60,
     "scaleup_accept_rate_threshold": 0.80,
     "scaleup_accept_rate_window": 50,
     "scaleup_min_test_pool_size": 20,

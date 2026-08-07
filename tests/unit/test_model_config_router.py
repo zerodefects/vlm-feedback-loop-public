@@ -23,10 +23,9 @@ from vlm_feedback_loop.model_catalog_constants import (
     COSMOS3_SUPER_REASONER,
     COSMOS_REASON2_2B,
     COSMOS_REASON2_8B,
-    MISTRAL_LARGE_3,
+    MISTRAL_MEDIUM_3_5,
     NEMOTRON_3_NANO_OMNI_REASONING,
     NEMOTRON_NANO_12B_VL,
-    QWEN_3_5,
 )
 from vlm_feedback_loop.services.http_client import HttpResult
 from vlm_feedback_loop.services.model_config_service import (
@@ -35,6 +34,8 @@ from vlm_feedback_loop.services.model_config_service import (
     probe_thinking_toggle,
     probe_visual_budget,
 )
+
+_RETIRED_MISTRAL_LARGE_3 = "mistralai/mistral-large-3-675b-instruct-2512"
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -126,6 +127,67 @@ class TestStructuredGenerationProbe:
         assert result == "supported"
         sent_body = mock_fn.call_args.kwargs["json_body"]
         assert sent_body["chat_template_kwargs"] == {"enable_thinking": False}
+
+    @pytest.mark.asyncio
+    async def test_always_on_reasoner_gets_probe_headroom(self, monkeypatch):
+        """Structured probing must leave room for an unavoidable trace."""
+        mock_result = HttpResult(
+            status_code=200,
+            body={
+                "choices": [
+                    {"message": {"content": '{"ok": true}'}, "finish_reason": "stop"}
+                ]
+            },
+            error_class=None,
+            attempts=1,
+        )
+        mock_fn = AsyncMock(return_value=mock_result)
+        monkeypatch.setattr(
+            "vlm_feedback_loop.services.model_config_service.nim_client.resilient_request",
+            mock_fn,
+        )
+
+        result = await probe_structured_generation(
+            "http://host:8000/v1",
+            {},
+            "always-on-model",
+            180.0,
+            thinking_toggle_mode="always_on_reasoning",
+        )
+
+        assert result == "supported"
+        assert mock_fn.call_args.kwargs["json_body"]["max_tokens"] == 4096
+
+    @pytest.mark.asyncio
+    async def test_truncated_reasoning_is_unknown_not_unsupported(self, monkeypatch):
+        """A length-limited trace does not prove response_format rejection."""
+        mock_result = HttpResult(
+            status_code=200,
+            body={
+                "choices": [
+                    {
+                        "message": {"content": "unfinished reasoning"},
+                        "finish_reason": "length",
+                    }
+                ]
+            },
+            error_class=None,
+            attempts=1,
+        )
+        monkeypatch.setattr(
+            "vlm_feedback_loop.services.model_config_service.nim_client.resilient_request",
+            AsyncMock(return_value=mock_result),
+        )
+
+        result = await probe_structured_generation(
+            "http://host:8000/v1",
+            {},
+            "always-on-model",
+            180.0,
+            thinking_toggle_mode="always_on_reasoning",
+        )
+
+        assert result == "unknown"
 
     @pytest.mark.asyncio
     async def test_unsupported_on_4xx(self, monkeypatch):
@@ -382,7 +444,7 @@ class TestImageCapSupportProbe:
             _mock_request,
         )
         result = await _probe_image_cap_support(
-            "http://host:8000/v1", {}, QWEN_3_5, 8, 10.0
+            "http://host:8000/v1", {}, NEMOTRON_NANO_12B_VL, 8, 10.0
         )
         assert result == "supported"
         assert call_count == 2  # cap then cap+1
@@ -407,7 +469,7 @@ class TestImageCapSupportProbe:
         )
         # Seeded value is 10 but real cap is 8 — probe MUST flag.
         result = await _probe_image_cap_support(
-            "http://host:8000/v1", {}, QWEN_3_5, 10, 10.0
+            "http://host:8000/v1", {}, NEMOTRON_NANO_12B_VL, 10, 10.0
         )
         assert result == "unsupported"
 
@@ -500,7 +562,10 @@ class TestModelConfigCRUD:
         resp = test_app_client.get(f"/v1/projects/{project_id}/model_configs")
         assert resp.status_code == 200
         data = resp.json()
-        assert len(data["items"]) == 10
+        assert len(data["items"]) == 8
+        assert _RETIRED_MISTRAL_LARGE_3 not in {
+            item["model_name"] for item in data["items"]
+        }
 
     def test_list_filter_teacher(self, test_app_client):
         project_id = _create_project(test_app_client)
@@ -754,7 +819,7 @@ class TestModelConfigCRUD:
     def test_seeded_icl_depth_defaults_match_measured_values(self, test_app_client):
         """Every seeded Teacher carries the ICL depth default the July 2026
         cross-model depth studies established for it (Nemotron Nano VL 2 ·
-        Omni 4 · CR3 8 · CR2-2B 8 · CR2-8B 16 · MiniMax 8 · Mistral 2)."""
+        Omni 4 · CR3 8 · CR2-2B 8 · CR2-8B 16 · Mistral 2)."""
         project_id = _create_project(test_app_client)
         items = test_app_client.get(f"/v1/projects/{project_id}/model_configs").json()[
             "items"
@@ -766,8 +831,8 @@ class TestModelConfigCRUD:
         assert by_name[COSMOS3_SUPER_REASONER] == 8
         assert by_name[COSMOS_REASON2_2B] == 8
         assert by_name[COSMOS_REASON2_8B] == 16
-        assert by_name[MISTRAL_LARGE_3] == 2
-        assert by_name["minimaxai/minimax-m3"] == 8
+        assert by_name[MISTRAL_MEDIUM_3_5] == 2
+        assert "minimaxai/minimax-m3" not in by_name
 
     def test_patch_default_icl_max_examples(self, test_app_client):
         """Operators can re-tune a model's ICL depth default per project
@@ -809,16 +874,16 @@ class TestModelConfigCRUD:
 
     def test_cursor_pagination(self, test_app_client):
         project_id = _create_project(test_app_client)
-        # 9 seeded entries — paginate with limit=4 across 3 pages.
+        # 8 seeded entries — paginate with limit=3 across 3 pages.
         items: list[dict] = []
         cursor: str | None = None
-        for _ in range(5):  # safety bound > ceil(9/4)
-            url = f"/v1/projects/{project_id}/model_configs?limit=4"
+        for _ in range(5):  # safety bound > ceil(8/3)
+            url = f"/v1/projects/{project_id}/model_configs?limit=3"
             if cursor:
                 url += f"&cursor={cursor}"
             data = test_app_client.get(url).json()
             page = data["items"]
-            assert len(page) <= 4
+            assert len(page) <= 3
             items.extend(page)
             cursor = data["next_cursor"]
             if cursor is None:
@@ -826,7 +891,7 @@ class TestModelConfigCRUD:
         assert cursor is None  # fully drained
         # All unique
         all_ids = {i["model_config_id"] for i in items}
-        assert len(all_ids) == 10
+        assert len(all_ids) == 8
 
 
 # ── Re-probe endpoint tests ────────────────────────────────────────────────
@@ -959,11 +1024,11 @@ class TestReprobe:
         """One probe failing doesn't block the others."""
         project_id = _create_project(test_app_client)
 
-        # Find mistral (thinking_toggle_mode=none, visual_budget_mode=none)
+        # Find the current Mistral seed (thinking/visual modes are both none).
         items = test_app_client.get(f"/v1/projects/{project_id}/model_configs").json()[
             "items"
         ]
-        mistral = next(i for i in items if i["model_name"] == MISTRAL_LARGE_3)
+        mistral = next(i for i in items if i["model_name"] == MISTRAL_MEDIUM_3_5)
         mc_id = mistral["model_config_id"]
 
         resp = test_app_client.post(

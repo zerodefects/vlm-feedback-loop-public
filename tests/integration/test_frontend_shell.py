@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -117,6 +118,18 @@ class TestKuiTailwindRender:
         assert tw_pos >= 0, "Tailwind import not found"
         assert kui_pos > tw_pos, "KUI base.css must be imported after Tailwind"
 
+    def test_native_glass_choices_restore_visible_keyboard_focus_after_reset(self):
+        """Checkboxes and radios retain a visible focus ring after form resets."""
+        css = (FRONTEND_DIR / "src" / "index.css").read_text()
+        base_pos = css.find('.glass-input[type="checkbox"],')
+        focus_pos = css.find('.glass-input[type="checkbox"]:focus-visible,')
+        assert base_pos >= 0, "Native glass choice styling not found"
+        assert focus_pos > base_pos, "Choice focus styling must follow the native reset"
+        focus_rule_end = css.find("}", focus_pos)
+        focus_rule = css[focus_pos:focus_rule_end]
+        assert "outline: 2px solid var(--accent-green);" in focus_rule
+        assert "outline-offset: 2px;" in focus_rule
+
 
 # ---------------------------------------------------------------------------
 # Criterion 3: Single-command launch
@@ -139,6 +152,110 @@ class TestSingleCommandLaunch:
         script = (REPO_ROOT / "scripts" / "dev.sh").read_text()
         assert "vlm_feedback_loop" in script, "Script should start the backend"
         assert "pnpm dev" in script, "Script should start the frontend"
+
+    def test_dev_script_propagates_child_failure_and_configured_port(
+        self, tmp_path: Path
+    ):
+        """A failed child stops the launcher and Vite sees the backend port."""
+        real_uv = shutil.which("uv")
+        assert real_uv is not None
+
+        config_dir = tmp_path / ".vlm_feedback_loop"
+        config_dir.mkdir()
+        (config_dir / "config.yaml").write_text(
+            f"WORKSPACE_ROOT: {tmp_path / 'workspace'}\nBIND_PORT: 8123\n"
+        )
+
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_uv = fake_bin / "uv"
+        fake_uv.write_text(
+            "#!/usr/bin/env bash\n"
+            'case " $* " in\n'
+            '  *" --print-backend-url "*) exec "$REAL_UV" "$@" ;;\n'
+            "  *)\n"
+            "    for _ in $(seq 1 100); do\n"
+            '      [ -f "$FRONTEND_READY" ] && exit 7\n'
+            "      sleep 0.05\n"
+            "    done\n"
+            "    exit 9\n"
+            "    ;;\n"
+            "esac\n"
+        )
+        fake_uv.chmod(0o755)
+
+        proxy_target = tmp_path / "vite-target.txt"
+        fake_pnpm = fake_bin / "pnpm"
+        fake_pnpm.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf \'%s\' "${VITE_BACKEND_URL:-missing}" > "$PROXY_TARGET"\n'
+            'printf \'%s\' "$$" > "$FRONTEND_READY"\n'
+            "exec node -e 'setInterval(() => {}, 1000)' \"$FAKE_VITE_ARG\"\n"
+        )
+        fake_pnpm.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            HOME=str(tmp_path),
+            PATH=f"{fake_bin}{os.pathsep}{env['PATH']}",
+            REAL_UV=real_uv,
+            PROXY_TARGET=str(proxy_target),
+            FRONTEND_READY=str(tmp_path / "frontend-ready.txt"),
+            FAKE_VITE_ARG=str(FRONTEND_DIR / "node_modules" / ".bin" / "vite"),
+        )
+        result = subprocess.run(
+            [str(REPO_ROOT / "scripts" / "dev.sh")],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+        assert result.returncode == 7, result.stdout + result.stderr
+        assert proxy_target.read_text() == "http://127.0.0.1:8123"
+        frontend_pid = (tmp_path / "frontend-ready.txt").read_text()
+        assert not Path(f"/proc/{frontend_pid}").exists()
+
+    def test_vite_refuses_to_hide_a_busy_documented_port(self):
+        """The dev server fails instead of silently moving away from 5173."""
+        config = (FRONTEND_DIR / "vite.config.ts").read_text()
+        assert "strictPort: true" in _config_object_block(config, "server")
+
+    def test_backend_cleanup_is_scoped_to_source_checkout(self, tmp_path: Path):
+        """A same-named backend outside this checkout is never reaped."""
+        external_cwd = tmp_path / "compose-app"
+        external_cwd.mkdir()
+        repo_process = subprocess.Popen(
+            ["vlm_feedback_loop.main", "30"],
+            executable="sleep",
+            cwd=REPO_ROOT,
+        )
+        external_process = subprocess.Popen(
+            ["vlm_feedback_loop.main", "30"],
+            executable="sleep",
+            cwd=external_cwd,
+        )
+        try:
+            command = (
+                f"REPO_ROOT={REPO_ROOT!s}; "
+                f"source {REPO_ROOT / 'scripts' / 'dev-processes.sh'}; "
+                "_vlm_dev_backend_pids"
+            )
+            result = subprocess.run(
+                ["bash", "-c", command],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            selected = {int(pid) for pid in result.stdout.split()}
+            assert repo_process.pid in selected
+            assert external_process.pid not in selected
+        finally:
+            repo_process.terminate()
+            external_process.terminate()
+            repo_process.wait(timeout=5)
+            external_process.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +302,7 @@ class TestDevProxy:
 
 
 class TestSsePassthrough:
-    """Verify: SSE connections through the proxy stay open and receive events."""
+    """Verify that the backend exposes the SSE route used by proxy tests."""
 
     def test_sse_endpoint_exists_on_backend(self, backend_server):  # noqa: ARG002
         """Backend has the SSE events endpoint (returns 404 for non-existent project)."""
@@ -197,40 +314,6 @@ class TestSsePassthrough:
         # (a missing ROUTE would be FastAPI's generic "Not Found" body).
         assert resp.status_code == 404
         assert resp.json()["detail"] == "Project not found"
-
-    def test_sse_via_proxy_for_real_project(self, frontend_server):  # noqa: ARG002
-        """SSE connection through Vite proxy opens and streams for a real project."""
-        # First create a project so we have a valid ID
-        create_resp = httpx.post(
-            f"{FRONTEND_URL}/v1/projects",
-            json={"name": "SSE Test Project"},
-            timeout=10,
-        )
-        assert create_resp.status_code == 201, create_resp.text
-        project_id = create_resp.json()["project_id"]
-
-        # Open an SSE connection through the Vite proxy
-        # Use raw httpx stream to verify the connection stays open
-        try:
-            with httpx.stream(
-                "GET",
-                f"{FRONTEND_URL}/v1/projects/{project_id}/events",
-                timeout=httpx.Timeout(connect=5, read=3, write=5, pool=5),
-                headers={"Accept": "text/event-stream"},
-            ) as response:
-                assert response.status_code == 200
-                content_type = response.headers.get("content-type", "")
-                assert "text/event-stream" in content_type, (
-                    f"Expected text/event-stream, got {content_type}"
-                )
-                # Connection opened successfully. SSE streams are long-lived;
-                # we don't need to wait for data — the fact that the response
-                # opened with 200 and correct content-type proves passthrough.
-        except httpx.ReadTimeout:
-            # ReadTimeout is expected — SSE streams have no end, so the
-            # read timeout fires. The connection was open and the content-type
-            # was correct before the timeout.
-            pass
 
 
 # ---------------------------------------------------------------------------

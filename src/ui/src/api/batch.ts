@@ -19,6 +19,8 @@ export function createBatchLabelRun(
     include_auto_labeled?: boolean;
     run_limit?: number | null;
     structured_generation_mode?: string | null;
+    concurrency?: number | null;
+    icl_mode?: "enabled" | "disabled";
     ingested_after?: string | null;
     ingested_before?: string | null;
   },
@@ -81,6 +83,15 @@ export function getDatasetExport(
   datasetExportId: string,
 ): Promise<DatasetExportResponse> {
   return apiFetch(`/projects/${projectId}/dataset_exports/${datasetExportId}`);
+}
+
+export function datasetExportArchiveUrl(
+  projectId: string,
+  datasetExportId: string,
+): string {
+  return `/v1/projects/${encodeURIComponent(projectId)}/dataset_exports/${encodeURIComponent(
+    datasetExportId,
+  )}/archive`;
 }
 
 export function createDatasetExport(

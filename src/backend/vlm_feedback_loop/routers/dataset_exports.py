@@ -8,6 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 
 from vlm_feedback_loop.config import Settings
+from vlm_feedback_loop.routers.file_response import FileDescriptorResponse
 from vlm_feedback_loop.routers.projects import get_current_settings
 from vlm_feedback_loop.schemas.dataset_export import (
     DatasetExportCreateRequest,
@@ -61,6 +62,29 @@ async def create_dataset_export(
 
 
 # ── Get ────────────────────────────────────────────────────────────────────
+
+
+@dataset_exports_router.get("/dataset_exports/{dataset_export_id}/archive")
+def download_dataset_export_archive(
+    project_id: str,
+    dataset_export_id: str,
+    settings: Settings = Depends(get_current_settings),
+) -> FileDescriptorResponse:
+    """Stream a completed project-scoped export through the public edge."""
+
+    result = dataset_export_service.get_dataset_export_archive(
+        project_id,
+        dataset_export_id,
+        settings=settings,
+    )
+    if isinstance(result, str):
+        raise map_service_error(result)
+    return FileDescriptorResponse(
+        result.opened_file,
+        media_type="application/gzip",
+        filename=result.path.name,
+        headers={"X-Checksum-SHA256": result.checksum_sha256},
+    )
 
 
 @dataset_exports_router.get(

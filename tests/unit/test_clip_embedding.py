@@ -703,6 +703,72 @@ class TestProjectCreationProbe:
 
 class TestBackgroundWorker:
     @pytest.mark.asyncio
+    async def test_worker_skips_policy_denied_image_without_dispatch(
+        self, tmp_path: Path
+    ):
+        """A persisted stale path cannot become outbound embedding input."""
+        from vlm_feedback_loop.db.engine import open_project_db
+        from vlm_feedback_loop.db.models.clip_embedding import ClipEmbedding
+        from vlm_feedback_loop.db.models.example import Example
+        from vlm_feedback_loop.db.models.project import Project
+        from vlm_feedback_loop.services.clip_embedding_service import (
+            _embedding_worker,
+        )
+        from vlm_feedback_loop.services.project_service import set_project_engine
+
+        workspace = tmp_path / "workspace"
+        project_dir = workspace / "projects" / "denied-project"
+        project_dir.mkdir(parents=True)
+        engine = open_project_db(project_dir)
+        set_project_engine("denied-project", engine)
+        allowed = tmp_path / "allowed"
+        allowed.mkdir()
+        outside = tmp_path / "outside.jpg"
+        make_test_image(outside)
+
+        with Session(engine) as session:
+            session.add(
+                Project(
+                    project_id="denied-project",
+                    name="Denied",
+                    project_dir=str(project_dir),
+                    embedding_provider="hosted_nvclip",
+                    embedding_model_id=EMBEDDING_MODEL_ID,
+                    embedding_dim=2048,
+                )
+            )
+            session.add(
+                Example(
+                    example_key="outside",
+                    project_id="denied-project",
+                    storage_ref=str(outside),
+                    ingested_at="2026-01-01T00:00:00Z",
+                    source_metadata={},
+                    state="Unlabeled",
+                    phash=None,
+                )
+            )
+            session.commit()
+
+        settings = make_settings(
+            workspace,
+            IMAGE_ROOT=str(allowed),
+            NVIDIA_API_KEY="nvapi-test",
+            EMBEDDINGS_AUTO_COMPUTE=True,
+        )
+        embed_mock = AsyncMock(return_value=_fake_embeddings_result(dim=2048, count=1))
+
+        with patch(
+            "vlm_feedback_loop.services.clip_embedding_service.nim_client.create_embeddings",
+            new=embed_mock,
+        ):
+            await _embedding_worker("denied-project", str(workspace), settings)
+
+        embed_mock.assert_not_awaited()
+        with Session(engine) as session:
+            assert session.query(ClipEmbedding).count() == 0
+
+    @pytest.mark.asyncio
     async def test_worker_processes_examples(self, tmp_path: Path):
         """Full worker run: creates ClipEmbedding rows and updates Example flags."""
         from vlm_feedback_loop.db.engine import open_project_db

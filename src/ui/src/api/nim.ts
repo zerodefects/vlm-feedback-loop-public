@@ -15,16 +15,29 @@ import type {
   EnvironmentResponse,
   LocalNimDeployRequest,
   LocalNimDeployResponse,
+  LocalNimDeploymentResponse,
   LocalNimDeploymentListResponse,
   LocalNimGpuConflict,
   LocalNimPreflightRequest,
+  NimEndpointListResponse,
   PreflightResponse,
+  SelfHostedTeacherConfigureRequest,
+  SelfHostedTeacherConfigureResponse,
+  SelfHostedEmbeddingConfigureRequest,
+  EmbeddingDeploymentConfigResponse,
 } from "@/types/nim";
+
+export function fetchNimEndpoints(projectId: string): Promise<NimEndpointListResponse> {
+  return apiFetch<NimEndpointListResponse>(`/projects/${projectId}/nim_endpoints`);
+}
 
 // ── Deployment-scoped ───────────────────────────────────────────────────────
 
-export function fetchEnvironment(): Promise<EnvironmentResponse> {
-  return apiFetch<EnvironmentResponse>("/environment");
+export function fetchEnvironment(
+  refreshHardware = false,
+): Promise<EnvironmentResponse> {
+  const suffix = refreshHardware ? "?refresh_hardware=true" : "";
+  return apiFetch<EnvironmentResponse>(`/environment${suffix}`);
 }
 
 export function testConnection(
@@ -34,6 +47,25 @@ export function testConnection(
     method: "POST",
     body: JSON.stringify(body),
   });
+}
+
+export function configureSelfHostedTeacher(
+  projectId: string,
+  body: SelfHostedTeacherConfigureRequest,
+): Promise<SelfHostedTeacherConfigureResponse> {
+  return apiFetch<SelfHostedTeacherConfigureResponse>(
+    `/projects/${projectId}/nim_endpoints:configure_self_hosted_teacher`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+export function configureSelfHostedEmbedding(
+  body: SelfHostedEmbeddingConfigureRequest,
+): Promise<EmbeddingDeploymentConfigResponse> {
+  return apiFetch<EmbeddingDeploymentConfigResponse>(
+    "/embedding_deployment_config:configure_self_hosted",
+    { method: "POST", body: JSON.stringify(body) },
+  );
 }
 
 /**
@@ -55,6 +87,7 @@ export function testConnection(
  */
 export function testNgcCredential(
   credential?: string,
+  signal?: AbortSignal,
 ): Promise<ConnectionTestResponse> {
   const body =
     credential !== undefined && credential.length > 0
@@ -63,6 +96,7 @@ export function testNgcCredential(
   return apiFetch<ConnectionTestResponse>("/nim/test_ngc_credential", {
     method: "POST",
     body: JSON.stringify(body),
+    signal,
   });
 }
 
@@ -76,6 +110,7 @@ export function testNgcCredential(
  */
 export function testNvidiaCredential(
   credential?: string,
+  signal?: AbortSignal,
 ): Promise<ConnectionTestResponse> {
   const body =
     credential !== undefined && credential.length > 0
@@ -84,6 +119,7 @@ export function testNvidiaCredential(
   return apiFetch<ConnectionTestResponse>("/nim/test_nvidia_credential", {
     method: "POST",
     body: JSON.stringify(body),
+    signal,
   });
 }
 
@@ -153,6 +189,16 @@ export function listLocalNimDeployments(
 ): Promise<LocalNimDeploymentListResponse> {
   return apiFetch<LocalNimDeploymentListResponse>(
     `/projects/${projectId}/local_nim/deployments`,
+  );
+}
+
+export function stopLocalNim(
+  projectId: string,
+  deploymentId: string,
+): Promise<LocalNimDeploymentResponse> {
+  return apiFetch<LocalNimDeploymentResponse>(
+    `/projects/${projectId}/local_nim/deployments/${deploymentId}:stop`,
+    { method: "POST" },
   );
 }
 

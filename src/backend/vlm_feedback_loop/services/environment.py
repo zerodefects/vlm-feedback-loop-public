@@ -4,12 +4,15 @@
 """Environment assessment service.
 
 Probes the local environment for hardware, credentials, Docker, and GPU
-availability.  ``assess_environment`` recomputes on every call;
-``get_cached_environment`` wraps it with a short TTL so high-frequency
-callers (model-catalog list endpoint, every ``GET
-/v1/projects/{id}/model_configs``) avoid running subprocess probes on
-each request. The cache is process-wide and invalidates automatically
-after ``_ENV_CACHE_TTL_S``.
+availability.  The expensive machine capability snapshot (Docker, NVIDIA
+Container Toolkit, and GPU inventory) is cached for the backend process
+lifetime. Cheap deployment state such as credentials, configured embeddings,
+and active NIM residents is composed fresh for every response.
+
+Real deployment preflight remains authoritative and re-checks its hardware
+requirements before launching a container. Operators who change machine
+prerequisites without restarting the backend can explicitly invalidate and
+refresh the cached snapshot through ``GET /v1/environment?refresh_hardware=true``.
 
 Shell commands use ``asyncio.create_subprocess_exec`` (safe, no injection).
 """
@@ -17,14 +20,13 @@ Shell commands use ``asyncio.create_subprocess_exec`` (safe, no injection).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
-import time
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -40,10 +42,13 @@ from vlm_feedback_loop.model_catalog_constants import (
     EMBEDDING_MODEL_ID,
     EMBEDDING_NIM_GPU_MIN_GB,
     EMBEDDING_NIM_IMAGE,
+    EMBEDDING_NIM_SUPPORTED_GPU_NAMES,
     NEMOTRON_3_NANO_OMNI_REASONING,
 )
+from vlm_feedback_loop.services.logging_config import redact_exact_secrets
 from vlm_feedback_loop.services.project_service import SEEDED_MODEL_CATALOG
 from vlm_feedback_loop.services.runtime_secrets import get_effective_secret
+from vlm_feedback_loop.services.subprocess_utils import communicate_with_timeout
 
 logger = logging.getLogger("vlm_feedback_loop.services.environment")
 
@@ -62,6 +67,15 @@ class GpuInfo:
     @property
     def memory_total_gb(self) -> float:
         return round(self.memory_total_mb / 1024, 1)
+
+
+@dataclass(frozen=True)
+class MachineAssessment:
+    """Stable host capabilities cached for one backend process lifetime."""
+
+    docker_available: bool
+    nvidia_toolkit_available: bool
+    gpu_inventory: tuple[GpuInfo, ...]
 
 
 @dataclass
@@ -131,12 +145,12 @@ async def run_subprocess(
     from stdout, stderr, and spawn diagnostics before they leave this boundary.
     The parent environment is never mutated.
     """
-    proc: asyncio.subprocess.Process | None = None
     try:
         subprocess_kwargs: dict[str, Any] = {
             "stdin": asyncio.subprocess.PIPE if stdin_input is not None else None,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
+            "start_new_session": True,
         }
         if secret_env is not None:
             child_env = dict(os.environ)
@@ -146,11 +160,10 @@ async def run_subprocess(
             *args,
             **subprocess_kwargs,
         )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(
-                input=stdin_input.encode("utf-8") if stdin_input is not None else None
-            ),
-            timeout=timeout_s,
+        stdout_bytes, stderr_bytes = await communicate_with_timeout(
+            proc,
+            timeout_s=timeout_s,
+            stdin=stdin_input.encode("utf-8") if stdin_input is not None else None,
         )
         stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
@@ -160,11 +173,6 @@ async def run_subprocess(
             _redact_private_values(stderr, secret_env, stdin_input),
         )
     except TimeoutError:
-        # TimeoutError originates from asyncio.wait_for(proc.communicate(), ...),
-        # which requires proc already bound. Guard for pyright's broader analysis.
-        if proc is not None:
-            with contextlib.suppress(Exception):
-                proc.kill()
         return (-1, "", f"Command timed out after {timeout_s}s")
     except FileNotFoundError:
         return (-1, "", f"Command not found: {args[0]}")
@@ -178,20 +186,10 @@ def _redact_private_values(
     stdin_input: str | None = None,
 ) -> str:
     """Remove child-only environment and stdin values from diagnostics."""
-    values: set[str] = set(secret_env.values()) if secret_env else set()
+    values: set[str | None] = set(secret_env.values()) if secret_env else set()
     if stdin_input:
         values.add(stdin_input)
-    values.discard("")
-    if not values:
-        return text
-    redacted = text
-    for value in sorted(
-        values,
-        key=len,
-        reverse=True,
-    ):
-        redacted = redacted.replace(value, "[REDACTED]")
-    return redacted
+    return redact_exact_secrets(text, values)
 
 
 # ── Individual checks ───────────────────────────────────────────────────────
@@ -418,6 +416,12 @@ def _pick_running_teacher_resident_entry(
     but different size/profile selectors.
     """
 
+    # Imported here because local_nim_service imports this module while it
+    # initializes. Runtime identity must use the same validation as launch.
+    from vlm_feedback_loop.services.local_nim_service import (
+        normalize_extra_container_env,
+    )
+
     if catalog_entries is None:
         catalog_entries = SEEDED_MODEL_CATALOG
 
@@ -438,13 +442,13 @@ def _pick_running_teacher_resident_entry(
         if entry is None:
             continue
         metadata: dict[str, Any] = entry["local_deploy_metadata"]
-        raw_env = metadata.get("extra_container_env")
-        requested_env: tuple[tuple[str, str], ...] = ()
-        if isinstance(raw_env, dict):
-            env_values = cast("dict[object, object]", raw_env)
-            requested_env = tuple(
-                sorted((str(key), str(value)) for key, value in env_values.items())
+        requested_env = tuple(
+            sorted(
+                normalize_extra_container_env(
+                    metadata.get("extra_container_env")
+                ).items()
             )
+        )
         if (
             str(metadata.get("nim_container_image", "")) == resident.nim_container_image
             and (
@@ -465,12 +469,12 @@ def _pick_running_teacher_resident_entry(
     return None
 
 
-def _embedding_gpu_candidates_gb(
+def _embedding_gpu_candidates(
     gpus: list[GpuInfo],
     occupied_roles_by_device: dict[str, set[str]],
     reserve_lowest_free_for_teacher: bool,
-) -> list[float]:
-    """Memory (GB) of each GPU the embedding NIM could actually claim.
+) -> list[GpuInfo]:
+    """Return GPUs the embedding NIM could actually claim.
 
     Mirrors ``local_nim_service.resolve_gpu_placement``: a device with
     an active non-embedding resident (Teacher / Student) is unavailable,
@@ -481,12 +485,12 @@ def _embedding_gpu_candidates_gb(
     single-GPU host that will run the Teacher locally reports no
     embedding candidate.
     """
-    candidates: dict[int, float] = {}
+    candidates: dict[int, GpuInfo] = {}
     for i, gpu in enumerate(gpus):
         roles = occupied_roles_by_device.get(str(i), set())
         if roles - {"embedding"}:
             continue
-        candidates[i] = gpu.memory_total_gb
+        candidates[i] = gpu
 
     if reserve_lowest_free_for_teacher:
         fully_free = [i for i in candidates if not occupied_roles_by_device.get(str(i))]
@@ -496,15 +500,28 @@ def _embedding_gpu_candidates_gb(
     return list(candidates.values())
 
 
+def _normalized_gpu_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.casefold())
+
+
+_SUPPORTED_EMBEDDING_GPU_NAMES = frozenset(
+    _normalized_gpu_name(name) for name in EMBEDDING_NIM_SUPPORTED_GPU_NAMES
+)
+
+
+def embedding_gpu_is_supported(gpu: GpuInfo) -> bool:
+    """Whether NIM 2.0.0 validates the pinned VLM model on this exact SKU."""
+    return _normalized_gpu_name(gpu.name) in _SUPPORTED_EMBEDDING_GPU_NAMES
+
+
 def _get_embedding_deployment_summary(
-    settings: Settings, candidate_gpu_memory_gb: list[float]
+    settings: Settings, candidate_gpus: list[GpuInfo]
 ) -> EmbeddingDeploymentSummary:
     """Read EmbeddingDeploymentConfig from deployment.db and summarize.
 
-    ``candidate_gpu_memory_gb`` holds the memory of each GPU the
-    embedding NIM could actually claim (see
-    ``_embedding_gpu_candidates_gb``); ``fits`` is true when the best of
-    those meets the config floor.
+    ``candidate_gpus`` contains devices the embedding NIM could actually
+    claim. ``fits`` is true only when one device both meets the configured
+    memory floor and is a validated SKU for the pinned model/NIM release.
     """
     engine = init_deployment_db(settings.WORKSPACE_ROOT)
     with Session(engine) as session:
@@ -519,7 +536,10 @@ def _get_embedding_deployment_summary(
             provider="none",
         )
 
-    best_gpu_gb = max(candidate_gpu_memory_gb, default=0.0)
+    supported_memory_gb = [
+        gpu.memory_total_gb for gpu in candidate_gpus if embedding_gpu_is_supported(gpu)
+    ]
+    best_gpu_gb = max(supported_memory_gb, default=0.0)
     return EmbeddingDeploymentSummary(
         model_name=config.model_name,
         nim_container_image=config.nim_container_image,
@@ -583,29 +603,45 @@ def _build_missing_prerequisites(
     return missing
 
 
-async def assess_environment(settings: Settings) -> dict[str, Any]:
-    """Run all environment checks and return structured assessment.
+async def _probe_machine_assessment() -> MachineAssessment:
+    """Probe stable host capabilities.
 
-    Recomputed on every call — no caching.  No secrets in response.
+    This is the expensive portion of the environment assessment: the toolkit
+    check starts a temporary CUDA container. Callers serving ordinary reads
+    should use :func:`get_cached_environment`, not this helper directly.
     """
-    # Runtime override wins over the .env-loaded
-    # value so a UI-applied key is reflected in the next env response —
-    # the recommendation surface can flip from "hosted only" to "hybrid"
-    # once an NGC key is pasted without a backend restart.
-    nvidia_api_key_configured = bool(get_effective_secret("NVIDIA_API_KEY", settings))
-    ngc_api_key_configured = bool(get_effective_secret("NGC_API_KEY", settings))
-
     docker_result, gpu_inventory = await asyncio.gather(
         check_docker_available(),
         probe_gpu_inventory(),
     )
     docker_available, _docker_error = docker_result
 
-    # NVIDIA toolkit check requires Docker
     nvidia_toolkit_available = False
     if docker_available:
         toolkit_result = await check_nvidia_toolkit()
         nvidia_toolkit_available = toolkit_result[0]
+
+    return MachineAssessment(
+        docker_available=docker_available,
+        nvidia_toolkit_available=nvidia_toolkit_available,
+        gpu_inventory=tuple(gpu_inventory),
+    )
+
+
+def _compose_environment(
+    settings: Settings,
+    machine: MachineAssessment,
+) -> dict[str, Any]:
+    """Combine cached host capabilities with current deployment state."""
+    # Runtime override wins over the .env-loaded
+    # value so a UI-applied key is reflected in the next env response —
+    # the recommendation surface can flip from "hosted only" to "hybrid"
+    # once an NGC key is pasted without a backend restart.
+    nvidia_api_key_configured = bool(get_effective_secret("NVIDIA_API_KEY", settings))
+    ngc_api_key_configured = bool(get_effective_secret("NGC_API_KEY", settings))
+    docker_available = machine.docker_available
+    nvidia_toolkit_available = machine.nvidia_toolkit_available
+    gpu_inventory = list(machine.gpu_inventory)
 
     local_deploy_available = (
         docker_available and nvidia_toolkit_available and len(gpu_inventory) > 0
@@ -666,7 +702,7 @@ async def assess_environment(settings: Settings) -> dict[str, Any]:
     # Teacher:
     #   * Exact running Blueprint Teacher → "local", regardless of a hosted
     #     key. Fresh projects attach and select that resident at creation.
-    #   * Key configured and no reusable resident → "hosted". Mistral Large 3 is the seeded
+    #   * Key configured and no reusable resident → "hosted". Step 3.7 Flash is the seeded
     #     default and is the strongest hosted Teacher on live end-to-end
     #     validation runs. The local Teacher recommendation is still
     #     populated so the frontend can offer hybrid.
@@ -704,7 +740,7 @@ async def assess_environment(settings: Settings) -> dict[str, Any]:
     )
     embedding_deployment = _get_embedding_deployment_summary(
         settings,
-        _embedding_gpu_candidates_gb(
+        _embedding_gpu_candidates(
             gpu_inventory,
             occupied_roles_by_device,
             reserve_lowest_free_for_teacher=(
@@ -713,7 +749,14 @@ async def assess_environment(settings: Settings) -> dict[str, Any]:
         ),
     )
     embedding_fits_locally = local_deploy_available and embedding_deployment.fits
-    recommended_embedding_mode = "local" if embedding_fits_locally else "hosted"
+    if settings.EMBEDDING_PROVIDER == "none":
+        # An explicit operator opt-out is a real supported mode: the review
+        # selector remains useful through pHash diversity. Do not recommend a
+        # hosted endpoint (or prompt/probe its key) after the operator chose
+        # that local-only contract.
+        recommended_embedding_mode = "none"
+    else:
+        recommended_embedding_mode = "local" if embedding_fits_locally else "hosted"
 
     # Concrete fields for the local-teacher peer card. Null when no
     # local teacher fits; the frontend collapses the peer card in that
@@ -794,44 +837,62 @@ async def assess_environment(settings: Settings) -> dict[str, Any]:
     }
 
 
-# ── Cached entry point ──────────────────────────────────────────────────────
-#
-# Probing the environment touches subprocess (docker info, nvidia-smi),
-# the deployment.db, and runtime-secret state. The model-catalog list
-# endpoint calls into the env probe on every request to compute
-# per-entry availability, so an uncached probe-per-request would add
-# tens of milliseconds and unnecessary process spawns. The cache is a
-# single shared tuple (timestamp, dict) with a short TTL — long enough
-# to absorb a burst of catalog calls during a screen load, short enough
-# that a user pasting in an NVIDIA_API_KEY sees the new state on the
-# next refresh.
-#
-# Concurrent callers within the same TTL all see the cached dict.
-# Concurrent first-callers after expiry may each run the probe once —
-# acceptable; the lost work is small and the alternative (asyncio.Lock
-# with double-checked locking) is more complexity than the workload
-# warrants. ``invalidate_env_cache`` is exposed for code paths that
-# change the inputs (runtime secret writes) to force a re-probe.
+# ── Machine assessment cache ────────────────────────────────────────────────
 
-_ENV_CACHE_TTL_S = 30.0
-_env_cache: tuple[float, dict[str, Any]] | None = None
+_machine_assessment_cache: MachineAssessment | None = None
+_machine_assessment_task: asyncio.Task[MachineAssessment] | None = None
 
 
-async def get_cached_environment(settings: Settings) -> dict[str, Any]:
-    """Return the latest environment assessment, recomputing at most once per TTL."""
-    global _env_cache
-    now = time.monotonic()
-    if _env_cache is not None and (now - _env_cache[0]) < _ENV_CACHE_TTL_S:
-        return _env_cache[1]
-    result = await assess_environment(settings)
-    _env_cache = (now, result)
+async def assess_environment(settings: Settings) -> dict[str, Any]:
+    """Run a fully fresh assessment, including machine subprocess probes.
+
+    Deployment preflight and focused tests can use this uncached entry point.
+    Ordinary API reads should use :func:`get_cached_environment`.
+    """
+    return _compose_environment(settings, await _probe_machine_assessment())
+
+
+async def get_cached_machine_assessment() -> MachineAssessment:
+    """Return the process-wide machine snapshot with single-flight cold start."""
+    global _machine_assessment_cache, _machine_assessment_task
+    if _machine_assessment_cache is not None:
+        return _machine_assessment_cache
+
+    task = _machine_assessment_task
+    if task is None:
+        task = asyncio.create_task(_probe_machine_assessment())
+        _machine_assessment_task = task
+
+    cache_result = _machine_assessment_task is task
+    try:
+        result = await task
+    finally:
+        cache_result = cache_result and _machine_assessment_task is task
+        if cache_result:
+            _machine_assessment_task = None
+
+    # An explicit invalidation while this task was running detaches it from
+    # ``_machine_assessment_task``. Return its result to the original caller,
+    # but do not repopulate the cache after that invalidation.
+    if cache_result and _machine_assessment_cache is None:
+        _machine_assessment_cache = result
     return result
 
 
-def invalidate_env_cache() -> None:
-    """Drop the cached environment assessment so the next call re-probes."""
-    global _env_cache
-    _env_cache = None
+async def get_cached_environment(settings: Settings) -> dict[str, Any]:
+    """Return fresh deployment state over the cached machine snapshot."""
+    machine = await get_cached_machine_assessment()
+    return _compose_environment(settings, machine)
+
+
+def invalidate_machine_assessment_cache() -> None:
+    """Force the next cached read to re-probe Docker, toolkit, and GPUs."""
+    global _machine_assessment_cache, _machine_assessment_task
+    _machine_assessment_cache = None
+    # Do not cancel a probe already serving a caller. Detaching it prevents
+    # that stale result from repopulating the cache; the next read starts a
+    # replacement probe.
+    _machine_assessment_task = None
 
 
 def _resolve_allow_secret_persist(settings: Settings) -> bool:

@@ -10,7 +10,7 @@ scale — coverage the wire-mocked unit tests cannot provide — and that the
 batch-labeling circuit breaker actually trips.
 
 Phases (single project, Teacher selected via ``--teacher`` — default
-mistral, thinking=OFF):
+Step 3.7 Flash):
 
   A. Setup — create project, save RPS Guidance, ingest 100 RPS images.
   B. Build pool — drive 50 review-cycle saves with ground-truth labels.
@@ -30,6 +30,10 @@ mistral, thinking=OFF):
      Then cancel.
 
 Backend MUST be running at http://127.0.0.1:8000 with NVIDIA_API_KEY set.
+The Profile B artifact checks query ``project.db`` directly using the
+``project_dir`` returned by the API, so the backend must run from local source
+on this host. Compose and remote backends do not expose that database path to
+this process.
 
 Usage::
 
@@ -51,6 +55,13 @@ from typing import Any
 
 import httpx
 
+from vlm_feedback_loop.model_catalog_constants import (
+    MISTRAL_MEDIUM_3_5,
+    NEMOTRON_3_NANO_OMNI_REASONING,
+    NEMOTRON_NANO_12B_VL,
+    STEP_3_7_FLASH,
+)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_helpers import (  # noqa: E402
     StageResult,
@@ -60,31 +71,37 @@ from smoke_helpers import (  # noqa: E402
 
 BACKEND_URL = "http://127.0.0.1:8000"
 RPS_ROOT = Path(os.environ.get("RPS_TEST_SET_ROOT", "~/rps-test-set")).expanduser()
-WORKSPACE_ROOT = Path("/tmp/vlm_workspace")
 
-QWEN_MODEL_NAME = "qwen/qwen3.5-397b-a17b"
 HOSTED_BASE_URL = "https://integrate.api.nvidia.com/v1"
-BAD_MODEL_NAME = "qwen/this-model-does-not-exist-99999"
+BAD_MODEL_NAME = "vlm-feedback-loop/this-model-does-not-exist-99999"
 
 # Teacher catalog — must match seeded ``model_name`` values from
 # ``services/project_service.py::SEEDED_MODEL_CATALOG``. Used by the
 # ``--teacher`` flag to drive the Profile B harness against alternate
 # Teachers when comparing candidates for the default Teacher.
 TEACHER_LOOKUP: dict[str, str] = {
-    "qwen": "qwen/qwen3.5-397b-a17b",
-    "kimi": "moonshotai/kimi-k2.5",
-    "mistral": "mistralai/mistral-large-3-675b-instruct-2512",
-    "nemotron": "nvidia/nemotron-nano-12b-v2-vl",
+    "step": STEP_3_7_FLASH,
+    "mistral_medium": MISTRAL_MEDIUM_3_5,
+    "nemotron": NEMOTRON_NANO_12B_VL,
+    "omni": NEMOTRON_3_NANO_OMNI_REASONING,
 }
+DEFAULT_TEACHER = "step"
 
 RPS_GROUND_TRUTH_FINGERS = {"rock": 0, "paper": 5, "scissors": 2}
 
-# Per-class image count for the 100-image cohort (33 + 33 + 34 = 100).
-PER_CLASS_COUNT = 33
+# Exact class distribution for the 100-image cohort.
+RPS_CLASS_COUNTS: dict[str, int] = {"rock": 33, "paper": 33, "scissors": 34}
+PROFILE_B_COHORT_SIZE = sum(RPS_CLASS_COUNTS.values())
 
 # Phase B target — 50 verifieds at the 0.40 default test-pool fraction
 # (Project.test_pool_fraction) yields pool=20.
 PHASE_B_TARGET_VERIFIEDS = 50
+
+# This RPS-specific qualification harness deliberately builds a 20-member
+# frozen pool (50 Verified at the 0.40 routing fraction).  Record that bounded
+# harness threshold through the normal project API; the product default stays
+# at 60 for ordinary projects.
+PROFILE_B_MIN_TEST_POOL_SIZE = 20
 
 # Phase D good-batch run limit — must be smaller than remaining Unlabeled
 # after Phase B (50 left of 100 ingested).
@@ -94,6 +111,37 @@ PHASE_D_RUN_LIMIT = 20
 # so the run pauses mid-flight. We leave 30 Unlabeled after Phase D.
 PHASE_E_RUN_LIMIT = 25
 
+# Hosted Teachers can legitimately take tens of seconds per image.  A
+# 20-member pool at the hosted concurrency limit can therefore exceed the old
+# five-minute poll window while continuing to make healthy progress.
+EVALUATION_MAX_WAIT_S = 900.0
+
+
+def _truthful_review_label(
+    proposal_json: dict[str, object], ground_truth_class: str
+) -> tuple[dict[str, object], str]:
+    """Return the label and rationale provenance a truthful SME would save.
+
+    ``category`` is the only Core field in this harness.  When it is already
+    correct, an SME Accept must preserve the proposal byte-for-byte; rewriting
+    Aux fields would turn a correct prediction into an artificial Edit and
+    poison the rolling Accept-rate gate.  A wrong Core value is corrected with
+    the deterministic ground-truth label and explicit SME provenance.
+    """
+    if proposal_json.get("category") == ground_truth_class:
+        return dict(proposal_json), "teacher_proposal"
+    return (
+        {
+            "rationale_note": (
+                f"Hand is {ground_truth_class}. "
+                "Verified against the curated RPS test pool."
+            ),
+            "number_fingers_extended": RPS_GROUND_TRUTH_FINGERS[ground_truth_class],
+            "category": ground_truth_class,
+        },
+        "sme_edited",
+    )
+
 
 # ── Result tracking ─────────────────────────────────────────────────────────
 
@@ -101,6 +149,7 @@ PHASE_E_RUN_LIMIT = 25
 @dataclass
 class ValidationReport:
     project_id: str | None = None
+    project_dir: Path | None = None
     stages: list[StageResult] = field(default_factory=list)
 
     def add(
@@ -132,20 +181,27 @@ async def _get_endpoint_for_hosted(
 
 
 def _curated_images() -> list[tuple[str, Path]]:
-    """Return PER_CLASS_COUNT-per-class spread across each class's images.
+    """Return the exact 33/33/34 Profile B cohort, spread within each class.
 
-    Picks every ~Nth file so the cohort is diverse rather than bunched at
-    the start of the directory.
+    Indexing each class proportionally keeps the cohort diverse rather than
+    bunched at the start of the directory.
     """
     cohort: list[tuple[str, Path]] = []
-    for cls in ("rock", "paper", "scissors"):
+    for cls, required in RPS_CLASS_COUNTS.items():
         all_paths = sorted((RPS_ROOT / cls).glob("*.png"))
-        if not all_paths:
-            raise RuntimeError(f"no png files in {RPS_ROOT / cls}")
-        # Even spread.
-        step = max(1, len(all_paths) // PER_CLASS_COUNT)
-        picked = all_paths[::step][:PER_CLASS_COUNT]
+        if len(all_paths) < required:
+            raise RuntimeError(
+                f"need {required} png files in {RPS_ROOT / cls}, found {len(all_paths)}"
+            )
+        picked = [
+            all_paths[index * len(all_paths) // required] for index in range(required)
+        ]
         cohort.extend((cls, p) for p in picked)
+    if len(cohort) != PROFILE_B_COHORT_SIZE:
+        raise RuntimeError(
+            f"Profile B cohort must contain {PROFILE_B_COHORT_SIZE} images, "
+            f"built {len(cohort)}"
+        )
     return cohort
 
 
@@ -153,7 +209,9 @@ def _curated_images() -> list[tuple[str, Path]]:
 
 
 async def _phase_a_setup(
-    client: httpx.AsyncClient, report: ValidationReport, teacher_label: str = "qwen"
+    client: httpx.AsyncClient,
+    report: ValidationReport,
+    teacher_label: str = DEFAULT_TEACHER,
 ) -> tuple[bool, list[tuple[str, Path]]]:
     print(
         f"\n=== Phase A: Setup (project + Guidance + ingest, teacher={teacher_label}) ===",
@@ -172,13 +230,31 @@ async def _phase_a_setup(
     if r.status_code != 201:
         report.add("create_project", False, f"HTTP {r.status_code}: {r.text[:200]}", t0)
         return False, []
-    project_id = r.json()["project_id"]
+    project_payload = r.json()
+    project_id = project_payload["project_id"]
     report.project_id = project_id
-    report.add("create_project", True, f"project_id={project_id}", t0)
+    report.project_dir = Path(project_payload["project_dir"])
+    report.add(
+        "create_project",
+        True,
+        f"project_id={project_id} project_dir={report.project_dir}",
+        t0,
+    )
+
+    # Fail the documented local-source prerequisite before the first paid
+    # Teacher call. A Compose/remote backend returns a path that is valid only
+    # in its own filesystem namespace.
+    t0 = time.monotonic()
+    try:
+        _project_db_path(report.project_dir)
+    except RuntimeError as exc:
+        report.add("project_db_access", False, str(exc), t0)
+        return False, []
+    report.add("project_db_access", True, "API-reported project.db is local", t0)
 
     # Resolve target Teacher's model_config_id and switch (also sets thinking
-    # OFF so each proposal stays under the 180s deadline at hosted scale —
-    # Kimi K2.5 with thinking=ON adds ~90s/call per the README).
+    # OFF so selectable Teachers with a supported toggle stay in the faster,
+    # schema-stable labeling regime used by this acceptance harness.
     t0 = time.monotonic()
     mc_id = await resolve_teacher_model_config_id(
         client, project_id, teacher_model_name, base_url=BACKEND_URL
@@ -196,6 +272,7 @@ async def _phase_a_setup(
         json={
             "teacher_model_config_id": mc_id,
             "thinking_default_on": False,
+            "scaleup_min_test_pool_size": PROFILE_B_MIN_TEST_POOL_SIZE,
         },
         timeout=10.0,
     )
@@ -205,7 +282,11 @@ async def _phase_a_setup(
     report.add(
         "switch_teacher",
         True,
-        f"{teacher_label} mc_id={mc_id} thinking=OFF model={teacher_model_name}",
+        (
+            f"{teacher_label} mc_id={mc_id} thinking=OFF "
+            f"model={teacher_model_name} "
+            f"test_pool_min={PROFILE_B_MIN_TEST_POOL_SIZE}"
+        ),
         t0,
     )
 
@@ -277,7 +358,7 @@ async def _phase_a_setup(
         json={"examples": items},
         timeout=60.0,
     )
-    if r.status_code != 200:
+    if r.status_code != 202:
         report.add("ingest_images", False, f"HTTP {r.status_code}: {r.text[:200]}", t0)
         return False, []
     payload = r.json()
@@ -285,8 +366,12 @@ async def _phase_a_setup(
     created = sum(1 for it in results if it.get("status") == "created")
     exists_ = sum(1 for it in results if it.get("status") == "exists")
     errored = sum(1 for it in results if it.get("status") == "error")
-    accepted = created + exists_
-    ok = accepted == len(items)
+    ok = (
+        len(items) == PROFILE_B_COHORT_SIZE
+        and created == PROFILE_B_COHORT_SIZE
+        and exists_ == 0
+        and errored == 0
+    )
     report.add(
         "ingest_images",
         ok,
@@ -393,21 +478,19 @@ async def _phase_b_label(
                 return False
             continue
 
-        # Submit ground-truth — Edit if model wrong, Accept if right.
-        label = {
-            "rationale_note": (
-                f"Hand is {gt_class}. Verified against the curated RPS test pool."
-            ),
-            "number_fingers_extended": RPS_GROUND_TRUTH_FINGERS[gt_class],
-            "category": gt_class,
-        }
+        # Preserve the exact proposal for a truthful Accept; correct only a
+        # wrong Core value.  Aux-only rewrites would manufacture Edits and
+        # make the readiness gate fail regardless of Teacher quality.
+        label, rationale_source = _truthful_review_label(
+            p.get("proposal_json") or {}, gt_class
+        )
         save = await client.post(
             f"{BACKEND_URL}/v1/projects/{pid}/labels",
             json={
                 "example_key": ex_key,
                 "inference_invocation_id": p["inference_invocation_id"],
                 "label_json": label,
-                "rationale_source": "sme_edited",
+                "rationale_source": rationale_source,
             },
             timeout=15.0,
         )
@@ -441,9 +524,20 @@ async def _phase_b_label(
     return ok
 
 
-def _pool_size_from_db(project_id: str) -> int:
-    """Read pool size directly from the project SQLite DB."""
-    db = WORKSPACE_ROOT / "projects" / project_id / "project.db"
+def _project_db_path(project_dir: Path) -> Path:
+    """Resolve the local DB from the project directory returned by the API."""
+    db = project_dir / "project.db"
+    if not db.is_file():
+        raise RuntimeError(
+            f"project DB is not locally accessible at {db}; Profile B DB audits "
+            "require a local-source backend on this host"
+        )
+    return db
+
+
+def _pool_size_from_db(project_dir: Path) -> int:
+    """Read pool size directly from the local project SQLite DB."""
+    db = _project_db_path(project_dir)
     con = sqlite3.connect(str(db))
     try:
         cur = con.execute(
@@ -455,8 +549,8 @@ def _pool_size_from_db(project_id: str) -> int:
         con.close()
 
 
-def _verified_count_from_db(project_id: str) -> int:
-    db = WORKSPACE_ROOT / "projects" / project_id / "project.db"
+def _verified_count_from_db(project_dir: Path) -> int:
+    db = _project_db_path(project_dir)
     con = sqlite3.connect(str(db))
     try:
         cur = con.execute("SELECT COUNT(*) FROM labels WHERE label_status='verified'")
@@ -497,10 +591,11 @@ async def _phase_c_evaluation(
 ) -> bool:
     print("\n=== Phase C: Evaluation Profile B (real NIM at scale) ===", flush=True)
     assert report.project_id is not None
+    assert report.project_dir is not None
     pid = report.project_id
 
-    pool_size = _pool_size_from_db(pid)
-    verified = _verified_count_from_db(pid)
+    pool_size = _pool_size_from_db(report.project_dir)
+    verified = _verified_count_from_db(report.project_dir)
     print(f"    pool_size={pool_size} verified={verified}", flush=True)
     if pool_size < 5:
         report.add(
@@ -528,9 +623,9 @@ async def _phase_c_evaluation(
         t0,
     )
 
-    # Wait for terminal. With pool=20 and self-hosted eval concurrency 8
-    # (EVAL_CONCURRENCY_SELF_HOSTED) each batch is ~3 examples avg latency
-    # ~3s → ~10s wallclock; allow 5min buffer.
+    # Wait for terminal.  The same harness supports hosted and self-hosted
+    # Teachers; hosted concurrency and provider latency can put a 20-member
+    # pool beyond five minutes even while progress remains healthy.
     t0 = time.monotonic()
     final = await _wait_for_run(
         client,
@@ -538,7 +633,7 @@ async def _phase_c_evaluation(
         run_id,
         "evaluation_runs",
         ("completed", "incomplete", "canceled", "failed"),
-        max_wait_s=300.0,
+        max_wait_s=EVALUATION_MAX_WAIT_S,
     )
     if final is None:
         report.add("eval_terminal", False, "timeout polling", t0)
@@ -561,7 +656,7 @@ async def _phase_c_evaluation(
     #   * OperationRecord rows for this run with non-null latency
     #   * exact_match_pass populated
     #   * structured_generation_attempted recorded
-    db = WORKSPACE_ROOT / "projects" / pid / "project.db"
+    db = _project_db_path(report.project_dir)
     con = sqlite3.connect(str(db))
     try:
         cur = con.execute(
@@ -601,6 +696,7 @@ async def _phase_c_evaluation(
 async def _phase_d_batch(client: httpx.AsyncClient, report: ValidationReport) -> bool:
     print("\n=== Phase D: Batch Labeling Profile B (real NIM at scale) ===", flush=True)
     assert report.project_id is not None
+    assert report.project_dir is not None
     pid = report.project_id
 
     t0 = time.monotonic()
@@ -654,7 +750,7 @@ async def _phase_d_batch(client: httpx.AsyncClient, report: ValidationReport) ->
     #   * OperationRecord rows with batch_label_run_id set and label_tier='auto_labeled'
     #   * non-null latency
     #   * Label rows with label_status='auto_labeled' and matching batch_label_run_id
-    db = WORKSPACE_ROOT / "projects" / pid / "project.db"
+    db = _project_db_path(report.project_dir)
     con = sqlite3.connect(str(db))
     try:
         cur = con.execute(
@@ -860,14 +956,15 @@ async def amain(argv: list[str]) -> int:
     parser.add_argument(
         "--teacher",
         type=str,
-        default="mistral",
+        default=DEFAULT_TEACHER,
         choices=sorted(TEACHER_LOOKUP.keys()),
         help=(
-            "Teacher to validate against. Default: mistral (matches the "
-            "post-migration-014 system default). Other options: "
-            + ", ".join(sorted(t for t in TEACHER_LOOKUP if t != "mistral"))
-            + ". The script always sets thinking=OFF; Kimi with thinking=ON "
-            "adds ~90s/proposal on hosted NIM (per README)."
+            f"Teacher to validate against. Default: {DEFAULT_TEACHER} "
+            "(the shipped Step 3.7 Flash Teacher). Other options: "
+            + ", ".join(sorted(t for t in TEACHER_LOOKUP if t != DEFAULT_TEACHER))
+            + ". The script requests thinking=OFF where the Teacher supports "
+            "a toggle; always-on reasoning models remain on. A local-source "
+            "backend is required for direct project.db audits."
         ),
     )
     args = parser.parse_args(argv)

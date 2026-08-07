@@ -30,6 +30,12 @@ export const TAO_JOB_STATUSES = [
 ] as const;
 export type TAOJobStatus = (typeof TAO_JOB_STATUSES)[number];
 
+export type TAOJobOutputsFetchStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "failed";
+
 export const TERMINAL_TAO_STATUSES: ReadonlySet<TAOJobStatus> = new Set([
   "succeeded",
   "failed",
@@ -43,7 +49,7 @@ export type TAOJobAction = "train" | "evaluate" | "quantize" | "inference";
 
 export type TrainingPreset = "quick" | "standard" | "high_quality" | "max_quality";
 export type QuantizationScheme = "FP8_DYNAMIC" | "W8A8" | "W8A16" | "W4A16";
-export type ExportFieldMode = "all" | "aux_and_core" | "core_only";
+type ExportFieldMode = "all" | "aux_and_core" | "core_only";
 
 // ── Training preflight / authoritative data preview ───────────────────────
 
@@ -55,20 +61,25 @@ export type TrainingPreflightCheckName =
   | "hf_token_configured"
   | "lora_merge_runtime"
   | "student_base_role"
-  | "verified_train_examples";
+  | "training_mode_compatible"
+  | "quantization_compatible"
+  | "verified_train_examples"
+  | "min_test_pool_size";
 
-export interface TrainingPreflightCheck {
+interface TrainingPreflightCheck {
   check_name: TrainingPreflightCheckName;
   passed: boolean;
   message: string;
   model_config_id: string | null;
   provisioning_required: boolean;
   remediation: string | null;
+  restriction?: "baseline_only" | null;
 }
 
-export interface TrainingDataSummary {
+interface TrainingDataSummary {
   verified_training_count: number;
   test_pool_count: number;
+  required_test_pool_count: number;
   auto_labeled_eligible_count: number;
   auto_labeled_included_count: number;
   excluded_test_pool_count: number;
@@ -85,7 +96,7 @@ export interface TrainingPreflightResponse {
 
 // ── TAOJob record ─────────────────────────────────────────────────────────
 
-export interface TAOJobProgress {
+interface TAOJobProgress {
   epoch_current?: number | null;
   epoch_total?: number | null;
   eta_seconds?: number | null;
@@ -93,16 +104,18 @@ export interface TAOJobProgress {
   metrics_history_ref?: string | null;
 }
 
-export interface TAOJobOutputArtifact {
+interface TAOJobOutputArtifact {
   name?: string;
   artifact_ref?: string | null;
   tao_file_path?: string | null;
+  local_path?: string | null;
+  bytes_written?: number | null;
   kind?: string;
   uri?: string;
   checksum?: string | null;
 }
 
-export interface TAOJobOutputs {
+interface TAOJobOutputs {
   artifacts?: TAOJobOutputArtifact[] | null;
   logs_ref?: string | null;
   metrics_ref?: string | null;
@@ -129,6 +142,8 @@ export interface TAOJob {
 
   progress: TAOJobProgress | null;
   outputs: TAOJobOutputs | null;
+  outputs_fetch_status: TAOJobOutputsFetchStatus;
+  outputs_fetch_error_ref: string | null;
 
   parent_tao_job_id: string | null;
   chain_id: string | null;
@@ -154,6 +169,8 @@ export interface TrainingSuiteJob {
   status: TAOJobStatus;
   tao_external_job_id: string | null;
   chain_halted_reason: string | null;
+  outputs_fetch_status: TAOJobOutputsFetchStatus;
+  outputs_fetch_error_ref: string | null;
 }
 
 export interface TrainingSuiteChain {
@@ -172,18 +189,24 @@ export interface TrainingSuite {
   training_preset: TrainingPreset;
   export_field_mode: ExportFieldMode;
   include_auto_labeled: boolean;
+  enable_lora: boolean;
   quantization_schemes: QuantizationScheme[];
 
   training_dataset_export_id: string | null;
   evaluation_dataset_export_id: string | null;
+  training_example_count: number | null;
+  evaluation_example_count: number | null;
+  evaluation_dataset_checksum_sha256: string | null;
   selected_student_base_model_config_ids: string[];
 
   chain_ids_ordered: string[];
   chains: TrainingSuiteChain[];
+  student_model_ids: string[];
 
   provisioning_run_id: string | null;
   provisioning_model_names: string[];
   setup_error_ref: string | null;
+  setup_retryable: boolean;
 
   status: TrainingSuiteStatus;
   created_at: string;
@@ -208,7 +231,7 @@ export interface TrainingSuiteListResponse {
   next_cursor: string | null;
 }
 
-export interface TrainingSuiteCancelFailure {
+interface TrainingSuiteCancelFailure {
   tao_job_id: string;
   error: string;
 }
@@ -225,6 +248,7 @@ export interface TrainingSuiteCreateRequest {
   student_base_model_config_ids: string[];
   training_preset: TrainingPreset;
   include_auto_labeled: boolean;
+  enable_lora: boolean;
   export_field_mode: ExportFieldMode;
   quantization_schemes: QuantizationScheme[];
   idempotency_key: string;
@@ -250,9 +274,9 @@ export interface TrainingPresetResolveResponse {
 
 // ── First-use TAO base provisioning ────────────────────────────────────────
 
-export type TAOBaseProvisioningStatus = "queued" | "running" | "succeeded" | "failed";
+type TAOBaseProvisioningStatus = "queued" | "running" | "succeeded" | "failed";
 
-export interface TAOBaseProvisioningFailure {
+interface TAOBaseProvisioningFailure {
   target: string;
   error: string;
 }
@@ -276,13 +300,14 @@ export interface TAOBaseProvisioningRun {
 // ── Student model ──────────────────────────────────────────────────────────
 // Mirrors backend StudentModelResponse (schemas/student_model.py).
 
-export type CheckpointPackagingStatus = "pending" | "validated" | "failed";
-export type QualityStatus = "pending" | "validated" | "partial" | "failed";
-export type ServingStatus = "pending" | "validated" | "failed" | "not_attempted";
+type CheckpointPackagingStatus = "pending" | "validated" | "failed";
+type QualityStatus = "pending" | "validated" | "partial" | "failed";
+type ServingStatus = "pending" | "validated" | "failed" | "not_attempted";
 
 export interface StudentModel {
   student_model_id: string;
   project_id: string;
+  training_suite_id: string | null;
   student_base_model_config_id: string;
   tao_job_id: string;
   guidance_id: string;
@@ -300,6 +325,10 @@ export interface StudentModel {
   quality_evaluation_run_id: string | null;
   serving_status: ServingStatus;
   serving_evaluation_run_id: string | null;
+  /** Backend-authoritative assessment of the current production AIPerf gate.
+      Historical `serving_status=validated` records may be false here. */
+  serving_benchmark_current?: boolean;
+  serving_benchmark_blocker?: string | null;
 
   // NIM deployment state
   nim_preflight_status: string | null;
@@ -337,6 +366,8 @@ export interface DeployNimRequest {
   nim_release_version?: string | null;
   gpu_assignment?: string | null;
   auth_mode?: "none" | "bearer";
+  /** External endpoints must affirm the canonical cache-disabled benchmark. */
+  benchmark_kv_cache_reuse?: "disabled" | null;
 }
 
 export interface DeployNimResponse {

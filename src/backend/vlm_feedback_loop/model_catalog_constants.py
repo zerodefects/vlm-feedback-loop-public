@@ -4,10 +4,10 @@
 """Canonical model identifiers and deployment constants — single source of truth.
 
 Every model name, NIM container image ref, Hugging Face model-card path,
-embedding-NIM identity value, and GPU-minimum figure that the Blueprint
-seeds or matches against lives here. Services, routers, DB seeding, and
-the CLIs import these constants instead of re-typing the strings, so a
-model rename or image-tag bump is a one-line change.
+TAO base-experiment display name, embedding-NIM identity value, and
+GPU-minimum figure that the Blueprint seeds or matches against lives here.
+Services, routers, DB seeding, and CLIs import these constants instead of
+re-typing wire values.
 
 Rules for this module:
 
@@ -37,15 +37,16 @@ COSMOS_REASON2_8B = "nvidia/cosmos-reason2-8b"
 COSMOS3_NANO_REASONER = "nvidia/cosmos3-nano-reasoner"
 COSMOS3_SUPER_REASONER = "nvidia/cosmos3-super-reasoner"
 
-# ── Hosted Teachers / Guidance authors (build.nvidia.com catalog) ───────────
+# ── Hosted Teacher identities (current seed + historical records) ──────────
 
-MISTRAL_LARGE_3 = "mistralai/mistral-large-3-675b-instruct-2512"
 MISTRAL_MEDIUM_3_5 = "mistralai/mistral-medium-3.5-128b"
-QWEN_3_5 = "qwen/qwen3.5-397b-a17b"
 NEMOTRON_NANO_12B_VL = "nvidia/nemotron-nano-12b-v2-vl"
 NEMOTRON_3_NANO_OMNI_REASONING = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
-KIMI_K2_THINKING = "moonshotai/kimi-k2-thinking"
 STEP_3_7_FLASH = "stepfun-ai/step-3.7-flash"
+# Historical/operator-created records only. MiniMax M3 is intentionally not
+# part of the fresh-project seed because its published terms are
+# non-commercial. The constant remains a wire-value pin for old project DBs
+# and retained experiment tooling.
 MINIMAX_M3 = "minimaxai/minimax-m3"
 
 # ── NIM container images (pinned tags; compose + local_nim deploys) ─────────
@@ -99,19 +100,46 @@ HF_MODEL_PATHS: dict[str, str] = {
     COSMOS3_SUPER_REASONER: COSMOS3_SUPER_REASONER_HF_PATH,
 }
 
+# TAO uses these display names both when registering air-gapped experiments
+# and when finding the resulting records. They are external lookup identities,
+# not UI presentation labels.
+TAO_BASE_EXPERIMENT_DISPLAY_NAMES: dict[str, str] = {
+    COSMOS_REASON2_2B: "Cosmos Reason2 2B",
+    COSMOS_REASON2_8B: "Cosmos Reason2 8B",
+    COSMOS3_NANO_REASONER: "Cosmos 3 Nano (Reasoner)",
+    COSMOS3_SUPER_REASONER: "Cosmos 3 Super (Reasoner)",
+}
+
 # ── Embedding NIM (NeMo Retriever VL 1B v2) ─────────────────────────────────
 #
 # NIM 2.0.0 keeps the model/API contract while replacing the legacy runtime
-# with automatic architecture-aware kernels. NVIDIA documents a 10 GB
-# non-optimized compatibility floor; optimized profiles use approximately
-# 5.6–9.3 GiB depending on architecture/precision. ``db/engine.py`` upgrades
-# deployment DBs that still carry a shipped 1.x image pin.
+# with automatic architecture-aware kernels. Its support matrix validates
+# specific GPU SKUs; the smallest listed devices (L4 and A10G) have 24 GB.
+# Memory alone does not establish compatibility. ``db/engine.py`` upgrades
+# deployment DBs that still carry a shipped 1.x image pin or older floor.
 
 EMBEDDING_MODEL_ID = "nvidia/llama-nemotron-embed-vl-1b-v2"
 EMBEDDING_DIM = 2048
 EMBEDDING_INPUT_TYPE = "passage"
 EMBEDDING_NIM_IMAGE = "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0"
-EMBEDDING_NIM_GPU_MIN_GB = 10
+EMBEDDING_NIM_GPU_MIN_GB = 24
+# Exact display names listed for the pinned VLM embedding model in NVIDIA's
+# NIM 2.0.0 support matrix. Environment recommendations stay conservative on
+# unlisted hardware; an operator may still try the documented fallback path
+# manually because final NIM preflight remains authoritative.
+EMBEDDING_NIM_SUPPORTED_GPU_NAMES = (
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "NVIDIA B200",
+    "NVIDIA GB200",
+    "NVIDIA H200",
+    "NVIDIA A100-SXM4-80GB",
+    "NVIDIA H100 NVL",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA L4",
+    "NVIDIA L40S",
+    "NVIDIA A10G",
+)
 
 __all__ = [
     "COSMOS3_NANO_REASONER",
@@ -134,16 +162,15 @@ __all__ = [
     "EMBEDDING_MODEL_ID",
     "EMBEDDING_NIM_GPU_MIN_GB",
     "EMBEDDING_NIM_IMAGE",
+    "EMBEDDING_NIM_SUPPORTED_GPU_NAMES",
     "HF_MODEL_PATHS",
-    "KIMI_K2_THINKING",
     "MINIMAX_M3",
-    "MISTRAL_LARGE_3",
     "MISTRAL_MEDIUM_3_5",
     "NEMOTRON_3_NANO_OMNI_COMPUTE_CAPABILITY_MIN",
     "NEMOTRON_3_NANO_OMNI_GPU_MIN_GB",
     "NEMOTRON_3_NANO_OMNI_NIM_IMAGE",
     "NEMOTRON_3_NANO_OMNI_REASONING",
     "NEMOTRON_NANO_12B_VL",
-    "QWEN_3_5",
     "STEP_3_7_FLASH",
+    "TAO_BASE_EXPERIMENT_DISPLAY_NAMES",
 ]

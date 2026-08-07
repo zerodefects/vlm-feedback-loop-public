@@ -173,13 +173,30 @@ describe("CreateGuidancePage — Page Structure", () => {
   it("renders page chrome: header, edit-policy banner, section headings", async () => {
     await renderPage();
     expect(screen.getByText("Create Guidance")).toBeInTheDocument();
-    expect(screen.getByText(/Damage Inspection/)).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("create-guidance-page")).getByText(
+        "Project: Damage Inspection",
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByTestId("edit-policy-banner")).toHaveTextContent(
       /Core field changes/,
     );
     expect(screen.getByText("Core Fields")).toBeInTheDocument();
     expect(screen.getByText("Aux Fields")).toBeInTheDocument();
     expect(screen.getByText("Rules & Edge Cases")).toBeInTheDocument();
+  });
+
+  it("names the free-form Guidance controls for assistive technology", async () => {
+    await renderPage();
+    expect(screen.getByRole("combobox", { name: "Guidance starter" })).toBe(
+      screen.getByTestId("template-selector"),
+    );
+    expect(screen.getByRole("textbox", { name: "Task description" })).toBe(
+      screen.getByTestId("description-textarea"),
+    );
+    expect(screen.getByRole("textbox", { name: "Rules and edge cases" })).toBe(
+      screen.getByTestId("rules-textarea"),
+    );
   });
 
   it("shows neutral required-count in status badge when blank template (pre-save)", async () => {
@@ -258,6 +275,24 @@ describe("CreateGuidancePage — Page Structure", () => {
     expect(options).toHaveLength(GUIDANCE_TEMPLATES.length);
   });
 
+  it("does not offer the retired extraction, damage, recycling, or grocery templates", async () => {
+    await renderPage();
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("template-selector"));
+    expect(
+      screen.queryByRole("option", { name: "Attribute extraction" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("option", { name: "Damage severity assessment" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("option", { name: "Recycling classification" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("option", { name: "Coarse grocery classification" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("pre-fills description and shows category field when Classification selected", async () => {
     await renderPage();
     const user = userEvent.setup();
@@ -266,6 +301,40 @@ describe("CreateGuidancePage — Page Structure", () => {
       (screen.getByTestId("description-textarea") as HTMLTextAreaElement).value,
     ).toBe("Classify each image into one category.");
     expect(screen.getByTestId("field-row-category")).toBeInTheDocument();
+  });
+
+  it("Presence and count demonstrates boolean, bounded integer, and consistency rules", async () => {
+    await renderPage();
+    const user = userEvent.setup();
+    await selectKuiOption(user, "template-selector", TEMPLATE_LABELS["presence_count"]);
+    expect(screen.getByTestId("field-row-target_present")).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("field-row-target_count")).getByDisplayValue("0"),
+    ).toBeInTheDocument();
+    expect((screen.getByTestId("rules-textarea") as HTMLTextAreaElement).value).toMatch(
+      /target_count to 0/i,
+    );
+  });
+
+  it("Packaging information audit shows its tested fields and dataset context", async () => {
+    await renderPage();
+    const user = userEvent.setup();
+    await selectKuiOption(
+      user,
+      "template-selector",
+      TEMPLATE_LABELS["packaging_audit"],
+    );
+    expect(screen.getByTestId("field-row-language_on_packaging")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("field-row-contains_nutrition_table"),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("template-dataset-metadata")).toHaveTextContent(
+      /Open Food Facts images.*CC BY-SA \(images\)/,
+    );
+    expect(screen.getByRole("link", { name: /View dataset source/i })).toHaveAttribute(
+      "href",
+      "https://openfoodfacts.github.io/openfoodfacts-server/api/aws-images-dataset/",
+    );
   });
 
   it("opens confirmation modal when template changed after user has edited", async () => {
@@ -278,11 +347,11 @@ describe("CreateGuidancePage — Page Structure", () => {
     await selectKuiOption(
       user,
       "template-selector",
-      TEMPLATE_LABELS["damage_severity"],
+      TEMPLATE_LABELS["industrial_anomaly"],
     );
     expect(
       await screen.findByTestId("confirm-template-replace-body"),
-    ).toHaveTextContent(/Damage severity assessment/);
+    ).toHaveTextContent(/Industrial anomaly inspection/);
     expect(textarea.value).toBe(editedValue);
   });
 
@@ -296,7 +365,7 @@ describe("CreateGuidancePage — Page Structure", () => {
     await selectKuiOption(
       user,
       "template-selector",
-      TEMPLATE_LABELS["damage_severity"],
+      TEMPLATE_LABELS["industrial_anomaly"],
     );
     await user.click(await screen.findByTestId("cancel-template-replace-btn"));
     expect(textarea.value).toBe(editedValue);
@@ -326,11 +395,11 @@ describe("CreateGuidancePage — Page Structure", () => {
       await selectKuiOption(
         user,
         "template-selector",
-        TEMPLATE_LABELS["damage_severity"],
+        TEMPLATE_LABELS["industrial_anomaly"],
       );
       await user.click(await screen.findByTestId("confirm-template-replace-btn"));
-      expect(screen.getByTestId("field-row-primary_damage_type")).toBeInTheDocument();
-      expect(screen.getByTestId("field-row-severity")).toBeInTheDocument();
+      expect(screen.getByTestId("field-row-object_category")).toBeInTheDocument();
+      expect(screen.getByTestId("field-row-has_anomaly")).toBeInTheDocument();
       // hasUserEdited cleared: picking another template now works without a second modal.
       await selectKuiOption(
         user,
@@ -359,25 +428,36 @@ describe("CreateGuidancePage — Page Structure", () => {
       await selectKuiOption(
         user,
         "template-selector",
-        TEMPLATE_LABELS["damage_severity"],
+        TEMPLATE_LABELS["industrial_anomaly"],
       );
       expect(
         screen.queryByTestId("confirm-template-replace-body"),
       ).not.toBeInTheDocument();
-      expect(screen.getByTestId("field-row-primary_damage_type")).toBeInTheDocument();
+      expect(screen.getByTestId("field-row-object_category")).toBeInTheDocument();
     },
   );
 
-  it("Damage severity template shows all fields", async () => {
+  it("Industrial anomaly template shows its evidence-backed Core fields and context", async () => {
     await renderPage();
     const user = userEvent.setup();
     await selectKuiOption(
       user,
       "template-selector",
-      TEMPLATE_LABELS["damage_severity"],
+      TEMPLATE_LABELS["industrial_anomaly"],
     );
-    expect(screen.getByTestId("field-row-primary_damage_type")).toBeInTheDocument();
-    expect(screen.getByTestId("field-row-severity")).toBeInTheDocument();
+    expect(screen.getByTestId("field-row-object_category")).toBeInTheDocument();
+    expect(screen.getByTestId("field-row-has_anomaly")).toBeInTheDocument();
+    expect(screen.queryByTestId("field-row-observed_defect")).not.toBeInTheDocument();
+    expect((screen.getByTestId("rules-textarea") as HTMLTextAreaElement).value).toMatch(
+      /visible surface or structural flaw/i,
+    );
+    expect(screen.getByTestId("template-dataset-metadata")).toHaveTextContent(
+      /Visual Anomaly \(VisA\).*CC BY 4.0/,
+    );
+    expect(screen.getByRole("link", { name: /View dataset source/i })).toHaveAttribute(
+      "href",
+      "https://github.com/amazon-science/spot-diff",
+    );
     expect(screen.queryByTestId("field-row-rationale_note")).not.toBeInTheDocument();
     expect(
       screen.getByRole("switch", { name: "Enable rationale notes" }),
@@ -409,20 +489,48 @@ describe("CreateGuidancePage — Page Structure", () => {
     const user = userEvent.setup();
     await selectKuiOption(user, "template-selector", TEMPLATE_LABELS["classification"]);
     const row = screen.getByTestId("field-row-category");
-    expect(within(row).getByText("category_a")).toBeInTheDocument();
+    expect(within(row).getByText("replace_me_a")).toBeInTheDocument();
   });
 
   it("shows min/max inputs for integer fields", async () => {
     await renderPage();
     const user = userEvent.setup();
-    await selectKuiOption(
-      user,
-      "template-selector",
-      TEMPLATE_LABELS["damage_severity"],
+    await selectKuiOption(user, "template-selector", TEMPLATE_LABELS["classification"]);
+    const row = screen.getByTestId("field-row-category");
+    await user.click(within(row).getByRole("combobox"));
+    await user.click(
+      await screen.findByRole("option", { name: TYPE_LABELS["integer"] }),
     );
-    const row = screen.getByTestId("field-row-severity");
-    expect(within(row).getByDisplayValue("0")).toBeInTheDocument();
-    expect(within(row).getByDisplayValue("4")).toBeInTheDocument();
+    expect(within(row).getByLabelText("Min:")).toBeInTheDocument();
+    expect(within(row).getByLabelText("Max:")).toBeInTheDocument();
+  });
+
+  it("keeps string length constraints collapsed and boolean fields constraint-free", async () => {
+    await renderPage();
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("add-core-field-btn"));
+    const row = screen.getByTestId("field-row-");
+
+    // New fields start as strings. Their uncommon length constraints stay
+    // behind an explicit disclosure instead of adding permanent form noise.
+    expect(within(row).getByText("Advanced constraints")).toBeInTheDocument();
+    expect(within(row).queryByLabelText("minLength:")).not.toBeInTheDocument();
+    expect(within(row).queryByLabelText("maxLength:")).not.toBeInTheDocument();
+    await user.click(within(row).getByText("Advanced constraints"));
+    expect(within(row).getByLabelText("minLength:")).toBeInTheDocument();
+    expect(within(row).getByLabelText("maxLength:")).toBeInTheDocument();
+
+    // Boolean has no meaningful constraint inputs. Changing type must also
+    // remove the string disclosure rather than leaving stale controls behind.
+    await user.click(within(row).getByRole("combobox"));
+    await user.click(
+      await screen.findByRole("option", { name: TYPE_LABELS["boolean"] }),
+    );
+    expect(within(row).queryByText("Advanced constraints")).not.toBeInTheDocument();
+    expect(within(row).queryByLabelText("minLength:")).not.toBeInTheDocument();
+    expect(within(row).queryByLabelText("maxLength:")).not.toBeInTheDocument();
+    expect(within(row).queryByLabelText("Min:")).not.toBeInTheDocument();
+    expect(within(row).queryByLabelText("Max:")).not.toBeInTheDocument();
   });
 
   it("shows 'No core fields defined' for blank template", async () => {
@@ -473,7 +581,7 @@ describe("CreateGuidancePage — Field Builder", () => {
     await selectKuiOption(
       user,
       "template-selector",
-      TEMPLATE_LABELS["damage_severity"],
+      TEMPLATE_LABELS["industrial_anomaly"],
     );
     await user.click(screen.getByTestId("add-core-field-btn"));
     // The new (empty-name) row must land last in the core section — not be
@@ -482,7 +590,7 @@ describe("CreateGuidancePage — Field Builder", () => {
       .getAllByTestId(/^field-row-/)
       .map((el) => el.getAttribute("data-testid"));
     expect(rowIds.indexOf("field-row-")).toBeGreaterThan(
-      rowIds.indexOf("field-row-severity"),
+      rowIds.indexOf("field-row-has_anomaly"),
     );
   });
 
@@ -539,13 +647,13 @@ describe("CreateGuidancePage — Field Builder", () => {
     const user = userEvent.setup();
     await selectKuiOption(user, "template-selector", TEMPLATE_LABELS["classification"]);
     const row = screen.getByTestId("field-row-category");
-    expect(within(row).getByText("category_a")).toBeInTheDocument();
+    expect(within(row).getByText("replace_me_a")).toBeInTheDocument();
     const typeTrigger = within(row).getByRole("combobox");
     await user.click(typeTrigger);
     await user.click(
       await screen.findByRole("option", { name: TYPE_LABELS["integer"] }),
     );
-    expect(within(row).queryByText("category_a")).not.toBeInTheDocument();
+    expect(within(row).queryByText("replace_me_a")).not.toBeInTheDocument();
     expect(within(row).getByText("Min:")).toBeInTheDocument();
   });
 
@@ -570,8 +678,8 @@ describe("CreateGuidancePage — Field Builder", () => {
     const user = userEvent.setup();
     await selectKuiOption(user, "template-selector", TEMPLATE_LABELS["classification"]);
     const row = screen.getByTestId("field-row-category");
-    await user.click(within(row).getByLabelText("Remove value category_a"));
-    expect(within(row).queryByText("category_a")).not.toBeInTheDocument();
+    await user.click(within(row).getByLabelText("Remove value replace_me_a"));
+    expect(within(row).queryByText("replace_me_a")).not.toBeInTheDocument();
   });
 
   it("Move to Aux moves core field to aux section", async () => {
@@ -592,14 +700,14 @@ describe("CreateGuidancePage — Field Builder", () => {
     await selectKuiOption(
       user,
       "template-selector",
-      TEMPLATE_LABELS["damage_severity"],
+      TEMPLATE_LABELS["industrial_anomaly"],
     );
-    const first = screen.getByTestId("field-row-primary_damage_type");
+    const first = screen.getByTestId("field-row-object_category");
     expect(within(first).getByLabelText("Move field up")).toBeDisabled();
-    const second = screen.getByTestId("field-row-damage_types_present");
+    const second = screen.getByTestId("field-row-has_anomaly");
     await user.click(within(second).getByLabelText("Move field up"));
     expect(
-      within(screen.getByTestId("field-row-damage_types_present")).getByLabelText(
+      within(screen.getByTestId("field-row-has_anomaly")).getByLabelText(
         "Move field up",
       ),
     ).toBeDisabled();
@@ -650,7 +758,7 @@ describe("CreateGuidancePage — Validation, Previews, Save", () => {
     await selectKuiOption(user, "template-selector", TEMPLATE_LABELS["classification"]);
     // Remove one of the two values from category enum
     const row = screen.getByTestId("field-row-category");
-    await user.click(within(row).getByLabelText("Remove value category_a"));
+    await user.click(within(row).getByLabelText("Remove value replace_me_a"));
     await waitFor(() => {
       expect(screen.getByTestId("status-badge")).not.toHaveTextContent("Schema: Valid");
     });
@@ -790,18 +898,18 @@ describe("CreateGuidancePage — Validation, Previews, Save", () => {
     expect(preview.textContent).toContain('"type"');
   });
 
-  it("Example output preview shows placeholder values", async () => {
+  it("Example output preview shows the applied template's Core fields", async () => {
     await renderPage();
     const user = userEvent.setup();
     await selectKuiOption(
       user,
       "template-selector",
-      TEMPLATE_LABELS["damage_severity"],
+      TEMPLATE_LABELS["industrial_anomaly"],
     );
     await user.click(screen.getByTestId("example-output-toggle"));
     const preview = screen.getByTestId("example-output-preview");
-    expect(preview.textContent).toContain('"primary_damage_type"');
-    expect(preview.textContent).toContain('"severity"');
+    expect(preview.textContent).toContain('"object_category"');
+    expect(preview.textContent).toContain('"has_anomaly"');
   });
 
   // ── Debounced backend validation ──────────────────────────────────────
@@ -854,7 +962,7 @@ describe("CreateGuidancePage — Validation, Previews, Save", () => {
         "test-pid",
         expect.objectContaining({
           description: "Classify each image into one category.",
-          rules: "",
+          rules: expect.stringMatching(/Replace the starter category values/),
           schema: expect.not.arrayContaining([
             expect.objectContaining({ field_name: "rationale_note" }),
           ]),

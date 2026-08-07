@@ -42,9 +42,14 @@ def _sample_response() -> dict:
         "training_preset": "standard",
         "export_field_mode": "all",
         "include_auto_labeled": True,
+        "enable_lora": True,
         "quantization_schemes": ["FP8_DYNAMIC", "W4A16"],
         "training_dataset_export_id": "de-train",
         "evaluation_dataset_export_id": "de-eval",
+        "training_example_count": 120,
+        "evaluation_example_count": 60,
+        "evaluation_dataset_checksum_sha256": "a" * 64,
+        "student_model_ids": ["student-1"],
         "selected_student_base_model_config_ids": ["mc-8b"],
         "chain_ids_ordered": ["chain-1"],
         "chains": [
@@ -60,6 +65,8 @@ def _sample_response() -> dict:
                         "status": "submitted",
                         "tao_external_job_id": "ext-1",
                         "chain_halted_reason": None,
+                        "outputs_fetch_status": "pending",
+                        "outputs_fetch_error_ref": None,
                     },
                     {
                         "tao_job_id": "t2",
@@ -68,6 +75,8 @@ def _sample_response() -> dict:
                         "status": "not_started",
                         "tao_external_job_id": None,
                         "chain_halted_reason": None,
+                        "outputs_fetch_status": "pending",
+                        "outputs_fetch_error_ref": None,
                     },
                 ],
             }
@@ -107,6 +116,10 @@ class TestPost:
         assert resp.status_code == 201, resp.text
         body = resp.json()
         assert body["training_suite_id"] == TSID
+        assert body["training_example_count"] == 120
+        assert body["evaluation_example_count"] == 60
+        assert body["evaluation_dataset_checksum_sha256"] == "a" * 64
+        assert body["student_model_ids"] == ["student-1"]
         assert len(body["chains"]) == 1
         assert len(body["chains"][0]["jobs"]) == 2
 
@@ -149,6 +162,24 @@ class TestPost:
             )
         assert resp.status_code == 400
         assert "student_base" in resp.text
+
+    def test_dataset_upload_failure_returns_documented_409(self, test_app_client):
+        detail = (
+            "tao_dataset_upload_failed: Training dataset upload failed. "
+            "Re-export incomplete or inconsistent artifacts, retry transient "
+            "transfers, or repair the TAO workspace storage configuration."
+        )
+        with patch(
+            f"{_SVC}.launch_training_suite", new_callable=AsyncMock
+        ) as mock_create:
+            mock_create.return_value = detail
+            resp = test_app_client.post(
+                f"/v1/projects/{PID}/training_suites",
+                json=_create_request_body(),
+            )
+
+        assert resp.status_code == 409
+        assert resp.json() == {"detail": detail}
 
     def test_missing_required_field_returns_422(self, test_app_client):
         req = _create_request_body()

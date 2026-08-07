@@ -42,8 +42,20 @@ from vlm_feedback_loop.db.base import generate_uuid4
 from vlm_feedback_loop.db.models.tao_job import TAOJob
 from vlm_feedback_loop.db.models.training_suite import TrainingSuite
 from vlm_feedback_loop.services import tao_job_service, tao_polling_service
+from vlm_feedback_loop.services.background import background_manager
 
 PID = "proj-poll"
+
+
+async def _await_pending_post_success_tasks() -> None:
+    """Wait for post-success work so assertions observe its steady state."""
+    pending = [
+        task
+        for task_id, task in list(background_manager._tasks.items())
+        if task_id.startswith("post-success-")
+    ]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 # ── Setup helpers ───────────────────────────────────────────────────────────
@@ -220,6 +232,42 @@ class TestListTaoJobFiles:
         assert result["success"] is False
         assert result["keys"] == []
         assert "list_files failed" in result["error"]
+
+
+class TestSelectHfCheckpointKeys:
+    """Artifact selection keeps each TAO action on its own checkpoint tree."""
+
+    def test_quantize_prefers_flat_output_when_parent_train_tree_is_present(self):
+        """A quantize listing must not package the nested parent adapter tree."""
+        keys = [
+            "results/quant-job/config.json",
+            "results/quant-job/model.safetensors",
+            "results/quant-job/tokenizer.json",
+            "results/quant-job/results/train-job/20260803/safetensors/epoch_1/adapter_config.json",
+        ]
+
+        selected, prefix = tao_polling_service._select_hf_checkpoint_keys(
+            keys, prefer_quantize_root=True
+        )
+
+        assert prefix == "results/quant-job/"
+        assert selected == keys[:3]
+
+    def test_train_still_prefers_latest_epoch_over_flat_sibling(self):
+        """Train retrieval retains newest-epoch semantics when both shapes exist."""
+        keys = [
+            "results/job/config.json",
+            "results/job/model.safetensors",
+            "results/job/safetensors/epoch_1/config.json",
+            "results/job/safetensors/epoch_1/model.safetensors",
+            "results/job/safetensors/epoch_2/config.json",
+            "results/job/safetensors/epoch_2/model.safetensors",
+        ]
+
+        selected, prefix = tao_polling_service._select_hf_checkpoint_keys(keys)
+
+        assert prefix == "results/job/safetensors/epoch_2/"
+        assert selected == keys[-2:]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -576,7 +624,7 @@ class TestTerminalSuccess:
         # Post-success flow is dispatched as a background
         # task so the polling tick doesn't head-of-line-block on multi-GB
         # downloads. Tests await it explicitly to assert the steady state.
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
 
         with Session(engine) as s:
             train = s.query(TAOJob).filter_by(tao_job_id=train_id).first()
@@ -987,7 +1035,7 @@ class TestSuiteRollUp:
             engine=engine,
             settings=_make_settings(workspace),
         )
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
 
         with Session(engine) as s:
             suite = s.get(TrainingSuite, "ts-canceled")
@@ -1076,7 +1124,7 @@ class TestSuiteRollUp:
         await tao_polling_service._poll_single_job(
             PID, eval_id, engine=engine, settings=settings
         )
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
 
         with Session(engine) as s:
             suite = s.query(TrainingSuite).filter_by(training_suite_id="ts-1").first()
@@ -1229,7 +1277,7 @@ class TestCrossChainAdvance:
         await tao_polling_service._poll_single_job(
             PID, a_train, engine=engine, settings=settings
         )
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
 
         # Chain B's first job submitted via cross-chain advancement.
         submit_mock.assert_awaited()
@@ -1351,7 +1399,7 @@ class TestOutputsFetchLifecycle:
         await tao_polling_service._poll_single_job(
             PID, train_id, engine=engine, settings=settings
         )
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
 
         with Session(engine) as s:
             row = s.query(TAOJob).filter_by(tao_job_id=train_id).first()
@@ -1390,7 +1438,9 @@ class TestOutputsFetchLifecycle:
         )
 
         async def _boom(*args, **kwargs):
-            raise RuntimeError("simulated S3 outage during artifact GET")
+            raise RuntimeError(
+                "simulated S3 outage during artifact GET with Bearer secret-value"
+            )
 
         monkeypatch.setattr(tao_polling_service, "_handle_succeeded_body", _boom)
         monkeypatch.setattr(tao_polling_service.sse_manager, "emit", AsyncMock())
@@ -1403,7 +1453,7 @@ class TestOutputsFetchLifecycle:
         await tao_polling_service._poll_single_job(
             PID, train_id, engine=engine, settings=settings
         )
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
 
         with Session(engine) as s:
             row = s.query(TAOJob).filter_by(tao_job_id=train_id).first()
@@ -1411,6 +1461,8 @@ class TestOutputsFetchLifecycle:
         assert row.outputs_fetch_status == "failed"
         assert row.outputs_fetch_error_ref is not None
         assert "S3 outage" in row.outputs_fetch_error_ref
+        assert "secret-value" not in row.outputs_fetch_error_ref
+        assert "[REDACTED]" in row.outputs_fetch_error_ref
 
 
 class TestOutputsFetchRecovery:
@@ -1456,7 +1508,7 @@ class TestOutputsFetchRecovery:
 
         settings = _make_settings(workspace)
         await tao_polling_service.tick(settings)
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
 
         # Recovery refired _handle_succeeded for the stuck job; outputs are now
         # populated and the lifecycle marker is completed.
@@ -1500,7 +1552,7 @@ class TestOutputsFetchRecovery:
 
         settings = _make_settings(workspace)
         await tao_polling_service.tick(settings)
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
 
         with Session(engine) as s:
             row = s.query(TAOJob).filter_by(tao_job_id=stuck_id).first()
@@ -1598,7 +1650,7 @@ class TestOutputsFetchRecovery:
 
         settings = _make_settings(workspace)
         await tao_polling_service.tick(settings)
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
 
         # Recovery resumed the train and triggered chain advance for
         # the eval — closing the crash-mid-download gap.
@@ -1691,7 +1743,7 @@ class TestPostSuccessAsyncDispatch:
         # event-loop scheduler), then release it and let the test cleanup.
         await slow_started.wait()
         slow_can_finish.set()
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
 
     @pytest.mark.asyncio
     async def test_dispatch_is_deduped_by_tao_job_id(self, tmp_path, monkeypatch):
@@ -1756,7 +1808,7 @@ class TestPostSuccessAsyncDispatch:
 
         # Release the body and drain the in-flight task before cleanup.
         body_can_finish.set()
-        await tao_polling_service._await_pending_post_success_tasks()
+        await _await_pending_post_success_tasks()
         # After the task drains, dispatch is allowed again (e.g., for a
         # different recovery cycle, though in practice the marker would
         # be ``completed`` and the recovery scan would skip).

@@ -29,6 +29,7 @@ from vlm_feedback_loop.schemas.schema_evolution import (
     GuidanceEditRequest,
 )
 from vlm_feedback_loop.services import (
+    evaluation_service,
     guidance_service,
     schema_evolution_service,
 )
@@ -225,6 +226,11 @@ async def edit_guidance_endpoint(
                 workspace_root=settings.WORKSPACE_ROOT,
                 schema_change_context_example_key=body.schema_change_context_example_key,
             )
+            if result is not None and not isinstance(result, str):
+                await evaluation_service.maybe_start_auto_evaluation(
+                    project_id,
+                    settings,
+                )
         if result is None:
             raise HTTPException(status_code=404, detail="Project not found")
         if isinstance(result, str):

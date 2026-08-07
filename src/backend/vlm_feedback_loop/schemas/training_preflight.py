@@ -6,9 +6,11 @@
 The training preflight confirms TAO reachability, safe job-timeout support,
 workspace readiness, per-student-base experiment readiness, gated-model
 credential availability when first-use provisioning is required,
-``student_base`` role on each selected base model, and that the training-export
-selection is non-empty (``verified_train_examples``). Deliberately distinct
-from the NIM deployment preflight which does Docker / GPU / NGC checks.
+``student_base`` role and training-mode compatibility on each selected base
+model, and that both the training and held-out evaluation datasets meet their
+project-configured requirements.
+Deliberately distinct from the NIM deployment preflight which does Docker /
+GPU / NGC checks.
 """
 
 from __future__ import annotations
@@ -26,6 +28,9 @@ class TrainingPreflightRequest(BaseModel):
     student_base_model_config_ids: list[str] = Field(..., min_length=1)
     include_auto_labeled: bool = True
     enable_lora: bool = True
+    quantization_schemes: list[Literal["FP8_DYNAMIC", "W8A8", "W8A16", "W4A16"]] = (
+        Field(default_factory=lambda: ["FP8_DYNAMIC"])
+    )
 
 
 class TrainingPreflightCheck(BaseModel):
@@ -41,7 +46,10 @@ class TrainingPreflightCheck(BaseModel):
         "hf_token_configured",
         "lora_merge_runtime",
         "student_base_role",
+        "training_mode_compatible",
+        "quantization_compatible",
         "verified_train_examples",
+        "min_test_pool_size",
     ]
     passed: bool
     message: str
@@ -54,6 +62,9 @@ class TrainingPreflightCheck(BaseModel):
     # UI can render it once even when several per-model checks fail with
     # the same fix.
     remediation: str | None = None
+    # Optional backend-owned capability restriction for a configuration that
+    # may still pass in a reduced mode (for example, a baseline-only Student).
+    restriction: Literal["baseline_only"] | None = None
 
 
 class TrainingDataSummary(BaseModel):
@@ -63,6 +74,7 @@ class TrainingDataSummary(BaseModel):
 
     verified_training_count: int = Field(ge=0)
     test_pool_count: int = Field(ge=0)
+    required_test_pool_count: int = Field(ge=1)
     auto_labeled_eligible_count: int = Field(ge=0)
     auto_labeled_included_count: int = Field(ge=0)
     excluded_test_pool_count: int = Field(ge=0)

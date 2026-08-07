@@ -32,6 +32,10 @@ from vlm_feedback_loop.db.deployment_models import TAODeploymentConfig
 from vlm_feedback_loop.db.engine import init_deployment_db
 from vlm_feedback_loop.db.models.tao_job import TAOJob
 from vlm_feedback_loop.db.models.training_suite import TrainingSuite
+from vlm_feedback_loop.model_catalog_constants import (
+    COSMOS_REASON2_2B,
+    COSMOS_REASON2_8B,
+)
 from vlm_feedback_loop.services import (
     tao_client,
     tao_polling_service,
@@ -40,8 +44,8 @@ from vlm_feedback_loop.services import (
 )
 from vlm_feedback_loop.services.project_service import get_project_engine
 
-MODEL_NAME_2B = "nvidia/cosmos-reason2-2b"
-MODEL_NAME_8B = "nvidia/cosmos-reason2-8b"
+MODEL_NAME_2B = COSMOS_REASON2_2B
+MODEL_NAME_8B = COSMOS_REASON2_8B
 DEFAULT_BASE_EXPERIMENT_ID_2B = "cosmos-reason-2-2b"
 
 logger = logging.getLogger("tao_validation")
@@ -125,11 +129,24 @@ async def find_reason2_2b_base_experiment(
 ) -> str:
     """Resolve an already-indexed Cosmos Reason2 2B base experiment."""
     log_banner("Discover Cosmos Reason2 base experiment in workspace")
-    experiment = await tao_workspace_service.find_base_experiment_by_arch(
-        settings,
-        network_arch="cosmos-rl",
-        name_substring="cosmos-reason-2-2b",
-    )
+    # Airgapped loading registers the CSV display name (``Cosmos Reason2
+    # 2B``), while older admin-managed workspaces may expose one of the
+    # model-path slugs.  FTMS performs literal substring matching, so try the
+    # current display spelling first and retain the legacy spellings for
+    # already-provisioned workspaces.
+    experiment = None
+    for name_substring in (
+        "cosmos reason2 2b",
+        "cosmos-reason2-2b",
+        "cosmos-reason-2-2b",
+    ):
+        experiment = await tao_workspace_service.find_base_experiment_by_arch(
+            settings,
+            network_arch="cosmos-rl",
+            name_substring=name_substring,
+        )
+        if experiment is not None:
+            break
     del deadline_s  # FTMS 6.26.3 catalog discovery is a single request.
     if experiment is None:
         print(

@@ -11,6 +11,15 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import BinaryIO
+
+
+def sha256_stream(stream: BinaryIO, *, chunk_size: int = 65536) -> str:
+    """Digest bytes from the stream's current position without closing it."""
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(chunk_size), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 
 def sha256_file(path: Path, *, chunk_size: int = 65536) -> str:
@@ -18,8 +27,5 @@ def sha256_file(path: Path, *, chunk_size: int = 65536) -> str:
 
     Memory-safe for large archives — reads ``chunk_size`` bytes at a time.
     """
-    h = hashlib.sha256()
     with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(chunk_size), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        return sha256_stream(fh, chunk_size=chunk_size)

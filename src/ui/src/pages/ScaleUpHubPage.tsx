@@ -7,8 +7,8 @@
  * Gate-first landing page for the optional Scale-Up path. Shows a
  * plain-language verdict with 1-2 next steps and two primary CTAs:
  * [Run Batch Labeling] (gated) and [Train a Student]. The latter always
- * opens the configuration screen; its Start Training action owns server-side
- * readiness validation.
+ * opens the configuration screen; its readiness styling reflects the
+ * authoritative preflight while Start Training owns final validation.
  */
 
 import { useState } from "react";
@@ -38,7 +38,11 @@ import {
   type ReadinessLine,
   type ReadinessStatus,
 } from "@/lib/scaleup/readinessFormatters";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import {
+  isTrainingConfigurationCheck,
+  isTrainingDataReadinessCheck,
+} from "@/lib/training/preflight";
+import { useSetupContext } from "@/pages/setup-context";
 import { useTeacherAndGuidance } from "@/hooks/useTeacherAndGuidance";
 import type { GateCriterion } from "@/types/evaluation";
 
@@ -136,12 +140,20 @@ export function ScaleUpHubPage() {
   const evalLine = formatEvalLine(criteria);
   const acceptLine = formatAcceptLine(criteria);
   const poolLine = formatPoolLine(criteria, project.counts.verified);
-  const trainingDataCheck = trainingPreflight?.checks.find(
-    (check) => check.check_name === "verified_train_examples",
-  );
+  const trainingDataFailures =
+    trainingPreflight?.checks.filter(
+      (check) => !check.passed && isTrainingDataReadinessCheck(check.check_name),
+    ) ?? [];
   const taoSetupFailures =
     trainingPreflight?.checks.filter(
-      (check) => !check.passed && check.check_name !== "verified_train_examples",
+      (check) =>
+        !check.passed &&
+        !isTrainingDataReadinessCheck(check.check_name) &&
+        !isTrainingConfigurationCheck(check.check_name),
+    ) ?? [];
+  const configurationFailures =
+    trainingPreflight?.checks.filter(
+      (check) => !check.passed && isTrainingConfigurationCheck(check.check_name),
     ) ?? [];
   const taoSetupRequired = taoSetupFailures.length > 0;
   let capabilityTaoLine: ReadinessLine;
@@ -169,11 +181,11 @@ export function ScaleUpHubPage() {
       label: "Student Training: checking",
       detail: "Checking TAO, workspace, Student bases, and usable data…",
     };
-  } else if (trainingDataCheck && !trainingDataCheck.passed) {
+  } else if (trainingDataFailures.length > 0) {
     capabilityTaoLine = {
       status: "fail",
-      label: "Student Training: no training data",
-      detail: trainingDataCheck.message,
+      label: "Student Training: more Verified data needed",
+      detail: trainingDataFailures[0]?.message ?? "Continue labeling.",
     };
   } else if (taoSetupRequired) {
     capabilityTaoLine = {
@@ -181,15 +193,23 @@ export function ScaleUpHubPage() {
       label: "Student Training: infrastructure setup required",
       detail: taoSetupFailures[0]?.message ?? "TAO setup is incomplete.",
     };
+  } else if (configurationFailures.length > 0) {
+    capabilityTaoLine = {
+      status: "pass",
+      label: "Student Training: ready to configure",
+      detail:
+        "TAO and data checks passed. Select a compatible model and training method on Student Training.",
+    };
   } else {
     capabilityTaoLine = {
       status: "pass",
       label: "Student Training: ready",
       detail: `${trainingPreflight.data_summary.usable_training_count} usable training example${
         trainingPreflight.data_summary.usable_training_count === 1 ? "" : "s"
-      }; TAO preflight passed.`,
+      }; ${trainingPreflight.data_summary.test_pool_count} held out for evaluation; TAO preflight passed.`,
     };
   }
+  const studentTrainingReady = capabilityTaoLine.status === "pass";
 
   return (
     <PageContainer data-testid="scaleup-hub-page">
@@ -307,15 +327,19 @@ export function ScaleUpHubPage() {
           <div className="space-y-1">
             <Text className="block" kind="body/regular/sm">
               Teacher:{" "}
-              <span className="break-words" style={{ color: "var(--text-primary)" }}>
+              <Text
+                kind="body/semibold/sm"
+                className="break-words"
+                style={{ color: "var(--text-primary)" }}
+              >
                 {teacherName ?? "—"}
-              </span>
+              </Text>
             </Text>
             <Text className="block" kind="body/regular/sm">
               Guidance:{" "}
-              <span style={{ color: "var(--text-primary)" }}>
+              <Text kind="body/semibold/sm" style={{ color: "var(--text-primary)" }}>
                 {activeGuidance ? `v${activeGuidance.version_number}` : "—"}
-              </span>
+              </Text>
             </Text>
           </div>
           <ReadinessRow line={acceptLine} />
@@ -436,8 +460,8 @@ export function ScaleUpHubPage() {
         {/* Train a Student */}
         <div className="space-y-2 md:flex md:flex-col md:items-end">
           <Button
-            kind="primary"
-            className="nvidia-green-button"
+            kind={studentTrainingReady ? "primary" : "secondary"}
+            className={studentTrainingReady ? "nvidia-green-button" : undefined}
             onClick={() => navigate("../training")}
             data-testid="train-a-student"
           >

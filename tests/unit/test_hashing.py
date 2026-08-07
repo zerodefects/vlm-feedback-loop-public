@@ -10,7 +10,7 @@ import random
 
 import pytest
 
-from vlm_feedback_loop.services.hashing import sha256_file
+from vlm_feedback_loop.services.hashing import sha256_file, sha256_stream
 
 CHUNK = 65536  # the helper's default chunk_size
 
@@ -34,3 +34,13 @@ def test_streamed_digest_matches_whole_file_sha256(tmp_path, size):
     path.write_bytes(data)
 
     assert sha256_file(path) == hashlib.sha256(data).hexdigest()
+
+
+def test_streamed_digest_starts_at_current_position_without_closing(tmp_path):
+    path = tmp_path / "archive.bin"
+    path.write_bytes(b"prefix-payload")
+
+    with path.open("rb") as stream:
+        stream.seek(len(b"prefix-"))
+        assert sha256_stream(stream) == hashlib.sha256(b"payload").hexdigest()
+        assert stream.closed is False

@@ -8,10 +8,10 @@
 
 // ── Literal unions ──────────────────────────────────────────────────────────
 
-export type AuthMode = "bearer" | "none";
+type AuthMode = "bearer" | "none";
 export type ProbeKind = "models" | "embeddings";
 export type RecommendedMode = "hosted" | "local" | "none";
-export type CapabilityStatus = "unknown" | "supported" | "unsupported";
+type CapabilityStatus = "unknown" | "supported" | "unsupported";
 
 // ── Environment assessment (GET /v1/environment) ────────────────────────────
 
@@ -21,7 +21,7 @@ export interface GpuInfo {
   compute_capability?: number | null;
 }
 
-export interface LocalDeployableModel {
+interface LocalDeployableModel {
   model_name: string;
   nim_container_image: string;
   gpu_memory_minimum_gb: number;
@@ -34,7 +34,7 @@ export interface MissingPrerequisite {
   install_hint: string;
 }
 
-export interface EmbeddingDeploymentSummary {
+interface EmbeddingDeploymentSummary {
   model_name: string;
   nim_container_image: string;
   gpu_memory_minimum_gb: number;
@@ -116,9 +116,58 @@ export interface ConnectionTestResponse {
   error?: string | null;
 }
 
+export interface NimEndpointResponse {
+  endpoint_id: string;
+  project_id: string;
+  display_name: string;
+  endpoint_mode: "hosted" | "self_hosted" | "local_system_managed";
+  base_url: string;
+  auth_mode: AuthMode;
+  is_enabled: boolean;
+  last_probe_status: string;
+  source_kind: string;
+  usage_policy: "evaluation_only" | "operator_managed";
+}
+
+export interface NimEndpointListResponse {
+  items: NimEndpointResponse[];
+}
+
+export interface SelfHostedTeacherConfigureRequest {
+  base_url: string;
+  model_config_id: string;
+}
+
+export interface SelfHostedTeacherConfigureResponse {
+  endpoint: NimEndpointResponse;
+  model_config_id: string;
+  model_name: string;
+  structured_generation_support: CapabilityStatus;
+  thinking_toggle_support: CapabilityStatus;
+  visual_budget_support: CapabilityStatus;
+}
+
+export interface SelfHostedEmbeddingConfigureRequest {
+  base_url: string;
+}
+
+export interface EmbeddingDeploymentConfigResponse {
+  embedding_deployment_config_id: string;
+  provider: string;
+  model_name: string;
+  embedding_dim: number;
+  endpoint_url: string | null;
+  nim_container_image: string;
+  preferred_host_port: number;
+  gpu_memory_minimum_gb: number;
+  gpu_assignment: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 // ── Model configs ───────────────────────────────────────────────────────────
 
-export type UnavailableReason =
+type UnavailableReason =
   | "no_nvidia_api_key"
   | "hosted_not_compatible"
   | "endpoint_unhealthy"
@@ -126,7 +175,7 @@ export type UnavailableReason =
   | "endpoint_missing"
   | "unknown_endpoint_mode";
 
-export interface ModelAvailability {
+interface ModelAvailability {
   available: boolean;
   reason: UnavailableReason | null;
 }
@@ -165,7 +214,7 @@ export interface ModelConfigListResponse {
 
 // ── Local NIM deployment ────────────────────────────────────────────────────
 
-export interface PreflightCheck {
+interface PreflightCheck {
   check_name: string;
   passed: boolean;
   diagnostic: string;

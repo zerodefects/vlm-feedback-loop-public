@@ -10,17 +10,56 @@ deployment-level Settings.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from vlm_feedback_loop.config import Settings
 from vlm_feedback_loop.db.base import generate_uuid4, utc_now
+from vlm_feedback_loop.db.models.model_config import ModelConfig
 from vlm_feedback_loop.db.models.nim_endpoint import NimEndpoint
+from vlm_feedback_loop.db.models.project import Project
 from vlm_feedback_loop.services import nim_client
 from vlm_feedback_loop.services.project_service import get_project_engine
 from vlm_feedback_loop.services.runtime_secrets import get_effective_secret
+
+
+@dataclass
+class NimEndpointConfigurationError(Exception):
+    """Safe, structured configuration failure for router translation."""
+
+    status_code: int
+    code: str
+    message: str
+
+
+def normalize_self_hosted_base_url(raw: str) -> str:
+    """Validate and normalize a credential-free HTTP(S) NIM API root."""
+    value = raw.strip().rstrip("/")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise NimEndpointConfigurationError(
+            400,
+            "invalid_base_url",
+            "Base URL must be an absolute http:// or https:// URL including /v1.",
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise NimEndpointConfigurationError(
+            400,
+            "embedded_credentials_forbidden",
+            "Do not include credentials in a self-hosted NIM URL.",
+        )
+    if parsed.query or parsed.fragment:
+        raise NimEndpointConfigurationError(
+            400,
+            "invalid_base_url",
+            "Base URL must not include a query string or fragment.",
+        )
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
 
 # ── Probe helper ────────────────────────────────────────────────────────────
 
@@ -204,3 +243,179 @@ async def update_nim_endpoint(
         session.expunge(endpoint)
 
     return endpoint
+
+
+async def configure_self_hosted_teacher(
+    project_id: str,
+    model_config_id: str,
+    base_url: str,
+    workspace_root: str,
+    settings: Settings,
+) -> tuple[NimEndpoint, ModelConfig]:
+    """Probe, persist, bind, and capability-check a self-hosted Teacher.
+
+    The network probe completes before the transaction. The transaction then
+    idempotently reuses an endpoint with the same URL, binds the exact
+    cataloged vision Teacher, and selects it on the Project. Capability probes
+    run afterward against the newly bound endpoint, so support learned from a
+    previous hosted/local runtime is never carried across silently.
+    """
+    normalized_url = normalize_self_hosted_base_url(base_url)
+    engine = get_project_engine(project_id, workspace_root)
+    if engine is None:
+        raise NimEndpointConfigurationError(
+            404, "project_not_found", "Project not found"
+        )
+
+    # Validate the requested identity and active-use guard without holding a
+    # transaction across the outbound /models probe.
+    from vlm_feedback_loop.services import model_config_service
+
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        model_config = session.get(ModelConfig, model_config_id)
+        if project is None:
+            raise NimEndpointConfigurationError(
+                404, "project_not_found", "Project not found"
+            )
+        if model_config is None or model_config.project_id != project_id:
+            raise NimEndpointConfigurationError(
+                404, "model_config_not_found", "Teacher model configuration not found"
+            )
+        if (
+            "teacher" not in (model_config.eligible_roles or [])
+            or not model_config.supports_image_input
+        ):
+            raise NimEndpointConfigurationError(
+                400,
+                "not_a_vision_teacher",
+                "The selected model is not a vision-capable Teacher.",
+            )
+        if model_config_service.is_model_in_active_use(
+            session, project_id, model_config_id
+        ):
+            raise NimEndpointConfigurationError(
+                409,
+                "model_in_active_use",
+                "Cannot change this Teacher endpoint while it is used by an active run.",
+            )
+        model_name = model_config.model_name
+
+    probe = await nim_client.list_models(
+        base_url=normalized_url,
+        auth_headers={},
+        deadline_s=float(settings.HTTP_DEADLINE_INTERACTIVE_S),
+        max_retries=1,
+    )
+    if not probe.success:
+        raise NimEndpointConfigurationError(
+            400,
+            "endpoint_probe_failed",
+            probe.error or "Could not connect to the self-hosted NIM endpoint.",
+        )
+    served_models = {name for name in (probe.models or []) if name}
+    if model_name not in served_models:
+        raise NimEndpointConfigurationError(
+            400,
+            "model_not_served",
+            f"The endpoint does not report the selected Teacher model {model_name}.",
+        )
+
+    now = utc_now()
+    with Session(engine) as session:
+        project = session.get(Project, project_id)
+        model_config = session.get(ModelConfig, model_config_id)
+        if (
+            project is None
+            or model_config is None
+            or model_config.project_id != project_id
+            or model_config.model_name != model_name
+            or "teacher" not in (model_config.eligible_roles or [])
+            or not model_config.supports_image_input
+        ):
+            raise NimEndpointConfigurationError(
+                409,
+                "configuration_changed",
+                "The project changed while the endpoint was being tested. Try again.",
+            )
+        if model_config_service.is_model_in_active_use(
+            session, project_id, model_config_id
+        ):
+            raise NimEndpointConfigurationError(
+                409,
+                "model_in_active_use",
+                "Cannot change this Teacher endpoint while it is used by an active run.",
+            )
+
+        endpoint = (
+            session.execute(
+                select(NimEndpoint)
+                .where(
+                    NimEndpoint.project_id == project_id,
+                    NimEndpoint.endpoint_mode == "self_hosted",
+                    NimEndpoint.base_url == normalized_url,
+                )
+                .order_by(NimEndpoint.created_at, NimEndpoint.endpoint_id)
+            )
+            .scalars()
+            .first()
+        )
+        if endpoint is None:
+            endpoint = NimEndpoint(
+                endpoint_id=generate_uuid4(),
+                project_id=project_id,
+                display_name=f"Self-hosted Teacher ({normalized_url})",
+                endpoint_mode="self_hosted",
+                base_url=normalized_url,
+                api_format="openai_compatible",
+                auth_mode="none",
+                models_path="/models",
+                health_ready_path="/health/ready",
+                health_live_path="/health/live",
+                metrics_path="/metrics",
+                source_kind="user_configured",
+            )
+            session.add(endpoint)
+        endpoint.display_name = f"Self-hosted Teacher ({normalized_url})"
+        endpoint.api_format = "openai_compatible"
+        endpoint.auth_mode = "none"
+        endpoint.models_path = "/models"
+        endpoint.health_ready_path = "/health/ready"
+        endpoint.health_live_path = "/health/live"
+        endpoint.metrics_path = "/metrics"
+        endpoint.is_enabled = True
+        endpoint.last_probe_at = now
+        endpoint.last_probe_status = "healthy"
+        endpoint.last_probe_error_ref = None
+        endpoint.source_kind = "user_configured"
+        endpoint.local_nim_deployment_id = None
+
+        model_config.endpoint_id = endpoint.endpoint_id
+        model_config.structured_generation_support = "unknown"
+        model_config.thinking_toggle_support = "unknown"
+        model_config.visual_budget_support = "unknown"
+        model_config.image_cap_support = "unknown"
+        project.teacher_model_config_id = model_config_id
+        session.commit()
+        endpoint_id = endpoint.endpoint_id
+
+    probed = await model_config_service.reprobe_model_config(
+        project_id=project_id,
+        model_config_id=model_config_id,
+        workspace_root=workspace_root,
+        settings=settings,
+    )
+    if probed is None or isinstance(probed, str):
+        raise NimEndpointConfigurationError(
+            409,
+            "capability_probe_interrupted",
+            "The endpoint was saved, but its capability probe could not complete. Re-probe it before use.",
+        )
+    endpoint = get_nim_endpoint(project_id, endpoint_id, workspace_root)
+    if endpoint is None:
+        raise NimEndpointConfigurationError(
+            500,
+            "endpoint_missing_after_save",
+            "The endpoint was saved but could not be reloaded.",
+        )
+    return endpoint, probed

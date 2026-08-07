@@ -77,6 +77,7 @@ def _make_subprocess_mock(
     registry_login_ok: bool = True,
     profile_ok: bool = True,
     profile_timeout: bool = False,
+    profile_unavailable: bool = False,
     manifest_ok: bool = True,
     docker_run_ok: bool = True,
     container_id: str = "abc123def456",
@@ -109,6 +110,13 @@ def _make_subprocess_mock(
         # list-model-profiles (check 6) — must be checked before generic
         # --runtime=nvidia handling (toolkit check 2)
         if args[0] == "docker" and "list-model-profiles" in cmd:
+            if profile_unavailable:
+                return (
+                    1,
+                    "",
+                    'exec: "/usr/local/bin/list-model-profiles": stat '
+                    "/usr/local/bin/list-model-profiles: no such file or directory",
+                )
             if profile_timeout:
                 # run_subprocess returns (-1, "", "...timed out...") and kills
                 # only the docker client; the container keeps holding the GPU.
@@ -414,12 +422,8 @@ class TestPreflightChecks:
     async def test_model_profile_timeout_is_inconclusive_not_failure(
         self, mock_settings, monkeypatch
     ):
-        """list-model-profiles on current VLM NIM images does a full engine
-        init and can exceed the probe timeout. A timeout must be treated as
-        INCONCLUSIVE (deploy proceeds; serve health poll is authoritative), and
-        the probe container must be force-removed so it can't orphan and hold
-        the GPU (the bug that caused 'Detected 0 compatible profile(s)' on the
-        next deploy)."""
+        """A stalled standalone profile probe is inconclusive, is cleaned up,
+        and cannot prevent the authoritative serve health check from running."""
         mock = _make_subprocess_mock(profile_timeout=True)
         monkeypatch.setattr(svc, "run_subprocess", mock)
         monkeypatch.setattr(
@@ -454,20 +458,88 @@ class TestPreflightChecks:
         ]
         assert rm_calls, "expected 'docker rm -f vlm-preflight-profile-0' cleanup"
 
-        # Some current VLM images perform a full model download/init even for this
-        # probe. The disposable probe must populate the same persistent cache
-        # as the real deploy and use the same writable host identity.
+        # The probe must bypass shell-form image entrypoints that otherwise
+        # ignore the command and start a full NIM server. It still uses the
+        # persistent cache and the same writable host identity as deployment.
         profile_call = next(
             call
             for call in mock.call_args_list
-            if call.args[:2] == ("docker", "run") and "list-model-profiles" in call.args
+            if call.args[:2] == ("docker", "run")
+            and "/usr/local/bin/list-model-profiles" in call.args
         )
+        entrypoint_index = profile_call.args.index("--entrypoint")
+        assert profile_call.args[entrypoint_index + 1] == (
+            "/usr/local/bin/list-model-profiles"
+        )
+        image_index = profile_call.args.index(
+            "nvcr.io/nim/nvidia/cosmos-reason2-2b:1.7.0"
+        )
+        assert profile_call.args[image_index + 1 :] == ()
         assert "-v" in profile_call.args
         cache_mount = profile_call.args[profile_call.args.index("-v") + 1]
         assert cache_mount.endswith(":/opt/nim/.cache")
         assert profile_call.args[profile_call.args.index("-u") + 1] == str(
             svc.os.getuid()
         )
+
+    @pytest.mark.asyncio
+    async def test_single_model_image_without_profile_probe_reaches_health_gate(
+        self, mock_settings, monkeypatch
+    ):
+        """A single-model NIM without the optional probe is validated by serve."""
+        mock = _make_subprocess_mock(profile_unavailable=True)
+        monkeypatch.setattr(svc, "run_subprocess", mock)
+        monkeypatch.setattr(
+            svc, "check_docker_available", AsyncMock(return_value=(True, None))
+        )
+        monkeypatch.setattr(
+            svc, "check_nvidia_toolkit", AsyncMock(return_value=(True, None))
+        )
+
+        result = await svc.run_preflight_checks(
+            nim_container_image=COSMOS_REASON2_8B_NIM_IMAGE,
+            gpu_memory_minimum_gb=56,
+            gpu_assignment="device=0",
+            role="student",
+            settings=mock_settings,
+        )
+
+        profile_check = next(
+            check for check in result.checks if check.check_name == "model_profile"
+        )
+        assert profile_check.passed is True
+        assert "single-model image" in profile_check.diagnostic
+        assert "serve health" in profile_check.diagnostic
+        assert result.all_passed is True
+
+    @pytest.mark.asyncio
+    async def test_shared_image_without_profile_probe_remains_blocked(
+        self, mock_settings, monkeypatch
+    ):
+        """A shared Nano/Super image cannot skip its size-aware profile probe."""
+        mock = _make_subprocess_mock(profile_unavailable=True)
+        monkeypatch.setattr(svc, "run_subprocess", mock)
+        monkeypatch.setattr(
+            svc, "check_docker_available", AsyncMock(return_value=(True, None))
+        )
+        monkeypatch.setattr(
+            svc, "check_nvidia_toolkit", AsyncMock(return_value=(True, None))
+        )
+
+        result = await svc.run_preflight_checks(
+            nim_container_image=COSMOS3_REASONER_NIM_IMAGE,
+            gpu_memory_minimum_gb=56,
+            gpu_assignment="device=0",
+            role="student",
+            settings=mock_settings,
+            nim_model_size="nano",
+        )
+
+        profile_check = next(
+            check for check in result.checks if check.check_name == "model_profile"
+        )
+        assert profile_check.passed is False
+        assert result.all_passed is False
 
     @pytest.mark.asyncio
     async def test_model_profile_probe_uses_requested_shared_image_identity(
@@ -493,7 +565,7 @@ class TestPreflightChecks:
             for call in self._subprocess_mock.await_args_list
             if call.args
             and call.args[:2] == ("docker", "run")
-            and "list-model-profiles" in call.args
+            and "/usr/local/bin/list-model-profiles" in call.args
         )
         assert "NIM_MODEL_SIZE=super" in profile_call.args
         assert f"NIM_MODEL_PROFILE={profile}" in profile_call.args
@@ -507,6 +579,30 @@ class TestPreflightChecks:
         assert profile_call.kwargs["secret_env"] == {"NGC_API_KEY": "test-ngc-key-123"}
         assert result.docker_run_command is not None
         assert "NIM_MODEL_SIZE=super" in result.docker_run_command
+
+    @pytest.mark.asyncio
+    async def test_student_preflight_command_uses_student_port(self, mock_settings):
+        """A Student recovery command must bind the dedicated Student port."""
+        result = await svc.run_preflight_checks(
+            nim_container_image=COSMOS3_REASONER_NIM_IMAGE,
+            gpu_memory_minimum_gb=56,
+            gpu_assignment="device=0",
+            role="student",
+            settings=mock_settings,
+            nim_model_size="super",
+            nim_served_model_name=COSMOS3_SUPER_REASONER,
+        )
+
+        assert result.all_passed is True
+        assert result.docker_run_command is not None
+        assert (
+            f"-p 127.0.0.1:{mock_settings.NIM_STUDENT_PORT}:8000"
+            in result.docker_run_command
+        )
+        assert (
+            f"-p 127.0.0.1:{mock_settings.LOCAL_NIM_TEACHER_PORT}:8000"
+            not in result.docker_run_command
+        )
 
     @pytest.mark.asyncio
     async def test_image_not_pullable(self, mock_settings, monkeypatch):
@@ -1360,6 +1456,72 @@ class TestDeployLocalNim:
             assert db_dep.status == "starting"
 
     @pytest.mark.asyncio
+    async def test_custom_nano_student_omits_base_profile_from_runtime_and_handoff(
+        self, project_with_db, mock_settings
+    ):
+        """A custom Nano checkpoint keeps its size without selecting base weights."""
+
+        project_id, engine = project_with_db
+        profile = "nano-base-profile"
+        with Session(engine) as session:
+            base = (
+                session.query(ModelConfig)
+                .filter(ModelConfig.model_name == COSMOS3_NANO_REASONER)
+                .one()
+            )
+            base.local_deploy_metadata = {
+                **(base.local_deploy_metadata or {}),
+                "nim_container_image": COSMOS3_REASONER_NIM_IMAGE,
+                "nim_model_size": "nano",
+                "nim_model_profile": profile,
+                "nim_gpu_memory_minimum_gb": 56,
+            }
+            model_config_id = base.model_config_id
+            session.commit()
+
+        result = await svc.deploy_local_nim(
+            project_id=project_id,
+            model_config_id=model_config_id,
+            role="student",
+            nim_container_image=COSMOS3_REASONER_NIM_IMAGE,
+            gpu_assignment="device=0",
+            gpu_memory_minimum_gb=56,
+            preferred_port=8002,
+            settings=mock_settings,
+            workspace_root=mock_settings.WORKSPACE_ROOT,
+            student_model_id="student-nano",
+            checkpoint_mount="/tmp/checkpoints/nano",
+            nim_model_name_path="/opt/checkpoints/student",
+            nim_served_model_name="student-nano",
+        )
+
+        deploy_args = next(
+            call.args
+            for call in self._subprocess_mock.await_args_list
+            if call.args[:3] == ("docker", "run", "-d")
+        )
+        assert "NIM_MODEL_SIZE=nano" in deploy_args
+        assert "NIM_MODEL_NAME=/opt/checkpoints/student" in deploy_args
+        assert f"NIM_MODEL_PROFILE={profile}" not in deploy_args
+
+        preflight_args = next(
+            call.args
+            for call in self._subprocess_mock.await_args_list
+            if call.args[:2] == ("docker", "run")
+            and "/usr/local/bin/list-model-profiles" in call.args
+        )
+        assert "NIM_MODEL_SIZE=nano" in preflight_args
+        assert f"NIM_MODEL_PROFILE={profile}" not in preflight_args
+
+        handoff_args = svc.build_student_docker_run_args(
+            deployment=result["deployment"],
+            settings=mock_settings,
+        )
+        assert "NIM_MODEL_SIZE=nano" in handoff_args
+        assert "NIM_MODEL_NAME=/opt/checkpoints/student" in handoff_args
+        assert f"NIM_MODEL_PROFILE={profile}" not in handoff_args
+
+    @pytest.mark.asyncio
     async def test_preflight_failure_creates_failed_record(
         self, project_with_db, mock_settings, monkeypatch
     ):
@@ -1700,10 +1862,11 @@ class TestHealthPolling:
                 return_value=svc.ServedModelVerification(ok=True, reason="verified")
             ),
         )
+        create_endpoint = AsyncMock(return_value=MagicMock(endpoint_id="test-ep-id"))
         monkeypatch.setattr(
             svc,
             "create_nim_endpoint",
-            AsyncMock(return_value=MagicMock(endpoint_id="test-ep-id")),
+            create_endpoint,
         )
 
         await svc._poll_health(
@@ -1721,6 +1884,7 @@ class TestHealthPolling:
             db_dep = session.get(LocalNimDeployment, dep_id)
             assert db_dep.status == "running"
             assert db_dep.deployed_at is not None
+        create_endpoint.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_timeout_marks_failed(
@@ -1984,6 +2148,7 @@ class TestHealthPolling:
         config = _read_embedding_config(mock_settings.WORKSPACE_ROOT)
         assert config.provider == "self_hosted_nvclip"
         assert config.endpoint_url == "http://localhost:8001/v1"
+        assert config.gpu_assignment == "device=0"
         resweep.assert_awaited_once_with(mock_settings)
 
     @pytest.mark.asyncio
@@ -2602,11 +2767,8 @@ class TestRestartRecovery:
                 )
             ),
         )
-        monkeypatch.setattr(
-            svc,
-            "create_nim_endpoint",
-            AsyncMock(return_value=MagicMock(endpoint_id="test-ep-id")),
-        )
+        create_endpoint = AsyncMock(return_value=MagicMock(endpoint_id="test-ep-id"))
+        monkeypatch.setattr(svc, "create_nim_endpoint", create_endpoint)
         monkeypatch.setattr(
             svc,
             "verify_served_model",
@@ -2620,6 +2782,136 @@ class TestRestartRecovery:
         with Session(engine) as session:
             db_dep = session.get(LocalNimDeployment, dep_id)
             assert db_dep.status == "running"
+        create_endpoint.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_running_healthy_container_repairs_existing_endpoint(
+        self, project_with_db, mock_settings, monkeypatch
+    ):
+        """Repeated restart recovery re-enables the deployment's existing
+        endpoint instead of creating a duplicate record."""
+        project_id, engine = project_with_db
+
+        dep_id = generate_uuid4()
+        endpoint_id = generate_uuid4()
+        with Session(engine) as session:
+            session.add(
+                LocalNimDeployment(
+                    local_nim_deployment_id=dep_id,
+                    project_id=project_id,
+                    model_config_id="test-mc",
+                    role="teacher",
+                    nim_container_image=COSMOS_REASON2_8B_NIM_IMAGE,
+                    container_name="vlm-teacher-test",
+                    host_port=8000,
+                    endpoint_url="http://localhost:8000/v1",
+                    gpu_assignment="device=0",
+                    status="running",
+                    deployed_at=utc_now(),
+                )
+            )
+            session.add(
+                NimEndpoint(
+                    endpoint_id=endpoint_id,
+                    project_id=project_id,
+                    display_name="Recovered local Teacher",
+                    endpoint_mode="local_system_managed",
+                    base_url="http://localhost:8000/v1",
+                    auth_mode="none",
+                    is_enabled=False,
+                    last_probe_status="unreachable",
+                    last_probe_error_ref="backend restart",
+                    source_kind="auto_registered_local",
+                    local_nim_deployment_id=dep_id,
+                )
+            )
+            session.commit()
+
+        from vlm_feedback_loop.services.http_client import HttpResult
+
+        monkeypatch.setattr(
+            svc,
+            "resilient_request",
+            AsyncMock(
+                return_value=HttpResult(
+                    status_code=200, body={}, error_class=None, attempts=1
+                )
+            ),
+        )
+        create_endpoint = AsyncMock()
+        monkeypatch.setattr(svc, "create_nim_endpoint", create_endpoint)
+        monkeypatch.setattr(
+            svc,
+            "verify_served_model",
+            AsyncMock(
+                return_value=svc.ServedModelVerification(ok=True, reason="verified")
+            ),
+        )
+
+        await svc.recover_local_deployments(mock_settings.WORKSPACE_ROOT, mock_settings)
+
+        create_endpoint.assert_not_awaited()
+        with Session(engine) as session:
+            endpoints = list(
+                session.execute(
+                    select(NimEndpoint).where(
+                        NimEndpoint.local_nim_deployment_id == dep_id
+                    )
+                ).scalars()
+            )
+            assert len(endpoints) == 1
+            assert endpoints[0].endpoint_id == endpoint_id
+            assert endpoints[0].is_enabled is True
+            assert endpoints[0].last_probe_status == "healthy"
+            assert endpoints[0].last_probe_error_ref is None
+
+    @pytest.mark.asyncio
+    async def test_running_healthy_embedding_restores_provider(
+        self, project_with_db, mock_settings, monkeypatch
+    ):
+        """Restart recovery restores the embedding provider and pending-work
+        sweep for a healthy surviving embedding NIM."""
+        project_id, engine = project_with_db
+
+        dep_id = generate_uuid4()
+        with Session(engine) as session:
+            session.add(
+                LocalNimDeployment(
+                    local_nim_deployment_id=dep_id,
+                    project_id=project_id,
+                    model_config_id="embedding",
+                    role="embedding",
+                    nim_container_image=EMBEDDING_NIM_IMAGE,
+                    container_name="vlm-embedding-test",
+                    host_port=8002,
+                    endpoint_url="http://localhost:8002/v1",
+                    gpu_assignment="device=0",
+                    status="running",
+                    deployed_at=utc_now(),
+                )
+            )
+            session.commit()
+
+        from vlm_feedback_loop.services.http_client import HttpResult
+
+        monkeypatch.setattr(
+            svc,
+            "resilient_request",
+            AsyncMock(
+                return_value=HttpResult(
+                    status_code=200, body={}, error_class=None, attempts=1
+                )
+            ),
+        )
+        resweep = AsyncMock()
+        monkeypatch.setattr(svc, "resweep_embedding_tasks", resweep)
+
+        await svc.recover_local_deployments(mock_settings.WORKSPACE_ROOT, mock_settings)
+
+        config = _read_embedding_config(mock_settings.WORKSPACE_ROOT)
+        assert config.provider == "self_hosted_nvclip"
+        assert config.endpoint_url == "http://localhost:8002/v1"
+        resweep.assert_awaited_once_with(mock_settings)
 
     @pytest.mark.asyncio
     async def test_starting_unready_container_resumes_health_poll(
@@ -3331,6 +3623,20 @@ class TestHelpers:
         assert "NGC_API_KEY=" not in cmd
         assert "nvapi-" not in cmd
 
+    def test_system_managed_nim_publishes_only_on_loopback(self):
+        """A local NIM must not become an unauthenticated LAN service."""
+        args = svc._build_docker_run_command(
+            nim_container_image=COSMOS_REASON2_8B_NIM_IMAGE,
+            container_name="vlm-teacher-test",
+            gpu_assignment="device=0",
+            host_port=8001,
+            role="teacher",
+        )
+
+        publish_index = args.index("-p")
+        assert args[publish_index + 1] == "127.0.0.1:8001:8000"
+        assert "8001:8000" not in args
+
     def test_docker_run_command_display_teacher_has_uid(self):
         cmd = svc.docker_run_command_display(
             nim_container_image="test:latest",
@@ -3673,6 +3979,25 @@ class TestCosmos3SharedImageDeployEnv:
         assert "NIM_MAX_IMAGES_PER_PROMPT=999" in args
         assert not any("NIM_MODEL_PROFILE" in a for a in args)
 
+    def test_cr3_super_student_keeps_custom_served_name(self):
+        """Shared-image size selection must not replace Student identity."""
+        args = svc._build_docker_run_command(
+            nim_container_image=COSMOS3_REASONER_NIM_IMAGE,
+            container_name="vlm-student-test",
+            gpu_assignment="device=0",
+            host_port=8002,
+            role="student",
+            checkpoint_mount="/tmp/student",
+            nim_model_name_path="/opt/checkpoints/student",
+            nim_served_model_name="student-12345678",
+            nim_model_size="super",
+        )
+        assert "NIM_MODEL_SIZE=super" in args
+        assert "NIM_SERVED_MODEL_NAME=student-12345678" in args
+        assert not any(
+            token == f"NIM_SERVED_MODEL_NAME={COSMOS3_SUPER_REASONER}" for token in args
+        )
+
     def test_cr3_nano_env_pins_profile(self):
         """CR3-Nano: NIM_MODEL_SIZE=nano + the pinned fp8 profile id + served
         name + cap=999. The pinned profile bypasses the fragile auto-selector
@@ -3693,6 +4018,26 @@ class TestCosmos3SharedImageDeployEnv:
         assert f"NIM_MODEL_PROFILE={profile}" in args
         assert "NIM_SERVED_MODEL_NAME=nvidia/cosmos3-nano-reasoner" in args
         assert "NIM_MAX_IMAGES_PER_PROMPT=999" in args
+
+    def test_cr3_nano_custom_student_never_pins_base_profile(self):
+        """The base profile and a custom checkpoint are mutually exclusive."""
+
+        profile = "e2e00f3e555bb4fe0ef011faadd56a37441c7274e149d482cfeb67dbfb75b092"
+        args = svc._build_docker_run_command(
+            nim_container_image=COSMOS3_REASONER_NIM_IMAGE,
+            container_name="vlm-student-test",
+            gpu_assignment="device=0",
+            host_port=8002,
+            role="student",
+            checkpoint_mount="/tmp/student",
+            nim_model_name_path="/opt/checkpoints/student",
+            nim_served_model_name="student-12345678",
+            nim_model_size="nano",
+            nim_model_profile=profile,
+        )
+        assert "NIM_MODEL_SIZE=nano" in args
+        assert "NIM_MODEL_NAME=/opt/checkpoints/student" in args
+        assert f"NIM_MODEL_PROFILE={profile}" not in args
 
     def test_cr2_8b_env_unchanged(self):
         """CR2-8B (single-image teacher): only the image cap is set — no
@@ -4856,6 +5201,94 @@ class TestExtraContainerEnv:
         mcid = self._mcid(engine, "nvidia/cosmos-reason2-2b")
         assert svc._resolve_extra_container_env(engine, mcid) == {}
 
+    def test_resident_identity_uses_the_env_that_docker_actually_receives(
+        self, project_with_db, mock_settings
+    ):
+        """Skipped metadata entries cannot make an identical runtime look stale."""
+        project_id, engine = project_with_db
+        mcid = self._mcid(engine, "nvidia/cosmos-reason2-2b")
+        image = "nvcr.io/nim/nvidia/cosmos-reason2-2b:1.6.0"
+        self._set_metadata(
+            engine,
+            mcid,
+            {
+                "nim_container_image": image,
+                "nim_gpu_memory_minimum_gb": 36,
+                "extra_container_env": {
+                    "NIM_DISABLE_CUDA_GRAPH": "1",
+                    "NIM_MAX_MODEL_LEN": 65536,
+                    "NGC_API_KEY": "reserved",
+                    "lower_case": "invalid",
+                    "BOOL_VALUE": True,
+                },
+            },
+        )
+        with Session(engine) as session:
+            session.add(
+                LocalNimDeployment(
+                    local_nim_deployment_id=generate_uuid4(),
+                    project_id=project_id,
+                    model_config_id=mcid,
+                    role="teacher",
+                    nim_container_image=image,
+                    container_name="vlm-teacher-test",
+                    host_port=8001,
+                    endpoint_url="http://localhost:8001/v1",
+                    gpu_assignment="device=0",
+                    status="running",
+                    deployed_at=utc_now(),
+                )
+            )
+            session.commit()
+
+        [resident] = svc.list_active_nim_residents(mock_settings.WORKSPACE_ROOT)
+        assert resident.extra_container_env == (
+            ("NIM_DISABLE_CUDA_GRAPH", "1"),
+            ("NIM_MAX_MODEL_LEN", "65536"),
+        )
+
+        assert svc.teacher_resident_matches_request(
+            resident,
+            project_id=project_id,
+            model_config_id=mcid,
+            nim_container_image=image,
+            workspace_root=mock_settings.WORKSPACE_ROOT,
+        )
+
+
+class TestContainerStartupLiveness:
+    @pytest.mark.asyncio
+    async def test_dead_container_retains_actionable_root_cause(self, monkeypatch):
+        """Generic shutdown lines must not hide the vLLM startup failure."""
+        calls = 0
+
+        async def fake_subprocess(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return 0, "false 0", ""
+            return (
+                0,
+                "\n".join(
+                    [
+                        "Traceback (most recent call last):",
+                        "ValueError: 64 GiB KV cache is larger than available memory",
+                        "ERROR Application startup failed. Exiting.",
+                        "INFO HTTP Inference server has exited.",
+                        "INFO No background processes to clean up",
+                    ]
+                ),
+                "",
+            )
+
+        monkeypatch.setattr(svc, "run_subprocess", fake_subprocess)
+        state, exit_code, reason = await svc._container_startup_liveness("student")
+
+        assert state == "exited"
+        assert exit_code == 0
+        assert "ValueError: 64 GiB KV cache" in reason
+        assert "Application startup failed" in reason
+
 
 class TestCommitWithLockRetry:
     @pytest.mark.asyncio
@@ -5007,6 +5440,9 @@ class TestTeacherResidentReuse:
         assert reused.model_name == COSMOS3_SUPER_REASONER
 
         with Session(target_engine) as session:
+            target_project = session.get(Project, target.project_id)
+            assert target_project is not None
+            target_project.teacher_model_config_id = target_mc_id
             attached_mc = session.get(ModelConfig, target_mc_id)
             assert attached_mc is not None
             attached_endpoint = session.get(NimEndpoint, attached_mc.endpoint_id)
@@ -5015,6 +5451,7 @@ class TestTeacherResidentReuse:
             assert attached_endpoint.local_nim_deployment_id == deployment_id
             assert attached_endpoint.max_images_per_request == 999
             assert attached_endpoint.is_enabled is True
+            session.commit()
 
         # The normal fresh-project path performs the same exact reuse and
         # returns with that local model already selected.
@@ -5049,6 +5486,98 @@ class TestTeacherResidentReuse:
                     )
                 ).scalars()
                 assert all(endpoint.is_enabled is False for endpoint in endpoints)
+
+        # A later generation of the exact runtime becomes healthy under a new
+        # deployment identity. Former consumers that still select this local
+        # Teacher are repaired automatically; a disabled attachment must not
+        # linger merely because the host port happened to be reused.
+        replacement_id = generate_uuid4()
+        with Session(owner_engine) as session:
+            old_deployment = session.get(LocalNimDeployment, deployment_id)
+            assert old_deployment is not None
+            old_deployment.status = "stopped"
+            old_deployment.stopped_at = utc_now()
+            session.add(
+                LocalNimDeployment(
+                    local_nim_deployment_id=replacement_id,
+                    project_id=owner_id,
+                    model_config_id=owner_mc_id,
+                    role="teacher",
+                    nim_container_image=COSMOS3_REASONER_NIM_IMAGE,
+                    container_name=f"vlm-teacher-{owner_id[:8]}",
+                    container_id="container-2",
+                    host_port=8001,
+                    endpoint_url=endpoint_url,
+                    gpu_assignment="device=0",
+                    status="running",
+                    deployed_at=utc_now(),
+                )
+            )
+            replacement_endpoint = NimEndpoint(
+                endpoint_id=generate_uuid4(),
+                project_id=owner_id,
+                display_name="Replacement owner local Teacher",
+                endpoint_mode="local_system_managed",
+                base_url=endpoint_url,
+                api_format="openai_compatible",
+                auth_mode="none",
+                models_path="/models",
+                health_ready_path="/health/ready",
+                health_live_path="/health/live",
+                metrics_path="/metrics",
+                is_enabled=True,
+                last_probe_status="healthy",
+                source_kind="auto_registered_local",
+                local_nim_deployment_id=replacement_id,
+                max_images_per_request=999,
+                image_cap_support="supported",
+            )
+            session.add(replacement_endpoint)
+            owner_mc = session.get(ModelConfig, owner_mc_id)
+            assert owner_mc is not None
+            owner_mc.endpoint_id = replacement_endpoint.endpoint_id
+            session.commit()
+
+        assert (
+            svc.reattach_selected_teacher_consumers(
+                mock_settings.WORKSPACE_ROOT, replacement_id
+            )
+            == 2
+        )
+        for engine in (target_engine, fresh_engine):
+            with Session(engine) as session:
+                project = session.execute(select(Project)).scalar_one()
+                selected = session.get(ModelConfig, project.teacher_model_config_id)
+                assert selected is not None
+                endpoint = session.get(NimEndpoint, selected.endpoint_id)
+                assert endpoint is not None
+                assert endpoint.local_nim_deployment_id == replacement_id
+                assert endpoint.is_enabled is True
+                assert endpoint.last_probe_status == "healthy"
+
+    def test_disabling_resident_endpoints_skips_archived_projects(
+        self, tmp_path, monkeypatch
+    ):
+        """Stopping host infrastructure must not open archived project DBs.
+
+        Archived projects cannot own live residents and may retain unsupported
+        historical schemas, so endpoint cleanup is limited to active projects.
+        """
+        projects_dir = tmp_path / "projects"
+        active_dir = projects_dir / "active-project"
+        archived_dir = projects_dir / "archived-project"
+        active_dir.mkdir(parents=True)
+        archived_dir.mkdir()
+        (active_dir / "project.db").touch()
+        (archived_dir / "project.db").touch()
+        (archived_dir / ".archived").write_text("2026-08-04T00:00:00Z\n")
+
+        engine_lookup = MagicMock(return_value=None)
+        monkeypatch.setattr(svc, "projects_root", lambda _root: projects_dir)
+        monkeypatch.setattr(svc, "get_project_engine", engine_lookup)
+
+        assert svc.disable_teacher_resident_endpoints(str(tmp_path), "dep-1") == 0
+        engine_lookup.assert_called_once_with("active-project", str(tmp_path))
 
 
 # ── Stale-failure detection (matches_active_role_config) ─────────────────────

@@ -10,8 +10,8 @@ is live-proven against FTMS 6.25.11/6.26.3.
 
 Steps:
 
-1. **Resolve targets** — read ``TAODeploymentConfig`` to confirm
-   ``TAO_WORKSPACE_ID`` is set; enumerate ``student_base`` entries from
+1. **Resolve targets** — read ``TAODeploymentConfig`` to confirm the workspace
+   identity is bootstrapped; enumerate ``student_base`` entries from
    :data:`SEEDED_MODEL_CATALOG` (or the operator-supplied
    ``--model-config-id`` set, resolved against the first project DB).
 2. **Idempotency pre-pass** — ``find_base_experiment_by_arch`` per target;
@@ -35,8 +35,8 @@ Steps:
 
 The FastAPI process **MUST NOT** import ``nvidia_tao_core``, ``transformers``,
 ``peft`` or ``huggingface_hub``. The subprocess driver
-(``scripts/pull_base_experiments.py``) owns those dependencies; this
-service only orchestrates the subprocess + S3 + HTTP. Acceptance test #13
+under ``tao_base_experiment_pull/`` owns those dependencies; this service
+only orchestrates the subprocess + S3 + HTTP. Acceptance test #13
 (import-boundary) verifies this with a clean ``sys.modules`` check.
 
 ``--dry-run`` short-circuits **after** step 3 succeeds: the CSV + the
@@ -66,11 +66,17 @@ from sqlalchemy.orm import Session
 from vlm_feedback_loop.config import Settings
 from vlm_feedback_loop.db.engine import open_project_db
 from vlm_feedback_loop.db.models.model_config import ModelConfig
-from vlm_feedback_loop.model_catalog_constants import HF_MODEL_PATHS
-from vlm_feedback_loop.services.hashing import sha256_file
+from vlm_feedback_loop.model_catalog_constants import (
+    HF_MODEL_PATHS,
+    TAO_BASE_EXPERIMENT_DISPLAY_NAMES,
+)
+from vlm_feedback_loop.services.authorized_file import open_regular_file_beneath
+from vlm_feedback_loop.services.hashing import sha256_stream
 from vlm_feedback_loop.services.http_client import resilient_request
+from vlm_feedback_loop.services.logging_config import redact_exact_secrets
 from vlm_feedback_loop.services.project_service import SEEDED_MODEL_CATALOG
 from vlm_feedback_loop.services.runtime_secrets import get_effective_secret
+from vlm_feedback_loop.services.subprocess_utils import communicate_with_timeout
 from vlm_feedback_loop.services.tao_auth import retry_once_on_401, tao_base_url
 from vlm_feedback_loop.services.tao_bootstrap_service import (
     iter_project_dirs,
@@ -99,14 +105,9 @@ logger = logging.getLogger(
 # ── Module-level constants ───────────────────────────────────────────────────
 
 
-PULL_SCRIPT_PATH: Path = (
-    Path(__file__).resolve().parents[4] / "scripts" / "pull_base_experiments.py"
-)
-PULL_REQUIREMENTS_PATH: Path = (
-    Path(__file__).resolve().parents[4]
-    / "scripts"
-    / "pull_base_experiments_requirements.txt"
-)
+_HELPER_DIR = Path(__file__).resolve().parent.parent / "tao_base_experiment_pull"
+PULL_SCRIPT_PATH: Path = _HELPER_DIR / "pull_base_experiments.py"
+PULL_REQUIREMENTS_PATH: Path = _HELPER_DIR / "requirements.txt"
 DEFAULT_SHARED_REGISTRY_PREFIX = "shared-storage/models"
 DEFAULT_SUBPROCESS_TIMEOUT_S: float = 1800.0
 DEFAULT_INDEX_SETTLE_RETRIES: int = 15
@@ -123,12 +124,6 @@ DEFAULT_INDEX_SETTLE_INTERVAL_S: float = 2.0
 # behaviour. (Admin-managed registration via ``tao bootstrap
 # --admin-managed --base-experiment-id-cosmos3-{nano,super}`` remains
 # available as an alternative.)
-_DISPLAY_NAMES: dict[str, str] = {
-    "nvidia/cosmos-reason2-2b": "Cosmos Reason2 2B",
-    "nvidia/cosmos-reason2-8b": "Cosmos Reason2 8B",
-    "nvidia/cosmos3-nano-reasoner": "Cosmos 3 Nano (Reasoner)",
-    "nvidia/cosmos3-super-reasoner": "Cosmos 3 Super (Reasoner)",
-}
 
 
 # ── Result types ─────────────────────────────────────────────────────────────
@@ -179,8 +174,9 @@ class ProvisioningResult:
 def _resolve_targets_default() -> list[_Target]:
     """Enumerate every ``student_base`` entry the Blueprint knows how to pull.
 
-    Used when the caller passes no ``student_base_model_config_ids`` —
-    the standalone CLI default + the live smoke default. Filters
+    Used when the caller passes no explicit target selector — the standalone
+    CLI default. Validation harnesses select only the base model exercised by
+    their current run. Filters
     ``SEEDED_MODEL_CATALOG`` to entries whose ``model_name`` is in
     ``HF_MODEL_PATHS`` so callers cannot accidentally schedule a
     pull for a catalog row that has no Hugging Face mapping.
@@ -197,7 +193,7 @@ def _resolve_targets_default() -> list[_Target]:
         hf_path = HF_MODEL_PATHS.get(model_name)
         if not hf_path:
             continue
-        display: str = _DISPLAY_NAMES.get(model_name, model_name)
+        display = TAO_BASE_EXPERIMENT_DISPLAY_NAMES.get(model_name, model_name)
         targets.append(
             _Target(
                 model_config_id=model_name,
@@ -283,7 +279,7 @@ def _resolve_targets_from_ids(
                 )
             )
             continue
-        display = _DISPLAY_NAMES.get(model_name, model_name)
+        display = TAO_BASE_EXPERIMENT_DISPLAY_NAMES.get(model_name, model_name)
         targets.append(
             _Target(
                 model_config_id=mcid,
@@ -364,7 +360,7 @@ async def _default_subprocess_runner(
     env: dict[str, str],
     timeout_s: float,
 ) -> dict[str, Any]:
-    """Spawn ``scripts/pull_base_experiments.py``.
+    """Spawn the packaged TAO base-experiment pull helper.
 
     Returns ``{"ok": bool, "stdout": str, "stderr": str, "returncode": int}``.
     Mirrors ``student_model_service._run_merge_lora_subprocess`` so the
@@ -381,6 +377,7 @@ async def _default_subprocess_runner(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            start_new_session=True,
         )
     except (FileNotFoundError, OSError) as exc:
         return {
@@ -393,12 +390,11 @@ async def _default_subprocess_runner(
         }
 
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_s
+        stdout_b, stderr_b = await communicate_with_timeout(
+            proc,
+            timeout_s=timeout_s,
         )
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
         return {
             "ok": False,
             "stdout": "",
@@ -418,15 +414,14 @@ async def _default_subprocess_runner(
 
 def _redact_subprocess_secrets(text: str, env: dict[str, str]) -> str:
     """Redact the private credential values passed to the pull child."""
-    redacted = text
-    values = {
-        env.get("PTM_API_KEY", ""),
-        env.get("HF_TOKEN", ""),
-        env.get("HUGGING_FACE_HUB_TOKEN", ""),
-    }
-    for value in sorted({value for value in values if value}, key=len, reverse=True):
-        redacted = redacted.replace(value, "[REDACTED]")
-    return redacted
+    return redact_exact_secrets(
+        text,
+        (
+            env.get("PTM_API_KEY"),
+            env.get("HF_TOKEN"),
+            env.get("HUGGING_FACE_HUB_TOKEN"),
+        ),
+    )
 
 
 def _build_subprocess_command(
@@ -499,12 +494,12 @@ def _upload_stage_tree_sync(
 ) -> None:
     """Walk ``stage_dir`` recursively and upload every regular file.
 
-    Reuses :func:`already_uploaded`, :func:`do_single_put`,
-    :func:`do_multipart_put` from ``tao_dataset_upload_service`` (plus
-    the shared :func:`hashing.sha256_file`) so this service shares the
-    same metadata key (``"dataset-export-sha256"``) and the same
-    multipart cutover threshold. Idempotent: re-running against an
-    already-staged workspace skips files whose SHA-256 already matches
+    Reuses :func:`already_uploaded`, :func:`do_single_put`, and
+    :func:`do_multipart_put` from ``tao_dataset_upload_service`` so this
+    service shares the same metadata key (``"dataset-export-sha256"``)
+    and multipart cutover threshold. Each file is opened once beneath
+    the disposable stage root; hashing, sizing, and upload stay bound to
+    that descriptor. Re-running skips files whose SHA-256 already matches
     the remote.
     """
     if not stage_dir.is_dir():
@@ -513,30 +508,39 @@ def _upload_stage_tree_sync(
     for file_path in sorted(stage_dir.rglob("*")):
         if not file_path.is_file():
             continue
-        rel = file_path.relative_to(stage_dir).as_posix()
-        key = f"{DEFAULT_SHARED_REGISTRY_PREFIX}/{rel}"
-        sha256 = sha256_file(file_path)
-        if already_uploaded(s3_client, bucket=bucket, key=key, sha256=sha256):
-            logger.info("skip already-uploaded %s (sha256=%s)", key, sha256[:12])
+        relative_path = file_path.relative_to(stage_dir)
+        # HF_HOME lives inside the disposable stage so the helper never
+        # pollutes the operator's global cache. It is downloader scratch space,
+        # not part of TAO's air-gapped registry layout. Uploading it duplicates
+        # large shards under an unusable ``_hf_cache`` key prefix before the
+        # intended ``huggingface/...`` model tree.
+        if relative_path.parts[0] == "_hf_cache":
             continue
-        size = file_path.stat().st_size
-        if size > multipart_threshold_bytes:
-            do_multipart_put(
-                s3_client,
-                bucket=bucket,
-                key=key,
-                archive_path=file_path,
-                sha256=sha256,
-                part_size_bytes=multipart_part_size_bytes,
-            )
-        else:
-            do_single_put(
-                s3_client,
-                bucket=bucket,
-                key=key,
-                archive_path=file_path,
-                sha256=sha256,
-            )
+        rel = relative_path.as_posix()
+        key = f"{DEFAULT_SHARED_REGISTRY_PREFIX}/{rel}"
+        with open_regular_file_beneath(file_path, stage_dir) as opened_file:
+            with opened_file.open_binary() as stream:
+                sha256 = sha256_stream(stream)
+            if already_uploaded(s3_client, bucket=bucket, key=key, sha256=sha256):
+                logger.info("skip already-uploaded %s (sha256=%s)", key, sha256[:12])
+                continue
+            if opened_file.stat_result.st_size > multipart_threshold_bytes:
+                do_multipart_put(
+                    s3_client,
+                    bucket=bucket,
+                    key=key,
+                    opened_file=opened_file,
+                    sha256=sha256,
+                    part_size_bytes=multipart_part_size_bytes,
+                )
+            else:
+                do_single_put(
+                    s3_client,
+                    bucket=bucket,
+                    key=key,
+                    opened_file=opened_file,
+                    sha256=sha256,
+                )
 
 
 # ── POST :load_airgapped ─────────────────────────────────────────────────────
@@ -608,6 +612,7 @@ async def provision_base_experiments(
     settings: Settings,
     student_base_model_config_ids: list[str] | None = None,
     *,
+    target_model_names: list[str] | None = None,
     project_id: str | None = None,
     hf_token: str | None = None,
     subprocess_timeout_s: float = DEFAULT_SUBPROCESS_TIMEOUT_S,
@@ -619,6 +624,11 @@ async def provision_base_experiments(
     _dry_run: bool = False,
 ) -> ProvisioningResult:
     """Self-service Blueprint base-experiment provisioning.
+
+    ``target_model_names`` lets a validation harness provision only the
+    canonical model names it will exercise. It is mutually exclusive with
+    project-local ``student_base_model_config_ids``; omitting both preserves
+    the standalone CLI's enumerate-all behavior.
 
     Idempotent: rerunning against a workspace whose target experiments
     are already registered is a no-op (returns ``already_registered``,
@@ -653,13 +663,22 @@ async def provision_base_experiments(
         result.failed.append(
             (
                 "workspace",
-                "TAO_WORKSPACE_ID is not configured; run "
+                "TAO workspace identity is not bootstrapped in deployment.db; run "
                 "`vlm-feedback-loop tao-bootstrap` first.",
             )
         )
         return result
 
     # 1) Resolve targets
+    if student_base_model_config_ids and target_model_names is not None:
+        result.failed.append(
+            (
+                "targets",
+                "student_base_model_config_ids and target_model_names are "
+                "mutually exclusive",
+            )
+        )
+        return result
     if student_base_model_config_ids:
         targets, resolution_failures = _resolve_targets_from_ids(
             workspace_root,
@@ -669,6 +688,24 @@ async def provision_base_experiments(
         result.failed.extend(resolution_failures)
     else:
         targets = _resolve_targets_default()
+        if target_model_names is not None:
+            requested_names = [name.strip().lower() for name in target_model_names]
+            targets_by_name = {target.model_name: target for target in targets}
+            selected_targets: list[_Target] = []
+            selected_names: set[str] = set()
+            for model_name in requested_names:
+                target = targets_by_name.get(model_name)
+                if target is None:
+                    result.failed.append(
+                        (
+                            model_name or "<empty>",
+                            f"unknown self-service base model {model_name!r}",
+                        )
+                    )
+                elif model_name not in selected_names:
+                    selected_targets.append(target)
+                    selected_names.add(model_name)
+            targets = selected_targets
     if not targets:
         if not result.failed:
             result.failed.append(

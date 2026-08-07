@@ -263,6 +263,38 @@ class TestSubmitTrainingSuite:
         assert "tao_dataset_upload_failed" in str(exc.value)
 
 
+async def test_reason2_discovery_accepts_ftms_airgapped_display_name(monkeypatch):
+    """The live smoke finds the human display name registered by FTMS."""
+    requested_names: list[str] = []
+
+    async def fake_find(settings, *, network_arch, name_substring):
+        del settings
+        assert network_arch == "cosmos-rl"
+        requested_names.append(name_substring)
+        if name_substring == "cosmos reason2 2b":
+            return {
+                "id": "base-2b-live",
+                "name": "Cosmos Reason2 2B",
+                "base_experiment_pull_complete": "pull_complete",
+            }
+        return None
+
+    monkeypatch.setattr(
+        tao_validation.tao_workspace_service,
+        "find_base_experiment_by_arch",
+        fake_find,
+    )
+
+    resolved = await tao_validation.find_reason2_2b_base_experiment(
+        object(),
+        "legacy-fallback",
+        deadline_s=1,
+    )
+
+    assert resolved == "base-2b-live"
+    assert requested_names == ["cosmos reason2 2b"]
+
+
 # ── _amain validation gates (without running the full pipeline) ───────────
 
 
@@ -620,6 +652,28 @@ def test_base_model_names_mapping_is_canonical(rps_e2e):
         "2b": "nvidia/cosmos-reason2-2b",
         "8b": "nvidia/cosmos-reason2-8b",
     }
+
+
+def test_fresh_2b_run_provisions_only_2b(rps_e2e):
+    """A fresh 2B qualification run must not pull unrelated bases."""
+    assert rps_e2e._provisioning_target_model_names("2b", project_id=None) == [
+        "nvidia/cosmos-reason2-2b"
+    ]
+
+
+def test_fresh_8b_run_provisions_the_two_required_reason2_bases(rps_e2e):
+    """Fresh project assembly needs 2B plus the selected 8B base."""
+    assert rps_e2e._provisioning_target_model_names("8b", project_id=None) == [
+        "nvidia/cosmos-reason2-2b",
+        "nvidia/cosmos-reason2-8b",
+    ]
+
+
+def test_existing_8b_project_provisions_only_8b(rps_e2e):
+    """An existing project must not repeat unrelated base discovery."""
+    assert rps_e2e._provisioning_target_model_names(
+        "8b", project_id="existing-project"
+    ) == ["nvidia/cosmos-reason2-8b"]
 
 
 # ── shared training outcome predicate ──────────────────────────────────

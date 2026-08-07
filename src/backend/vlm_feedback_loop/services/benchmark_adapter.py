@@ -1,429 +1,355 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""NIM benchmark adapter.
-
-Isolates the load-driver integration (request construction, concurrency
-control, artifact parsing) behind a Protocol so a future migration from
-``genai-perf`` to AIPerf is a one-file swap without redesigning the
-benchmarking pipeline.
-
-Two implementations ship today:
-
-  - ``GenaiPerfAdapter`` — primary. Subprocess invocation of ``genai-perf
-    profile --service-kind openai --endpoint-type chat ...``. Parses
-    ``profile_export_genai_perf.json``.
-  - ``HttpxAdapter`` — fallback (CI, unit tests, and environments without
-    ``genai-perf``). Concurrent ``httpx.AsyncClient`` runner with the same
-    OpenAI-compatible request shape. Produces the IDENTICAL output schema,
-    so callers only see ``BenchmarkResult`` regardless of which path ran.
-
-``select_adapter()`` try-imports ``genai_perf`` and falls back. The
-``BenchmarkResult.driver`` field captures which path ran, for audit.
-"""
+"""Pinned AIPerf adapter for production-representative Student benchmarks."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
-import statistics
-import time
+import math
+import os
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 
-import httpx
+from vlm_feedback_loop.services.subprocess_utils import communicate_with_timeout
 
-from vlm_feedback_loop.services.nim_client import NIM_DEFAULT_HEADERS
-
-logger = logging.getLogger("vlm_feedback_loop.services.benchmark_adapter")
-
-
-# ── Output artifact schema ────────────────────────────────────────────────────
+AIPERF_VERSION = "0.10.0"
 
 
 @dataclass
 class BenchmarkResult:
-    """Per-concurrency benchmark result.
-
-    Both adapters MUST produce this exact shape. The ``driver`` field
-    records which path ran. ``prometheus`` is left empty by the adapter
-    itself; the lifecycle orchestrator scrapes ``/metrics`` post-run and
-    merges the dict in.
-    """
-
     concurrency: int
-    latency_p50_ms: float
-    latency_p90_ms: float
-    latency_p99_ms: float
-    ttft_p50_ms: float | None
-    ttft_p90_ms: float | None
-    itl_p50_ms: float | None
-    itl_p90_ms: float | None
-    request_count: int
-    error_count: int
-    prometheus: dict[str, float] = field(default_factory=dict[str, float])
+    status: str = "passed"
+    latency_p50_ms: float | None = None
+    latency_p90_ms: float | None = None
+    latency_p99_ms: float | None = None
+    request_throughput_rps: float | None = None
+    benchmark_duration_s: float | None = None
+    attempted_request_count: int = 0
+    successful_request_count: int = 0
+    failed_request_count: int = 0
+    request_count: int = 0
+    error_count: int = 0
+    failure_rate: float | None = None
+    input_tokens_mean: float | None = None
+    output_tokens_mean: float | None = None
+    ttft_p50_ms: float | None = None
+    ttft_p90_ms: float | None = None
+    itl_p50_ms: float | None = None
+    itl_p90_ms: float | None = None
+    prometheus: dict[str, float | None] = field(default_factory=dict[str, float | None])
+    prometheus_available: bool = False
     artifact_dir: str = ""
-    driver: str = ""  # "genai-perf" | "httpx"
-    # True when the driver produced no real measurement (process failure /
-    # missing output). Distinguishes a failed run from a genuine
-    # zero-latency one so the sweep can mark the concurrency skipped instead
-    # of persisting fake zeros the UI would render as valid.
+    driver: str = "aiperf"
+    driver_version: str = AIPERF_VERSION
+    export_schema_version: str | None = None
+    error_summary: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
+    failure_reason: str | None = None
     failed: bool = False
 
-    def to_json(self) -> dict[str, Any]:
-        """Stable dict serialization — the persisted benchmark shape.
+    def __post_init__(self) -> None:
+        # Compatibility for injected test adapters and historic callers while
+        # the persisted v1 shape carries the explicit successful/failed names.
+        if self.successful_request_count == 0 and self.request_count:
+            self.successful_request_count = self.request_count
+        elif self.request_count == 0 and self.successful_request_count:
+            self.request_count = self.successful_request_count
+        if self.failed_request_count == 0 and self.error_count:
+            self.failed_request_count = self.error_count
+        elif self.error_count == 0 and self.failed_request_count:
+            self.error_count = self.failed_request_count
+        if self.attempted_request_count == 0:
+            self.attempted_request_count = self.request_count + self.error_count
+        if self.failure_rate is None and self.attempted_request_count:
+            self.failure_rate = self.error_count / self.attempted_request_count
 
-        Consumed by ``student_nim_lifecycle`` (the per-Student
-        ``benchmarks`` list) and written to each run's ``result.json``
-        artifact; both adapters must emit identical keys.
-        """
+    def to_json(self) -> dict[str, Any]:
         return asdict(self)
 
 
-# ── Adapter Protocol ──────────────────────────────────────────────────────────
-
-
 class BenchmarkAdapter(Protocol):
-    """Async load-driver. Implementations MUST be deterministic-keyed
-    (the same ``project_dir`` + ``concurrency`` writes to a stable artifact
-    path so reruns are idempotent).
-    """
-
     async def run(
         self,
         *,
         base_url: str,
         model: str,
         concurrency: int,
-        project_dir: str,
-        student_model_id: str,
-        request_count: int = 100,
+        input_file: Path,
+        artifact_dir: Path,
+        request_count: int,
+        auth_headers: dict[str, str] | None = None,
         deadline_s: float = 1200.0,
     ) -> BenchmarkResult: ...
 
 
-# ── Default prompt payload ────────────────────────────────────────────────────
+def _metric_value(
+    raw: dict[str, Any], metric: str, statistic: str, expected_unit: str
+) -> float | None:
+    raw_node = raw.get(metric)
+    if not isinstance(raw_node, dict):
+        return None
+    node = cast("dict[str, Any]", raw_node)
+    if node.get("unit") != expected_unit:
+        return None
+    value = node.get(statistic)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
 
 
-def _default_prompt_payload(model: str) -> dict[str, Any]:
-    """Default benchmark payload — text-only OpenAI chat completion.
-
-    Apples-to-apples rule: every variant of the same Student
-    is benchmarked with identical decoding params. We use a deterministic
-    short prompt to keep prefill cost stable across concurrencies.
-    """
-    return {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    'Return the single JSON object {"ok": true} and nothing else.'
-                ),
-            }
-        ],
-        "max_tokens": 32,
-        "temperature": 0.0,
-        "top_p": 1.0,
-    }
+def _duration_seconds(raw: dict[str, Any]) -> float | None:
+    start = raw.get("start_time")
+    end = raw.get("end_time")
+    if not isinstance(start, str) or not isinstance(end, str):
+        return None
+    try:
+        duration = (
+            datetime.fromisoformat(end.replace("Z", "+00:00"))
+            - datetime.fromisoformat(start.replace("Z", "+00:00"))
+        ).total_seconds()
+    except ValueError:
+        return None
+    return duration if duration >= 0 and math.isfinite(duration) else None
 
 
-def _percentiles(samples: list[float]) -> tuple[float, float, float]:
-    """Return (p50, p90, p99) in milliseconds.
-
-    For N < 4 samples the standard ``quantiles`` API rejects, so we fall
-    back to the max value for tail percentiles (degenerate but explicit).
-    """
-    if not samples:
-        return 0.0, 0.0, 0.0
-    sorted_samples = sorted(samples)
-    if len(sorted_samples) < 4:
-        return (
-            sorted_samples[len(sorted_samples) // 2],
-            sorted_samples[-1],
-            sorted_samples[-1],
-        )
-    quantiles = statistics.quantiles(sorted_samples, n=100, method="inclusive")
-    # quantiles returns 99 cut points: q[i] is the (i+1)-th percentile.
-    return quantiles[49], quantiles[89], quantiles[98]
-
-
-# ── HttpxAdapter (fallback) ───────────────────────────────────────────────────
-
-
-class HttpxAdapter:
-    """Concurrent httpx runner.
-
-    Sends ``concurrency`` parallel POSTs of the prompt payload using an
-    ``asyncio.Semaphore`` to bound in-flight calls, then computes
-    percentiles via ``statistics.quantiles``. Streaming is disabled so
-    TTFT/ITL fields are ``None`` — explicitly documented in the
-    BenchmarkResult schema. Writes the full result.json artifact under
-    ``{project_dir}/benchmarks/{student_model_id}/{concurrency}/``.
-    """
-
-    driver_name = "httpx"
-
-    async def run(
-        self,
-        *,
-        base_url: str,
-        model: str,
-        concurrency: int,
-        project_dir: str,
-        student_model_id: str,
-        request_count: int = 100,
-        deadline_s: float = 1200.0,
-    ) -> BenchmarkResult:
-        artifact_dir = (
-            Path(project_dir) / "benchmarks" / student_model_id / str(concurrency)
-        )
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-
-        payload = _default_prompt_payload(model)
-
-        endpoint = f"{base_url.rstrip('/')}/chat/completions"
-        sem = asyncio.Semaphore(concurrency)
-        latencies_ms: list[float] = []
-        errors = 0
-
-        async def _one_request(client: httpx.AsyncClient) -> None:
-            nonlocal errors
-            async with sem:
-                t0 = time.perf_counter()
-                try:
-                    response = await client.post(endpoint, json=payload)
-                    elapsed = (time.perf_counter() - t0) * 1000.0
-                    if 200 <= response.status_code < 400:
-                        latencies_ms.append(elapsed)
-                    else:
-                        errors += 1
-                except Exception as exc:  # bench tolerates any exception
-                    errors += 1
-                    logger.debug("httpx benchmark request failed: %s", exc)
-
-        # Deliberately bypasses nim_client/resilient_request (retries and
-        # pacing would corrupt latency percentiles) but still carries the
-        # Blueprint source header every outbound NIM request must have.
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(deadline_s), headers=NIM_DEFAULT_HEADERS
-        ) as client:
-            tasks = [_one_request(client) for _ in range(request_count)]
-            await asyncio.gather(*tasks, return_exceptions=False)
-
-        p50, p90, p99 = _percentiles(latencies_ms)
-        # Zero successful requests (every request errored / timed out) is a
-        # non-measurement, not a genuine zero-latency result — mark it failed
-        # so the sweep records the concurrency skipped instead of persisting
-        # fake zeros, matching the genai-perf failure path.
-        result = BenchmarkResult(
-            concurrency=concurrency,
-            latency_p50_ms=p50,
-            latency_p90_ms=p90,
-            latency_p99_ms=p99,
-            ttft_p50_ms=None,
-            ttft_p90_ms=None,
-            itl_p50_ms=None,
-            itl_p90_ms=None,
-            request_count=len(latencies_ms),
-            error_count=errors,
-            prometheus={},
-            artifact_dir=str(artifact_dir),
-            driver=self.driver_name,
-            failed=not latencies_ms,
-        )
-
-        # Persist the full result.json so reruns are idempotent and the
-        # benchmark UI / audit trail can read the raw numbers.
-        (artifact_dir / "result.json").write_text(
-            json.dumps(result.to_json(), indent=2, sort_keys=True)
-        )
-        return result
-
-
-# ── GenaiPerfAdapter (primary) ────────────────────────────────────────────────
-
-
-class GenaiPerfAdapter:
-    """Subprocess invocation of ``genai-perf``.
-
-    Command:
-      genai-perf profile \\
-        --service-kind openai \\
-        --endpoint-type chat \\
-        --url {base_url} \\
-        --model {model} \\
-        --concurrency {c} \\
-        --request-count {n} \\
-        --output-format json \\
-        --artifact-dir {artifact_dir}
-
-    Parses ``profile_export_genai_perf.json`` (genai-perf's standard
-    output filename). The parser is forgiving: any missing field defaults
-    to 0 / None so the ``BenchmarkResult`` schema is always populated.
-    """
-
-    driver_name = "genai-perf"
-
-    async def run(
-        self,
-        *,
-        base_url: str,
-        model: str,
-        concurrency: int,
-        project_dir: str,
-        student_model_id: str,
-        request_count: int = 100,
-        deadline_s: float = 1200.0,
-    ) -> BenchmarkResult:
-        artifact_dir = (
-            Path(project_dir) / "benchmarks" / student_model_id / str(concurrency)
-        )
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            "genai-perf",
-            "profile",
-            "--service-kind",
-            "openai",
-            "--endpoint-type",
-            "chat",
-            "--url",
-            base_url.rstrip("/"),
-            "--model",
-            model,
-            "--concurrency",
-            str(concurrency),
-            "--request-count",
-            str(request_count),
-            "--output-format",
-            "json",
-            "--artifact-dir",
-            str(artifact_dir),
-        ]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=deadline_s)
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise
-
-        return _parse_genai_perf_output(
-            artifact_dir=artifact_dir,
-            concurrency=concurrency,
-            return_code=proc.returncode,
-        )
-
-
-def _parse_genai_perf_output(
+def parse_aiperf_output(
+    *,
     artifact_dir: Path,
     concurrency: int,
+    expected_request_count: int,
     return_code: int | None,
 ) -> BenchmarkResult:
-    """Parse genai-perf's ``profile_export_genai_perf.json`` output.
-
-    The exact schema varies between genai-perf releases but consistently
-    exposes a ``request_latency`` block with ``p50``/``p90``/``p99``
-    (milliseconds) and a ``time_to_first_token`` / ``inter_token_latency``
-    block with the same shape. Missing fields → 0.0 / None.
-    """
-    output_path = artifact_dir / "profile_export_genai_perf.json"
-    if return_code != 0 or not output_path.exists():
-        logger.warning(
-            "genai-perf produced no usable output at concurrency=%d "
-            "(return_code=%s, output_exists=%s)",
-            concurrency,
-            return_code,
-            output_path.exists(),
+    """Parse AIPerf's versioned summary without inventing zero metrics."""
+    candidates = sorted(artifact_dir.rglob("profile_export_aiperf.json"))
+    if return_code != 0 or len(candidates) != 1:
+        reason = (
+            f"aiperf_exit_{return_code}"
+            if return_code != 0
+            else f"expected_one_summary_found_{len(candidates)}"
         )
         return BenchmarkResult(
             concurrency=concurrency,
-            latency_p50_ms=0.0,
-            latency_p90_ms=0.0,
-            latency_p99_ms=0.0,
-            ttft_p50_ms=None,
-            ttft_p90_ms=None,
-            itl_p50_ms=None,
-            itl_p90_ms=None,
-            request_count=0,
-            error_count=0,
-            prometheus={},
+            status="failed",
             artifact_dir=str(artifact_dir),
-            driver=GenaiPerfAdapter.driver_name,
+            failure_reason=reason,
             failed=True,
         )
+    try:
+        raw_value = json.loads(candidates[0].read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        return BenchmarkResult(
+            concurrency=concurrency,
+            status="failed",
+            artifact_dir=str(artifact_dir),
+            failure_reason=f"invalid_aiperf_summary:{type(exc).__name__}",
+            failed=True,
+        )
+    if not isinstance(raw_value, dict):
+        return BenchmarkResult(
+            concurrency=concurrency,
+            status="failed",
+            artifact_dir=str(artifact_dir),
+            failure_reason="invalid_aiperf_summary_root",
+            failed=True,
+        )
+    raw = cast("dict[str, Any]", raw_value)
 
-    raw = json.loads(output_path.read_text())
+    successful = int(_metric_value(raw, "request_count", "avg", "requests") or 0)
+    failures = int(_metric_value(raw, "error_request_count", "avg", "requests") or 0)
+    attempted = successful + failures
+    p50 = _metric_value(raw, "request_latency", "p50", "ms")
+    p90 = _metric_value(raw, "request_latency", "p90", "ms")
+    p99 = _metric_value(raw, "request_latency", "p99", "ms")
+    throughput = _metric_value(raw, "request_throughput", "avg", "requests/sec")
+    error_summary_raw = raw.get("error_summary")
+    error_summary: list[dict[str, Any]] = []
+    if isinstance(error_summary_raw, list):
+        for item in cast("list[Any]", error_summary_raw):
+            if isinstance(item, dict):
+                error_summary.append(cast("dict[str, Any]", item))
+    reasons: list[str] = []
+    reported_driver_version = raw.get("aiperf_version")
+    if reported_driver_version != AIPERF_VERSION:
+        reasons.append(
+            f"driver_version_{reported_driver_version}_expected_{AIPERF_VERSION}"
+        )
+    if raw.get("was_cancelled") is True:
+        reasons.append("cancelled")
+    if attempted != expected_request_count:
+        reasons.append(f"request_count_{attempted}_expected_{expected_request_count}")
+    if failures:
+        reasons.append(f"failed_requests_{failures}")
+    if any(value is None for value in (p50, p90, p99, throughput)):
+        reasons.append("missing_or_non_finite_required_metric")
 
-    def _ms(node: dict[str, Any] | None, key: str) -> float | None:
-        if not isinstance(node, dict):
-            return None
-        value = node.get(key)
-        if isinstance(value, (int, float)):
-            return float(value)
-        return None
-
-    latency_raw: Any = raw.get("request_latency") or raw.get("e2e_latency") or {}
-    ttft_raw: Any = raw.get("time_to_first_token") or {}
-    itl_raw: Any = raw.get("inter_token_latency") or {}
-    latency: dict[str, Any] = (
-        cast("dict[str, Any]", latency_raw) if isinstance(latency_raw, dict) else {}
-    )
-    ttft: dict[str, Any] = (
-        cast("dict[str, Any]", ttft_raw) if isinstance(ttft_raw, dict) else {}
-    )
-    itl: dict[str, Any] = (
-        cast("dict[str, Any]", itl_raw) if isinstance(itl_raw, dict) else {}
-    )
-
-    p50 = _ms(latency, "p50") or 0.0
-    p90 = _ms(latency, "p90") or 0.0
-    p99 = _ms(latency, "p99") or 0.0
-
-    request_count = int(raw.get("request_count", 0) or 0)
-    error_count = int(raw.get("error_count", 0) or 0)
-
+    passed = not reasons
     return BenchmarkResult(
         concurrency=concurrency,
+        status="passed" if passed else "failed",
         latency_p50_ms=p50,
         latency_p90_ms=p90,
         latency_p99_ms=p99,
-        ttft_p50_ms=_ms(ttft, "p50"),
-        ttft_p90_ms=_ms(ttft, "p90"),
-        itl_p50_ms=_ms(itl, "p50"),
-        itl_p90_ms=_ms(itl, "p90"),
-        request_count=request_count,
-        error_count=error_count,
-        prometheus={},
+        request_throughput_rps=throughput,
+        benchmark_duration_s=_duration_seconds(raw),
+        attempted_request_count=attempted,
+        successful_request_count=successful,
+        failed_request_count=failures,
+        request_count=successful,
+        error_count=failures,
+        failure_rate=(failures / attempted) if attempted else None,
+        input_tokens_mean=_metric_value(raw, "input_sequence_length", "avg", "tokens"),
+        output_tokens_mean=_metric_value(
+            raw, "output_sequence_length", "avg", "tokens"
+        ),
         artifact_dir=str(artifact_dir),
-        driver=GenaiPerfAdapter.driver_name,
+        driver_version=str(reported_driver_version or AIPERF_VERSION),
+        export_schema_version=(
+            str(raw["schema_version"])
+            if raw.get("schema_version") is not None
+            else None
+        ),
+        error_summary=error_summary,
+        failure_reason=";".join(reasons) if reasons else None,
+        failed=not passed,
     )
 
 
-# ── Adapter selection ─────────────────────────────────────────────────────────
+class AIPerfAdapter:
+    """Run the mandatory pinned NVIDIA AIPerf load driver as a subprocess."""
+
+    driver_name = "aiperf"
+
+    async def run(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        concurrency: int,
+        input_file: Path,
+        artifact_dir: Path,
+        request_count: int,
+        auth_headers: dict[str, str] | None = None,
+        deadline_s: float = 1200.0,
+    ) -> BenchmarkResult:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        authorization = (auth_headers or {}).get("Authorization")
+        endpoint_config: dict[str, Any] = {
+            "urls": [base_url.rstrip("/")],
+            "type": "chat",
+            "timeout": deadline_s,
+            "use_server_token_count": True,
+            "headers": {"source": "vlm-feedback-loop"},
+        }
+        if authorization:
+            scheme, _, credential = authorization.partition(" ")
+            if scheme.lower() != "bearer" or not credential:
+                return BenchmarkResult(
+                    concurrency=concurrency,
+                    status="failed",
+                    artifact_dir=str(artifact_dir),
+                    failure_reason="unsupported_benchmark_auth_header",
+                    failed=True,
+                )
+            env["VLM_BENCHMARK_API_KEY"] = credential
+            endpoint_config["api_key"] = "${VLM_BENCHMARK_API_KEY}"
+
+        # A complete v2 config is required: AIPerf validates config files
+        # before applying any CLI overrides. JSON is valid YAML and prevents
+        # model names, URLs, or paths from becoming YAML syntax. The credential
+        # stays an environment placeholder, never plaintext on disk or argv.
+        config_file = input_file.parent / f"aiperf-c{concurrency}.yaml"
+        config_file.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": "2.0",
+                    "randomSeed": 17,
+                    "benchmark": {
+                        "models": {"items": [{"name": model}]},
+                        "endpoint": endpoint_config,
+                        "datasets": [
+                            {
+                                "name": "main",
+                                "type": "file",
+                                "path": str(input_file),
+                                "format": "raw_payload",
+                                "sampling": "sequential",
+                                "entries": request_count,
+                                "random_seed": 17,
+                            }
+                        ],
+                        "phases": [
+                            {
+                                "name": "profiling",
+                                "type": "concurrency",
+                                "requests": request_count,
+                                "concurrency": concurrency,
+                            }
+                        ],
+                        "artifacts": {
+                            "dir": str(artifact_dir),
+                            "records": False,
+                            "raw": False,
+                            "auto_plot": False,
+                            "plot_required": False,
+                        },
+                        "tokenizer": {"name": "builtin"},
+                        "gpu_telemetry": {"enabled": False},
+                        "server_metrics": {"enabled": False},
+                        "runtime": {"ui": "none"},
+                    },
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        config_file.chmod(0o600)
+        cmd = ["aiperf", "profile", "--config", str(config_file)]
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = await communicate_with_timeout(
+                process,
+                timeout_s=deadline_s,
+            )
+        except TimeoutError:
+            return BenchmarkResult(
+                concurrency=concurrency,
+                status="failed",
+                artifact_dir=str(artifact_dir),
+                failure_reason="aiperf_timeout",
+                failed=True,
+            )
+        (artifact_dir / "driver_stdout.log").write_bytes(stdout[-1_000_000:])
+        (artifact_dir / "driver_stderr.log").write_bytes(stderr[-1_000_000:])
+        return parse_aiperf_output(
+            artifact_dir=artifact_dir,
+            concurrency=concurrency,
+            expected_request_count=request_count,
+            return_code=process.returncode,
+        )
 
 
 def select_adapter() -> BenchmarkAdapter:
-    """Choose the best available benchmark adapter.
+    """Return the required driver; there is intentionally no fallback."""
+    return AIPerfAdapter()
 
-    Returns ``GenaiPerfAdapter`` when ``genai_perf`` is importable; falls
-    back to ``HttpxAdapter`` otherwise. Tests monkeypatch this function or
-    inject ``sys.modules["genai_perf"]`` to exercise both paths.
-    """
-    try:
-        import genai_perf  # noqa: F401  # pyright: ignore[reportUnusedImport, reportMissingImports] — optional dep, capability probe only
-    except ImportError:
-        logger.info(
-            "genai-perf not available; using httpx fallback for NIM benchmarks. "
-            "Install via `pip install vlm-feedback-loop[benchmarking]`."
-        )
-        return HttpxAdapter()
-    return GenaiPerfAdapter()
+
+__all__ = [
+    "AIPERF_VERSION",
+    "AIPerfAdapter",
+    "BenchmarkAdapter",
+    "BenchmarkResult",
+    "parse_aiperf_output",
+    "select_adapter",
+]

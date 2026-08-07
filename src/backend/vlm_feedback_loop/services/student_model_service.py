@@ -65,12 +65,17 @@ from vlm_feedback_loop.db.models.tao_job import TAOJob
 from vlm_feedback_loop.services.inference_contract_resolver import (
     resolve_training_inference_contract,
 )
+from vlm_feedback_loop.services.logging_config import redact_exact_secrets
 from vlm_feedback_loop.services.pagination import (
     after_position,
     decode_cursor,
     encode_cursor,
 )
 from vlm_feedback_loop.services.project_service import get_project_engine
+from vlm_feedback_loop.services.serving_validation_service import (
+    annotate_student_serving_validation,
+)
+from vlm_feedback_loop.services.subprocess_utils import communicate_with_timeout
 from vlm_feedback_loop.services.tao_job_service import (
     find_suite_for_chain,
     find_train_job_for_chain,
@@ -280,8 +285,9 @@ async def check_lora_merge_readiness(settings: Settings) -> tuple[bool, str]:
             probe,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+        stdout, stderr = await communicate_with_timeout(proc, timeout_s=15.0)
     except (OSError, TimeoutError) as exc:
         return False, f"LoRA merge runtime probe failed: {exc}"
     if proc.returncode != 0:
@@ -338,6 +344,7 @@ async def _run_merge_lora_subprocess(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=merge_env,
+            start_new_session=True,
         )
     except (FileNotFoundError, OSError) as exc:
         return {
@@ -348,12 +355,11 @@ async def _run_merge_lora_subprocess(
         }
 
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_s
+        stdout_b, stderr_b = await communicate_with_timeout(
+            proc,
+            timeout_s=timeout_s,
         )
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
         return {
             "ok": False,
             "stdout": "",
@@ -361,14 +367,20 @@ async def _run_merge_lora_subprocess(
             "returncode": -2,
         }
 
-    stderr_text = (stderr_b or b"").decode("utf-8", errors="replace")
+    private_values = (settings.HF_TOKEN,)
+    stdout_text = redact_exact_secrets(
+        (stdout_b or b"").decode("utf-8", errors="replace"), private_values
+    )
+    stderr_text = redact_exact_secrets(
+        (stderr_b or b"").decode("utf-8", errors="replace"), private_values
+    )
     if proc.returncode != 0 and (
         "ModuleNotFoundError" in stderr_text or "ImportError" in stderr_text
     ):
         stderr_text = f"{stderr_text.strip()}\n{_MERGE_PROVISION_HINT}"
     return {
         "ok": proc.returncode == 0,
-        "stdout": (stdout_b or b"").decode("utf-8", errors="replace"),
+        "stdout": stdout_text,
         "stderr": stderr_text,
         "returncode": proc.returncode if proc.returncode is not None else -1,
     }
@@ -582,6 +594,55 @@ def mark_student_quality_failed(
     student.nim_preflight_details = details
 
 
+def _restore_pending_quality_for_local_nim_retry(
+    session: Session,
+    *,
+    student: StudentModel,
+) -> bool:
+    """Repair the legacy state created by a local NIM operational failure.
+
+    Before local Student evaluation became a first-class synthetic TAOJob,
+    the shared terminal-failure handler marked every failed ``evaluate`` row
+    as a quality failure. A local preflight/startup failure therefore changed
+    ``pending`` to ``failed`` even though no prediction had been measured,
+    preventing a clean serving retry from using the documented pending-quality
+    NIM path. Restore only the narrow, provable shape: a baseline Student whose
+    paired failed evaluate row is Blueprint-local and whose audit reason is the
+    legacy evaluate-failure token.
+    """
+    if student.quality_status != "failed" or student.quantize_tao_job_id is not None:
+        return False
+    details = dict(student.nim_preflight_details or {})
+    if details.get("quality_failure_reason") not in {
+        "tao_evaluate_failed",
+        "student_nim_evaluation_failed",
+    }:
+        return False
+    local_evaluate = (
+        session.query(TAOJob)
+        .filter_by(
+            project_id=student.project_id,
+            parent_tao_job_id=student.tao_job_id,
+            action="evaluate",
+            training_backend="student_nim_local",
+            status="failed",
+        )
+        .first()
+    )
+    if local_evaluate is None:
+        return False
+    student.quality_status = "pending"
+    student.quality_evaluation_run_id = None
+    details.pop("quality_failure_reason", None)
+    student.nim_preflight_details = details or None
+    logger.info(
+        "Restored pending quality for Student %s before retrying its "
+        "Blueprint-local NIM evaluation",
+        student.student_model_id,
+    )
+    return True
+
+
 # ── Primary entry point ───────────────────────────────────────────────────
 
 
@@ -662,6 +723,7 @@ async def register_from_tao_terminal(
         )
         suite_snap: dict[str, Any] | None = (
             {
+                "training_suite_id": suite.training_suite_id,
                 "guidance_id": suite.guidance_id,
                 "training_preset": suite.training_preset,
             }
@@ -766,6 +828,11 @@ async def register_from_tao_terminal(
         student = StudentModel(
             student_model_id=generate_uuid4(),
             project_id=project_id,
+            training_suite_id=(
+                cast("str", suite_snap["training_suite_id"])
+                if suite_snap is not None
+                else None
+            ),
             student_base_model_config_id=student_base_id,
             tao_job_id=base_tao_job_id,
             guidance_id=guidance_id,
@@ -823,6 +890,7 @@ def list_student_models(
     workspace_root: str,
     limit: int = 50,
     cursor: str | None = None,
+    expected_benchmark_concurrencies: tuple[int, ...] = (1, 8, 24),
 ) -> tuple[list[StudentModel], str | None]:
     """Paginated list of StudentModel records, newest-first.
 
@@ -883,6 +951,11 @@ def list_student_models(
                     "base_model_name",
                     name_by_id.get(row.student_base_model_config_id),
                 )
+        annotate_student_serving_validation(
+            session,
+            items,
+            expected_concurrencies=expected_benchmark_concurrencies,
+        )
         for row in items:
             session.expunge(row)
 
@@ -932,6 +1005,53 @@ async def repackage_student_model(
         tao_job_id = (
             student.quantize_tao_job_id or student.tao_job_id
         )  # variant-aware: quantized students repackage from their quantize job
+        refresh_quantize_artifacts = student.quantize_tao_job_id is not None
+        tao_external_job_id: str | None = None
+        artifact_cache_dir: Path | None = None
+        if refresh_quantize_artifacts:
+            tao_job = session.get(TAOJob, tao_job_id)
+            if tao_job is None:
+                return {
+                    "error": "tao_job_unresolved",
+                    "student_model_id": student_model_id,
+                }
+            tao_external_job_id = tao_job.tao_external_job_id
+            artifact_cache_dir = _resolve_artifact_dir(tao_job)
+
+    # A failed quantized package may have been caused by selecting a nested
+    # parent-train adapter tree from FTMS's mixed listing. Re-enumerate and
+    # materialize the quantize job's own flat HF root before replaying the
+    # idempotent packaging step. Baseline LoRA failures intentionally skip this
+    # network work because their recovery is the local merge environment.
+    if refresh_quantize_artifacts:
+        if not tao_external_job_id or artifact_cache_dir is None:
+            return {
+                "error": "artifact_refresh_failed",
+                "student_model_id": student_model_id,
+            }
+        from vlm_feedback_loop.services.tao_polling_service import (
+            refresh_quantized_checkpoint_artifacts,
+        )
+
+        refreshed = await refresh_quantized_checkpoint_artifacts(
+            tao_external_job_id,
+            settings=settings,
+            local_cache_dir=artifact_cache_dir,
+        )
+        if not refreshed.get("success") or any(
+            item.get("download_error") for item in refreshed.get("artifacts", [])
+        ):
+            logger.warning(
+                "Quantized Student artifact refresh failed before repackage: "
+                "student=%s job=%s error=%s",
+                student_model_id,
+                tao_job_id,
+                refreshed.get("error"),
+            )
+            return {
+                "error": "artifact_refresh_failed",
+                "student_model_id": student_model_id,
+            }
 
     result_id = await register_from_tao_terminal(
         project_id, tao_job_id, settings=settings
@@ -953,6 +1073,7 @@ def get_student_model(
     project_id: str,
     student_model_id: str,
     workspace_root: str,
+    expected_benchmark_concurrencies: tuple[int, ...] = (1, 8, 24),
 ) -> StudentModel | None:
     """Retrieve a single StudentModel by id, project-scoped.
 
@@ -987,6 +1108,11 @@ def get_student_model(
                 row,
                 "base_model_name",
                 mc[0] if mc else None,
+            )
+            annotate_student_serving_validation(
+                session,
+                [row],
+                expected_concurrencies=expected_benchmark_concurrencies,
             )
             session.expunge(row)
     return row
@@ -1141,6 +1267,7 @@ async def deploy_nim(
     nim_release_version: str | None,
     gpu_assignment: str | None,
     auth_mode: str = "none",
+    benchmark_kv_cache_reuse: str | None = None,
     settings: Settings,
 ) -> dict[str, Any]:
     """Validate the request, write mode to the StudentModel, register the
@@ -1173,6 +1300,8 @@ async def deploy_nim(
         return {"error": "invalid_external_url"}
 
     mode: str = "external" if nim_endpoint_url else "local"
+    if mode == "external" and benchmark_kv_cache_reuse != "disabled":
+        return {"error": "benchmark_cache_policy_unconfirmed"}
 
     # Project-level single-active invariant.
     async with _project_lock(project_id):
@@ -1185,6 +1314,10 @@ async def deploy_nim(
             student = session.get(StudentModel, student_model_id)
             if student is None:  # pragma: no cover — racy delete
                 return {"error": "student_not_found"}
+            _restore_pending_quality_for_local_nim_retry(
+                session,
+                student=student,
+            )
             student.serving_status = "pending"
             student.nim_deployment_mode = mode
             student.nim_endpoint_url = nim_endpoint_url if mode == "external" else None

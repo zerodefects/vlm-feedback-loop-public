@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from vlm_feedback_loop.db.base import generate_uuid4
+from vlm_feedback_loop.model_catalog_constants import COSMOS3_SUPER_REASONER
 
 _SVC = "vlm_feedback_loop.services.training_preflight_service"
 
@@ -106,14 +107,32 @@ def _patch_base_experiment_pass_for(model_config_ids: list[str]):
 
 
 def _patch_train_examples_pass():
-    """Make ``verified_train_examples`` pass (fresh test projects have no
-    verified labels, so tests about OTHER checks patch this one out)."""
-    return patch(
-        f"{_SVC}._check_verified_train_examples",
-        new=lambda *, project_id, workspace_root: {
+    """Make both dataset checks pass for tests focused on other checks."""
+    return patch.multiple(
+        _SVC,
+        _check_verified_train_examples=lambda *, project_id, workspace_root: {
             "check_name": "verified_train_examples",
             "passed": True,
             "message": "1 Verified training example available (Test Pool excluded).",
+            "model_config_id": None,
+        },
+        _check_min_test_pool_size=lambda data_summary: {
+            "check_name": "min_test_pool_size",
+            "passed": True,
+            "message": "Test Pool has 60 held-out evaluation examples (need 60).",
+            "model_config_id": None,
+        },
+    )
+
+
+def _patch_test_pool_pass():
+    """Keep Verified-training selection tests focused on that one rule."""
+    return patch(
+        f"{_SVC}._check_min_test_pool_size",
+        new=lambda data_summary: {
+            "check_name": "min_test_pool_size",
+            "passed": True,
+            "message": "Test Pool has 60 held-out evaluation examples (need 60).",
             "model_config_id": None,
         },
     )
@@ -233,23 +252,42 @@ def _insert_auto_labeled_example(client, project_id: str, guidance_id: str) -> N
 
 
 def _student_base_model_id(client, project_id: str) -> str:
-    """Return a seeded catalog entry that has the student_base role."""
+    """Return the seeded default-compatible 2B student base."""
     resp = client.get(
         f"/v1/projects/{project_id}/model_configs",
         params={"eligible_role": "student_base"},
     )
     assert resp.status_code == 200, resp.text
     items = resp.json()["items"]
-    assert items, "seed catalog should include student_base entries"
-    return items[0]["model_config_id"]
+    match = next(
+        (item for item in items if item["model_name"] == "nvidia/cosmos-reason2-2b"),
+        None,
+    )
+    assert match is not None, "seed catalog should include Cosmos Reason2 2B"
+    return match["model_config_id"]
+
+
+def _student_base_model_id_by_name(client, project_id: str, model_name: str) -> str:
+    """Return the seeded student-base row with the exact model identity."""
+    resp = client.get(
+        f"/v1/projects/{project_id}/model_configs",
+        params={"eligible_role": "student_base"},
+    )
+    assert resp.status_code == 200, resp.text
+    matches = [
+        item["model_config_id"]
+        for item in resp.json()["items"]
+        if item["model_name"] == model_name
+    ]
+    assert len(matches) == 1, f"expected one seeded {model_name!r} row"
+    return matches[0]
 
 
 def _teacher_only_model_id(client, project_id: str) -> str:
     """Return a catalog entry that has ``teacher`` but NOT ``student_base``.
 
-    The seed catalog contains ``mistralai/mistral-large-3-675b-instruct-2512`` as
-    a teacher with no student_base role — perfect for
-    testing the negative role path.
+    The seed catalog contains hosted Teachers without the ``student_base``
+    role, which exercise the negative role path without pinning a provider.
     """
     resp = client.get(f"/v1/projects/{project_id}/model_configs")
     assert resp.status_code == 200, resp.text
@@ -291,9 +329,135 @@ class TestPreflightRouter:
         assert "hf_token_configured" in check_names
         assert "lora_merge_runtime" in check_names
         assert "student_base_role" in check_names
+        assert "training_mode_compatible" in check_names
+        assert "quantization_compatible" in check_names
         assert "verified_train_examples" in check_names
+        assert "min_test_pool_size" in check_names
         for c in body["checks"]:
             assert c["passed"] is True
+
+    def test_cosmos3_super_lora_requires_full_weight_on_qualified_runtime(
+        self, test_app_client
+    ):
+        """Readiness must stop the proven Super LoRA/TP crash before TAO spend."""
+        pid = _seed_project_with_catalog(test_app_client)
+        super_id = _student_base_model_id_by_name(
+            test_app_client, pid, COSMOS3_SUPER_REASONER
+        )
+        _set_hf_token(test_app_client, "hf_test")
+
+        with (
+            _patch_probe_success(),
+            _patch_workspace_check_pass(),
+            _patch_base_experiment_pass_for([super_id]),
+            _patch_train_examples_pass(),
+        ):
+            lora_resp = test_app_client.post(
+                f"/v1/projects/{pid}/training_preflight",
+                json={
+                    "student_base_model_config_ids": [super_id],
+                    "enable_lora": True,
+                    "quantization_schemes": [],
+                },
+            )
+
+        assert lora_resp.status_code == 200, lora_resp.text
+        lora_body = lora_resp.json()
+        mode_check = next(
+            check
+            for check in lora_body["checks"]
+            if check["check_name"] == "training_mode_compatible"
+        )
+        assert lora_body["status"] == "failed"
+        assert mode_check["passed"] is False
+        assert "tensor-parallel" in mode_check["message"]
+        assert "Full-weight" in mode_check["remediation"]
+
+        with (
+            _patch_probe_success(),
+            _patch_workspace_check_pass(),
+            _patch_base_experiment_pass_for([super_id]),
+            _patch_train_examples_pass(),
+        ):
+            full_weight_resp = test_app_client.post(
+                f"/v1/projects/{pid}/training_preflight",
+                json={
+                    "student_base_model_config_ids": [super_id],
+                    "enable_lora": False,
+                    "quantization_schemes": [],
+                },
+            )
+
+        assert full_weight_resp.status_code == 200, full_weight_resp.text
+        full_weight_body = full_weight_resp.json()
+        full_weight_check = next(
+            check
+            for check in full_weight_body["checks"]
+            if check["check_name"] == "training_mode_compatible"
+        )
+        assert full_weight_body["status"] == "passed"
+        assert full_weight_check["passed"] is True
+        assert "Full-weight" in full_weight_check["message"]
+
+    def test_cosmos3_super_quantization_requires_baseline_only(self, test_app_client):
+        """The proven Super baseline stays usable while quantization fails closed."""
+        pid = _seed_project_with_catalog(test_app_client)
+        super_id = _student_base_model_id_by_name(
+            test_app_client, pid, COSMOS3_SUPER_REASONER
+        )
+
+        with (
+            _patch_probe_success(),
+            _patch_workspace_check_pass(),
+            _patch_base_experiment_pass_for([super_id]),
+            _patch_train_examples_pass(),
+        ):
+            quantized = test_app_client.post(
+                f"/v1/projects/{pid}/training_preflight",
+                json={
+                    "student_base_model_config_ids": [super_id],
+                    "enable_lora": False,
+                    "quantization_schemes": ["FP8_DYNAMIC"],
+                },
+            )
+
+        assert quantized.status_code == 200, quantized.text
+        quantized_body = quantized.json()
+        quantized_check = next(
+            check
+            for check in quantized_body["checks"]
+            if check["check_name"] == "quantization_compatible"
+        )
+        assert quantized_body["status"] == "failed"
+        assert quantized_check["passed"] is False
+        assert "not currently supported" in quantized_check["message"]
+        assert "full-precision Super baseline" in quantized_check["message"]
+
+        with (
+            _patch_probe_success(),
+            _patch_workspace_check_pass(),
+            _patch_base_experiment_pass_for([super_id]),
+            _patch_train_examples_pass(),
+        ):
+            baseline = test_app_client.post(
+                f"/v1/projects/{pid}/training_preflight",
+                json={
+                    "student_base_model_config_ids": [super_id],
+                    "enable_lora": False,
+                    "quantization_schemes": [],
+                },
+            )
+
+        assert baseline.status_code == 200, baseline.text
+        baseline_body = baseline.json()
+        baseline_check = next(
+            check
+            for check in baseline_body["checks"]
+            if check["check_name"] == "quantization_compatible"
+        )
+        assert baseline_body["status"] == "passed"
+        assert baseline_check["passed"] is True
+        assert "Baseline-only" in baseline_check["message"]
 
     def test_tao_unreachable_returns_failed(self, test_app_client):
         pid = _seed_project_with_catalog(test_app_client)
@@ -502,7 +666,7 @@ class TestProfileDDifferentiation:
     """Training preflight (Profile D) MUST NOT run the NIM deploy checks."""
 
     def test_no_docker_or_gpu_or_ngc_checks(self, test_app_client):
-        """Asserts the preflight response contains ONLY the five Profile D
+        """Asserts the preflight response contains only Profile D checks —
         check_names — no docker / gpu / ngc / container-toolkit checks.
         """
         pid = _seed_project_with_catalog(test_app_client)
@@ -526,7 +690,10 @@ class TestProfileDDifferentiation:
             "hf_token_configured",
             "lora_merge_runtime",
             "student_base_role",
+            "training_mode_compatible",
+            "quantization_compatible",
             "verified_train_examples",
+            "min_test_pool_size",
         }
         observed = {c["check_name"] for c in body["checks"]}
         leaked = observed - allowed
@@ -937,7 +1104,11 @@ class TestPreflightWorkspaceAndBaseExperimentChecks:
         ):
             resp = test_app_client.post(
                 f"/v1/projects/{pid}/training_preflight",
-                json={"student_base_model_config_ids": sb_ids},
+                json={
+                    "student_base_model_config_ids": sb_ids,
+                    "enable_lora": False,
+                    "quantization_schemes": [],
+                },
             )
         assert resp.status_code == 200
         be_checks = [
@@ -965,6 +1136,7 @@ class TestVerifiedTrainExamplesCheck:
             _patch_probe_success(),
             _patch_workspace_check_pass(),
             _patch_base_experiment_pass_for([sb_id]),
+            _patch_test_pool_pass(),
         ):
             return client.post(
                 f"/v1/projects/{pid}/training_preflight",
@@ -1053,6 +1225,7 @@ class TestVerifiedTrainExamplesCheck:
         assert included.json()["data_summary"] == {
             "verified_training_count": 1,
             "test_pool_count": 1,
+            "required_test_pool_count": 60,
             "auto_labeled_eligible_count": 1,
             "auto_labeled_included_count": 1,
             "excluded_test_pool_count": 1,
@@ -1063,12 +1236,88 @@ class TestVerifiedTrainExamplesCheck:
         assert excluded.json()["data_summary"] == {
             "verified_training_count": 1,
             "test_pool_count": 1,
+            "required_test_pool_count": 60,
             "auto_labeled_eligible_count": 1,
             "auto_labeled_included_count": 0,
             "excluded_test_pool_count": 1,
             "excluded_auto_labeled_count": 1,
             "usable_training_count": 1,
         }
+
+
+class TestMinimumTestPoolSizeCheck:
+    """Student evaluation needs the project's configured held-out minimum."""
+
+    def _post(self, client, pid: str, sb_id: str):
+        with (
+            _patch_probe_success(),
+            _patch_workspace_check_pass(),
+            _patch_base_experiment_pass_for([sb_id]),
+        ):
+            return client.post(
+                f"/v1/projects/{pid}/training_preflight",
+                json={"student_base_model_config_ids": [sb_id]},
+            )
+
+    def test_blocks_until_configured_test_pool_minimum_is_reached(
+        self, test_app_client
+    ):
+        pid = _seed_project_with_catalog(test_app_client)
+        sb_id = _student_base_model_id(test_app_client, pid)
+        _set_hf_token(test_app_client, "hf_test")
+        gid = _seed_active_guidance(test_app_client, pid)
+        update = test_app_client.patch(
+            f"/v1/projects/{pid}", json={"scaleup_min_test_pool_size": 2}
+        )
+        assert update.status_code == 200, update.text
+        _insert_verified_label(test_app_client, pid, gid, pool_assignment=None)
+        _insert_verified_label(test_app_client, pid, gid, pool_assignment="test_pool")
+
+        blocked = self._post(test_app_client, pid, sb_id)
+        assert blocked.status_code == 200, blocked.text
+        blocked_body = blocked.json()
+        check = next(
+            c for c in blocked_body["checks"] if c["check_name"] == "min_test_pool_size"
+        )
+        assert check["passed"] is False
+        assert check["message"] == (
+            "Test Pool has 1 of 2 required held-out evaluation examples. "
+            "Continue labeling to grow the pool."
+        )
+        assert blocked_body["data_summary"]["required_test_pool_count"] == 2
+        assert blocked_body["status"] == "failed"
+
+        _insert_verified_label(test_app_client, pid, gid, pool_assignment="test_pool")
+        ready = self._post(test_app_client, pid, sb_id)
+        assert ready.status_code == 200, ready.text
+        ready_body = ready.json()
+        check = next(
+            c for c in ready_body["checks"] if c["check_name"] == "min_test_pool_size"
+        )
+        assert check["passed"] is True
+        assert ready_body["status"] == "passed"
+
+    def test_configured_zero_still_requires_nonempty_evaluation_set(
+        self, test_app_client
+    ):
+        pid = _seed_project_with_catalog(test_app_client)
+        sb_id = _student_base_model_id(test_app_client, pid)
+        _set_hf_token(test_app_client, "hf_test")
+        gid = _seed_active_guidance(test_app_client, pid)
+        update = test_app_client.patch(
+            f"/v1/projects/{pid}", json={"scaleup_min_test_pool_size": 0}
+        )
+        assert update.status_code == 200, update.text
+        _insert_verified_label(test_app_client, pid, gid, pool_assignment=None)
+
+        blocked = self._post(test_app_client, pid, sb_id)
+        assert blocked.status_code == 200, blocked.text
+        body = blocked.json()
+        check = next(
+            c for c in body["checks"] if c["check_name"] == "min_test_pool_size"
+        )
+        assert check["passed"] is False
+        assert body["data_summary"]["required_test_pool_count"] == 1
 
 
 # ── Regression — TAO auth failures render gracefully (not as HTTP 500) ─────

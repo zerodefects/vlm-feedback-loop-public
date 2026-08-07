@@ -9,9 +9,9 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, Text, Spinner } from "@kui/react";
-import { AlertTriangle, ArrowLeft, Images } from "lucide-react";
+import { AlertTriangle, ArrowLeft, FolderUp } from "lucide-react";
 
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useEnvironmentSetupContext } from "@/pages/setup-context";
 import { browseFilesystem, scanDirectory, ingestExamples } from "@/api/filesystem";
 import { ApiError, parseApiErrorDetail } from "@/api/client";
 import { projectKeys } from "@/api/query-keys";
@@ -76,8 +76,14 @@ function saveRecentPath(path: string) {
   localStorage.setItem(RECENT_PATHS_KEY, JSON.stringify(recent.slice(0, 5)));
 }
 
+function parentDirectory(path: string): string {
+  const normalized = path.replace(/\/+$/, "");
+  const separator = normalized.lastIndexOf("/");
+  return separator <= 0 ? "/" : normalized.slice(0, separator);
+}
+
 export function ImageIngestPage() {
-  const { projectId, project, environment } = useSetupContext();
+  const { projectId, project, environment } = useEnvironmentSetupContext();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const embeddingActivationExpected =
@@ -119,8 +125,30 @@ export function ImageIngestPage() {
     setScanError(null);
     setIsLoadingBrowse(true);
     try {
-      const resp: BrowseResponse = await browseFilesystem(path);
-      if (path === undefined) setBrowseRoot(resp.path);
+      const initialResp: BrowseResponse = await browseFilesystem(path);
+      let resp = initialResp;
+      if (path === undefined) {
+        // Keep the backend-selected root as the browser boundary, but start
+        // beside the bundled sample so its directory can be selected as one
+        // ordinary folder. This replaces the former sample-specific button
+        // and avoids opening inside a directory the picker cannot select.
+        setBrowseRoot(initialResp.path);
+        if (initialResp.bundled_sample_path) {
+          const sampleParent = parentDirectory(initialResp.bundled_sample_path);
+          if (
+            initialResp.path !== sampleParent &&
+            initialResp.path !== initialResp.bundled_sample_path
+          ) {
+            try {
+              resp = await browseFilesystem(sampleParent);
+            } catch {
+              // A custom IMAGE_ROOT can make the repository sample's parent
+              // inaccessible. Fall back to the authoritative initial root.
+              resp = initialResp;
+            }
+          }
+        }
+      }
       setBundledSamplePath(resp.bundled_sample_path);
       setEntries(resp.entries);
       setParentPath(resp.parent);
@@ -209,7 +237,7 @@ export function ImageIngestPage() {
     setScreenState("scanning");
 
     // For selected items, scan each path and collect images. The backend
-    // is the example-key authority (slug + relpath-hash scheme with
+    // is the example-key authority (slug + canonical-path hash scheme with
     // key_status dedupe) — individually selected files reuse the scan
     // endpoint on their parent directory instead of re-deriving keys
     // client-side, which collided on same-named files from different
@@ -345,6 +373,29 @@ export function ImageIngestPage() {
       errors.push(...out.errors);
       warnings.push(...out.warnings);
       processed += batch.length;
+
+      // The SME may leave for Labeling as soon as the first batch lands. The
+      // backend's created responses are authoritative: every item submitted
+      // by this screen enters Unlabeled. Apply that committed delta to the
+      // shared project snapshot before exposing the exit so Scale Up cannot
+      // retain its pre-ingest count. The loop survives this page unmount, so
+      // later batches keep the still-active ProjectSetupLayout cache current.
+      if (out.accepted > 0) {
+        queryClient.setQueryData(
+          projectKeys.detail(projectId),
+          (current: typeof project | undefined) =>
+            current
+              ? {
+                  ...current,
+                  counts: {
+                    ...current.counts,
+                    unlabeled: current.counts.unlabeled + out.accepted,
+                  },
+                }
+              : current,
+        );
+      }
+
       setIngestionProcessed(Math.min(processed, allImages.length));
       setIngestionAccepted(accepted);
       setIngestionSkipped([...skipped]);
@@ -365,6 +416,7 @@ export function ImageIngestPage() {
     screenState,
     project.embedding_provider,
     embeddingActivationExpected,
+    queryClient,
   ]);
 
   // ── Reset to browse ──────────────────────────────────────────────────────
@@ -401,9 +453,10 @@ export function ImageIngestPage() {
   // the SetupLayout mount is unchanged, so IngestionSummary reads the
   // stale "none" and shows "Embeddings unavailable" even though the
   // backend is happily computing on the hosted NIM. Invalidating on the
-  // ``complete`` transition gives RQ a chance to refetch and pick up the
-  // post-probe value before the summary renders. Idempotent: if the value
-  // didn't change, the refetch resolves to the same object.
+  // ``complete`` transition is a final defense-in-depth refresh for the
+  // post-probe value before the summary renders. Per-batch count refreshes
+  // above already protect the mid-ingest exit path. Idempotent: if nothing
+  // changed, the refetch resolves to the same object.
   useEffect(() => {
     if (screenState !== "queued") return;
     void queryClient.invalidateQueries({
@@ -569,7 +622,7 @@ export function ImageIngestPage() {
             </Text>
             <div className="mt-4">
               <Button kind="secondary" onClick={() => navigate(-1)}>
-                <ArrowLeft size={14} /> Back
+                <ArrowLeft size={14} /> Previous screen
               </Button>
             </div>
           </div>
@@ -602,6 +655,7 @@ export function ImageIngestPage() {
               <div className="flex-1">
                 <input
                   type="text"
+                  aria-label="Path"
                   value={pathInput}
                   onChange={(e) => setPathInput(e.target.value)}
                   onKeyDown={(e) => {
@@ -612,16 +666,36 @@ export function ImageIngestPage() {
                   data-testid="path-input"
                 />
               </div>
-              {bundledSamplePath && currentPath !== bundledSamplePath && (
-                <Button
-                  kind="secondary"
-                  onClick={() => void doBrowse(bundledSamplePath)}
-                  data-testid="use-bundled-sample"
-                >
-                  <Images size={14} /> Use bundled sample
-                </Button>
-              )}
+              <Button
+                kind="secondary"
+                onClick={() => {
+                  if (parentPath) handleNavigate(parentPath);
+                }}
+                disabled={!parentPath || isLoadingBrowse}
+                title={
+                  parentPath
+                    ? `Open parent folder: ${parentPath}`
+                    : browseRoot === "/"
+                      ? "You are at the filesystem root."
+                      : "You are at the configured image root."
+                }
+                data-testid="browse-parent-button"
+              >
+                <FolderUp size={14} /> Up one folder
+              </Button>
             </div>
+
+            {!pathError && !parentPath && currentPath === browseRoot && (
+              <Text
+                kind="body/regular/xs"
+                style={{ color: "var(--text-muted)" }}
+                data-testid="browse-root-boundary"
+              >
+                {browseRoot === "/"
+                  ? "You’re at the filesystem root."
+                  : "You’re at the configured image root. Files above this folder are intentionally unavailable; change IMAGE_ROOT in the server configuration to browse somewhere else."}
+              </Text>
+            )}
 
             {/* File Browser */}
             {screenState === "browse" && (
@@ -681,7 +755,6 @@ export function ImageIngestPage() {
                     entries={entries}
                     rootPath={browseRoot}
                     currentPath={currentPath}
-                    parentPath={parentPath}
                     selectedPaths={selectedPaths}
                     onNavigate={handleNavigate}
                     onToggleSelect={handleToggleSelect}
@@ -691,7 +764,7 @@ export function ImageIngestPage() {
                 {/* Footer */}
                 <div className="flex items-center justify-between mt-2">
                   <Button kind="secondary" onClick={() => navigate(-1)}>
-                    <ArrowLeft size={14} /> Back
+                    <ArrowLeft size={14} /> Previous screen
                   </Button>
                   <div className="flex items-center gap-3">
                     <Text

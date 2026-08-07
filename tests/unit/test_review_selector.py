@@ -108,13 +108,14 @@ def _cleanup_selector():
     between two selector runs; the autouse fixture below handles the
     between-tests reset.
     """
-    from vlm_feedback_loop.services.clip_embedding_service import embedding_cache
-    from vlm_feedback_loop.services.review_selector_service import (
-        _reset_mode_tracker,
+    from vlm_feedback_loop.services import (
+        clip_embedding_service,
+        review_selector_service,
     )
 
-    _reset_mode_tracker()
-    embedding_cache.invalidate("test-proj")
+    review_selector_service._last_mode_by_project.clear()
+    clip_embedding_service.embedding_cache._store.pop("test-proj", None)
+    clip_embedding_service.embedding_cache._normalized.pop("test-proj", None)
 
 
 @pytest.fixture(autouse=True)

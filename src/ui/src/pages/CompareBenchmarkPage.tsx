@@ -56,24 +56,30 @@ import { getEvaluationRun, listEvaluationRuns } from "@/api/evaluation";
 import { fetchGuidance } from "@/api/guidance";
 import { fetchModelConfigs } from "@/api/model-configs";
 import { deployNim, listStudentModels } from "@/api/students";
+import { listTrainingSuites } from "@/api/training";
 import {
   evaluationKeys,
   guidanceKeys,
   modelConfigKeys,
   studentModelKeys,
+  trainingKeys,
 } from "@/api/query-keys";
 import { PageContainer } from "@/components/common/PageContainer";
 import { CompareScopeBar } from "@/components/compare/CompareScopeBar";
 import type { MetricSelection } from "@/components/compare/CompareScopeBar";
-import { formatModelDisplayName } from "@/lib/model-display";
+import { localTeacherDisplayName, quantizationDisplayName } from "@/lib/model-display";
 import { CHART_TEACHER_COLOR, variantColor } from "@/lib/chart-palette";
-import { chartGroupKey, GroupedBarChart } from "@/components/compare/GroupedBarChart";
+import { GroupedBarChart } from "@/components/compare/GroupedBarChart";
 import type { ChartGroup, ChartSeries } from "@/components/compare/GroupedBarChart";
+import { chartGroupKey } from "@/lib/chart-group";
 import { QualityFailedVariantCard } from "@/components/compare/QualityFailedVariantCard";
 import { StudentVariantCard } from "@/components/compare/StudentVariantCard";
 import { TeacherBaselineCard } from "@/components/compare/TeacherBaselineCard";
+import { TrainingRunGroup } from "@/components/compare/TrainingRunGroup";
 import { useProjectSSE } from "@/hooks/useProjectSSE";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useEnvironmentSetupContext } from "@/pages/setup-context";
+import { formatTimestamp } from "@/lib/format-date";
+import { titleCasePreset } from "@/lib/formatPreset";
 import type {
   EvaluationMetrics,
   EvaluationRunResponse,
@@ -82,7 +88,12 @@ import type {
 } from "@/types/evaluation";
 import type { GuidanceResponse, SchemaFieldResponse } from "@/types/guidance";
 import type { ModelConfigResponse } from "@/types/nim";
-import type { StudentModel, StudentModelListResponse } from "@/types/training";
+import type {
+  StudentModel,
+  StudentModelListResponse,
+  TrainingSuite,
+  TrainingSuiteListResponse,
+} from "@/types/training";
 
 interface BenchmarkState {
   stage: NimBenchmarkStage;
@@ -92,13 +103,47 @@ interface BenchmarkState {
   evalProgress: { processed: number; total: number } | null;
 }
 
+interface StudentRunGroupData {
+  key: string;
+  suite: TrainingSuite | null;
+  students: StudentModel[];
+  latest: boolean;
+}
+
+function normalizedInferenceContract(
+  contract: Record<string, unknown> | null,
+): string | null {
+  if (!contract) return null;
+  return JSON.stringify({
+    output_field_mode: contract.output_field_mode ?? null,
+    icl_field_mode: contract.icl_field_mode ?? null,
+    icl_max_examples: contract.icl_max_examples ?? null,
+  });
+}
+
+/** A delta is only meaningful when both runs measured the same task contract
+ * and frozen Test Pool. Unknown provenance fails closed. */
+function evaluationContextsMatch(
+  studentRun: EvaluationRunResponse | null,
+  teacherRun: EvaluationRunResponse | null,
+): boolean {
+  if (!studentRun || !teacherRun) return false;
+  if (!studentRun.pool_version_id || !teacherRun.pool_version_id) return false;
+  return (
+    studentRun.guidance_id === teacherRun.guidance_id &&
+    studentRun.pool_version_id === teacherRun.pool_version_id &&
+    normalizedInferenceContract(studentRun.inference_contract) ===
+      normalizedInferenceContract(teacherRun.inference_contract)
+  );
+}
+
 // Poll cadence for the student list while a benchmark is active — the
 // REST fallback that advances the queue when a terminal SSE event is
 // missed (outage, backend restart).
 const BENCHMARK_RECONCILE_POLL_MS = 5_000;
 
 export function CompareBenchmarkPage() {
-  const { projectId, project, environment } = useSetupContext();
+  const { projectId, project, environment } = useEnvironmentSetupContext();
   // One-NIM-per-GPU: on single-GPU hosts, Student NIM
   // benchmarking displaces the resident
   // Teacher (replace semantics) and best-effort auto-
@@ -146,27 +191,77 @@ export function CompareBenchmarkPage() {
     // REST is authoritative; SSE is a hint channel. While a benchmark is
     // active, poll so a missed terminal event still reaches the
     // reconciliation effect below instead of stalling the queue.
-    refetchInterval: activeBenchmarkId != null ? BENCHMARK_RECONCILE_POLL_MS : false,
+    refetchInterval: (query) => {
+      const current = query.state.data;
+      const hasDurablePending = current?.items.some(
+        (student) => student.serving_status === "pending",
+      );
+      return activeBenchmarkId != null || hasDurablePending
+        ? BENCHMARK_RECONCILE_POLL_MS
+        : false;
+    },
   });
 
-  const { data: completedRuns } = useQuery({
+  const { data: completedRuns, isLoading: completedRunsLoading } = useQuery({
     queryKey: evaluationKeys.completedList(projectId),
     queryFn: () => listEvaluationRuns(projectId, { status: "completed", limit: 100 }),
   });
 
-  const { data: guidance } = useQuery<GuidanceResponse>({
+  const { data: trainingSuiteList, isLoading: trainingSuitesLoading } =
+    useQuery<TrainingSuiteListResponse>({
+      queryKey: trainingKeys.suites(projectId),
+      queryFn: () => listTrainingSuites(projectId),
+    });
+
+  const { data: guidance, isLoading: guidanceLoading } = useQuery<GuidanceResponse>({
     queryKey: guidanceKeys.detail(projectId, project.active_guidance_id ?? ""),
     queryFn: () => fetchGuidance(projectId, project.active_guidance_id!),
     enabled: !!project.active_guidance_id,
   });
 
-  const { data: modelConfigs } = useQuery({
+  const { data: modelConfigs, isLoading: modelConfigsLoading } = useQuery({
     queryKey: modelConfigKeys.list(projectId, undefined),
     queryFn: () => fetchModelConfigs(projectId),
   });
 
-  // Filter to Students with usable quality validation. ``validated`` is
-  // the production-handoff bar; ``partial`` is informational —
+  // Historical Students must render against the Guidance schema they were
+  // trained under, not whichever Guidance happens to be active today. The
+  // current Guidance query above remains the Teacher/current-project source;
+  // this deduplicated set fills the immutable Training Run headings and card
+  // field definitions.
+  const historicalGuidanceIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const suite of trainingSuiteList?.items ?? []) {
+      if (suite.guidance_id !== project.active_guidance_id) ids.add(suite.guidance_id);
+    }
+    for (const student of studentList?.items ?? []) {
+      if (student.guidance_id !== project.active_guidance_id)
+        ids.add(student.guidance_id);
+    }
+    return Array.from(ids).sort();
+  }, [project.active_guidance_id, studentList, trainingSuiteList]);
+
+  const historicalGuidanceQueries = useQueries({
+    queries: historicalGuidanceIds.map((guidanceId) => ({
+      queryKey: guidanceKeys.detail(projectId, guidanceId),
+      queryFn: () => fetchGuidance(projectId, guidanceId),
+    })),
+  });
+
+  const guidanceById = useMemo(() => {
+    const byId: Record<string, GuidanceResponse> = {};
+    if (guidance) byId[guidance.guidance_id] = guidance;
+    historicalGuidanceIds.forEach((guidanceId, index) => {
+      const historical = historicalGuidanceQueries[index]?.data;
+      if (historical) byId[guidanceId] = historical;
+    });
+    return byId;
+  }, [guidance, historicalGuidanceIds, historicalGuidanceQueries]);
+
+  // Keep every packaged Student that can run the NIM lifecycle visible.
+  // ``pending`` is the cold-start path: its first NIM evaluation supplies
+  // both quality and serving evidence. ``validated`` is the production-
+  // handoff bar; ``partial`` is informational —
   // partial Students render with the yellow "Quality: Partial" badge so
   // the SME can compare them and decide whether to re-run NIM eval to
   // promote to validated. The [Request Production Deployment] gate on
@@ -177,7 +272,10 @@ export function CompareBenchmarkPage() {
   // [Benchmark] them.
   const variants = useMemo<StudentModel[]>(() => {
     return (studentList?.items ?? []).filter(
-      (s) => s.quality_status === "validated" || s.quality_status === "partial",
+      (s) =>
+        s.quality_status === "pending" ||
+        s.quality_status === "validated" ||
+        s.quality_status === "partial",
     );
   }, [studentList]);
 
@@ -189,16 +287,103 @@ export function CompareBenchmarkPage() {
     return (studentList?.items ?? []).filter((s) => s.quality_status === "failed");
   }, [studentList]);
 
-  // Per-variant lazy fetch of the ``quality_evaluation_run_id`` for
-  // without-ICL Exact Match + per-field metrics.
-  const qualityRunQueries = useQueries({
-    queries: variants
-      .filter((v) => v.quality_evaluation_run_id != null)
-      .map((v) => ({
-        queryKey: evaluationKeys.detail(projectId, v.quality_evaluation_run_id!),
-        queryFn: () => getEvaluationRun(projectId, v.quality_evaluation_run_id!),
-      })),
+  // One project-wide comparison, visually partitioned by immutable Start
+  // Training actions. Existing databases are backfilled with
+  // training_suite_id; student_model_ids is a second authoritative link for
+  // records created while a migration/recovery boundary was in flight.
+  const runGroups = useMemo<StudentRunGroupData[]>(() => {
+    const suites = trainingSuiteList?.items ?? [];
+    const suiteByStudentId = new Map<string, string>();
+    for (const suite of suites) {
+      for (const studentId of suite.student_model_ids) {
+        suiteByStudentId.set(studentId, suite.training_suite_id);
+      }
+    }
+
+    const studentsBySuite = new Map<string, StudentModel[]>();
+    const unassigned: StudentModel[] = [];
+    for (const student of studentList?.items ?? []) {
+      const suiteId =
+        student.training_suite_id ?? suiteByStudentId.get(student.student_model_id);
+      if (!suiteId) {
+        unassigned.push(student);
+        continue;
+      }
+      const groupStudents = studentsBySuite.get(suiteId) ?? [];
+      groupStudents.push(student);
+      studentsBySuite.set(suiteId, groupStudents);
+    }
+
+    const groups: StudentRunGroupData[] = [];
+    for (const suite of suites) {
+      const students = studentsBySuite.get(suite.training_suite_id);
+      if (!students?.length) continue;
+      groups.push({
+        key: suite.training_suite_id,
+        suite,
+        students,
+        latest: groups.length === 0,
+      });
+      studentsBySuite.delete(suite.training_suite_id);
+    }
+
+    // A Student may reference a suite beyond the first 100 history rows. Keep
+    // it visible and actionable instead of dropping it from Models & Results.
+    for (const [suiteId, students] of studentsBySuite) {
+      groups.push({ key: suiteId, suite: null, students, latest: false });
+    }
+    if (unassigned.length > 0) {
+      groups.push({
+        key: "unassigned",
+        suite: null,
+        students: unassigned,
+        latest: groups.length === 0,
+      });
+    }
+    return groups;
+  }, [studentList, trainingSuiteList]);
+
+  // Fetch each referenced evaluation run exactly once. Several variants can
+  // legitimately share a quality or serving run. Passing duplicate query
+  // keys to one ``useQueries`` observer produces an explicit React Query
+  // warning and can make observer result sharing ambiguous, so deduplicate
+  // the union before constructing the queries.
+  const variantEvaluationRunIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const variant of variants) {
+      if (variant.quality_evaluation_run_id) {
+        ids.add(variant.quality_evaluation_run_id);
+      }
+      if (variant.serving_evaluation_run_id) {
+        ids.add(variant.serving_evaluation_run_id);
+      }
+    }
+    return Array.from(ids);
+  }, [variants]);
+
+  const variantEvaluationRunQueries = useQueries({
+    queries: variantEvaluationRunIds.map((runId) => ({
+      queryKey: evaluationKeys.detail(projectId, runId),
+      queryFn: () => getEvaluationRun(projectId, runId),
+    })),
   });
+
+  const comparisonDataLoading =
+    studentsLoading ||
+    completedRunsLoading ||
+    trainingSuitesLoading ||
+    modelConfigsLoading ||
+    (!!project.active_guidance_id && guidanceLoading) ||
+    historicalGuidanceQueries.some((query) => query.isLoading) ||
+    variantEvaluationRunQueries.some((query) => query.isLoading);
+
+  const variantEvaluationRunById = useMemo(() => {
+    const runs: Record<string, EvaluationRunResponse | null> = {};
+    variantEvaluationRunIds.forEach((runId, index) => {
+      runs[runId] = variantEvaluationRunQueries[index]?.data ?? null;
+    });
+    return runs;
+  }, [variantEvaluationRunIds, variantEvaluationRunQueries]);
 
   const qualityRunByStudentId = useMemo(() => {
     const m: Record<string, EvaluationMetrics | null> = {};
@@ -206,20 +391,15 @@ export function CompareBenchmarkPage() {
       string,
       Awaited<ReturnType<typeof getEvaluationRun>> | null
     > = {};
-    let q = 0;
     for (const v of variants) {
-      if (v.quality_evaluation_run_id == null) {
-        m[v.student_model_id] = null;
-        fullByStudentId[v.student_model_id] = null;
-        continue;
-      }
-      const result = qualityRunQueries[q]?.data ?? null;
+      const result = v.quality_evaluation_run_id
+        ? (variantEvaluationRunById[v.quality_evaluation_run_id] ?? null)
+        : null;
       fullByStudentId[v.student_model_id] = result;
       m[v.student_model_id] = (result?.metrics ?? null) as EvaluationMetrics | null;
-      q += 1;
     }
     return { metricsByStudentId: m, runByStudentId: fullByStudentId };
-  }, [variants, qualityRunQueries]);
+  }, [variants, variantEvaluationRunById]);
 
   // Teacher baseline = the newest completed run made with the fixed
   // Teacher contract (all/core_only/null — schemas/inference_contract.py,
@@ -255,40 +435,25 @@ export function CompareBenchmarkPage() {
   const teacherOverallExactMatch =
     teacherBaselineMetrics?.overall?.exact_match_rate ?? null;
 
-  // Per-variant lazy fetch of the serving run referenced by
-  // ``serving_evaluation_run_id`` — carries ``metrics.benchmarks``
-  // (latency × concurrency) written by the NIM benchmark lifecycle.
-  // React Query dedupes with the quality fetch above when the two run
-  // ids coincide (NIM-validated Students).
-  const servingRunQueries = useQueries({
-    queries: variants
-      .filter((v) => v.serving_evaluation_run_id != null)
-      .map((v) => ({
-        queryKey: evaluationKeys.detail(projectId, v.serving_evaluation_run_id!),
-        queryFn: () => getEvaluationRun(projectId, v.serving_evaluation_run_id!),
-      })),
-  });
-
+  // Per-variant serving runs carry ``metrics.benchmarks`` (latency ×
+  // concurrency) written by the NIM benchmark lifecycle. They come from the
+  // shared, deduplicated run map above.
   const servingRunByStudentId = useMemo(() => {
     const m: Record<string, EvaluationRunResponse | null> = {};
-    let q = 0;
     for (const v of variants) {
-      if (v.serving_evaluation_run_id == null) {
-        m[v.student_model_id] = null;
-        continue;
-      }
-      m[v.student_model_id] = servingRunQueries[q]?.data ?? null;
-      q += 1;
+      m[v.student_model_id] = v.serving_evaluation_run_id
+        ? (variantEvaluationRunById[v.serving_evaluation_run_id] ?? null)
+        : null;
     }
     return m;
-  }, [variants, servingRunQueries]);
+  }, [variants, variantEvaluationRunById]);
 
   // ── Model labels ──────────────────────────────────────────────────────────
   // Two label maps: ``labelByModelConfigId`` keeps the canonical
   // provider-prefixed name (e.g. ``nvidia/cosmos-reason2-8b``) used
   // on the Teacher card. The
-  // ``friendlyLabelByModelConfigId`` map applies
-  // ``formatModelDisplayName`` so Student variant cards
+  // ``friendlyLabelByModelConfigId`` map applies the shared product-model
+  // display names so Student variant cards
   // and chart legend entries render as ``Cosmos Reason2 8B``
   // — the human-readable form the comparison surface requires.
   const labelByModelConfigId = useMemo(() => {
@@ -302,23 +467,143 @@ export function CompareBenchmarkPage() {
   const friendlyLabelByModelConfigId = useMemo(() => {
     const m: Record<string, string> = {};
     for (const mc of (modelConfigs?.items ?? []) as ModelConfigResponse[]) {
-      m[mc.model_config_id] = formatModelDisplayName(mc.model_name);
+      m[mc.model_config_id] = localTeacherDisplayName(mc.model_name);
     }
     return m;
   }, [modelConfigs]);
-
-  const currentTeacherLabel = useMemo(() => {
-    return (
-      labelByModelConfigId[project.teacher_model_config_id] ??
-      project.teacher_model_config_id
-    );
-  }, [labelByModelConfigId, project]);
 
   const teacherBaselineLabel = useMemo(() => {
     const modelConfigId = teacherBaselineRun?.model_config_id;
     if (!modelConfigId) return "Unknown Teacher model";
     return labelByModelConfigId[modelConfigId] ?? modelConfigId;
   }, [labelByModelConfigId, teacherBaselineRun]);
+
+  const runLabelByStudentId = useMemo(() => {
+    const labels: Record<string, string> = {};
+    for (const group of runGroups) {
+      const timestamp =
+        formatTimestamp(
+          group.suite?.started_at ??
+            group.suite?.created_at ??
+            group.students[0]?.created_at,
+        ) ?? "Unknown date";
+      for (const student of group.students)
+        labels[student.student_model_id] = timestamp;
+    }
+    return labels;
+  }, [runGroups]);
+
+  // Chart series names must remain unique when the same base/precision is
+  // trained more than once. Include the immutable run timestamp, then add a
+  // candidate suffix only for the rare duplicate within one suite.
+  const chartLabelByStudentId = useMemo(() => {
+    const rawById: Record<string, string> = {};
+    const totals = new Map<string, number>();
+    for (const student of variants) {
+      const model =
+        friendlyLabelByModelConfigId[student.student_base_model_config_id] ??
+        student.student_base_model_config_id;
+      const raw = `${model} · ${quantizationDisplayName(student.quantization_method)} · ${runLabelByStudentId[student.student_model_id] ?? "Unknown run"}`;
+      rawById[student.student_model_id] = raw;
+      totals.set(raw, (totals.get(raw) ?? 0) + 1);
+    }
+    const seen = new Map<string, number>();
+    const labels: Record<string, string> = {};
+    for (const student of variants) {
+      const raw = rawById[student.student_model_id];
+      const ordinal = (seen.get(raw) ?? 0) + 1;
+      seen.set(raw, ordinal);
+      labels[student.student_model_id] =
+        (totals.get(raw) ?? 0) > 1 ? `${raw} · Candidate ${ordinal}` : raw;
+    }
+    return labels;
+  }, [friendlyLabelByModelConfigId, runLabelByStudentId, variants]);
+
+  const teacherComparableByStudentId = useMemo(() => {
+    const comparable: Record<string, boolean> = {};
+    for (const student of variants) {
+      comparable[student.student_model_id] = evaluationContextsMatch(
+        qualityRunByStudentId.runByStudentId[student.student_model_id] ?? null,
+        teacherBaselineRun,
+      );
+    }
+    return comparable;
+  }, [qualityRunByStudentId, teacherBaselineRun, variants]);
+
+  const latestSuite = runGroups.find((group) => group.suite != null)?.suite ?? null;
+
+  const warningByRunKey = useMemo(() => {
+    const warnings: Record<string, string | null> = {};
+    for (const group of runGroups) {
+      const messages: string[] = [];
+      if (!group.suite) {
+        messages.push(
+          "Training Run provenance is unavailable. The model remains fully actionable, but cross-run score differences are directional.",
+        );
+      } else if (
+        latestSuite &&
+        group.suite.training_suite_id !== latestSuite.training_suite_id
+      ) {
+        const differences: string[] = [];
+        if (group.suite.guidance_id !== latestSuite.guidance_id) {
+          differences.push("Guidance");
+        }
+        if (group.suite.export_field_mode !== latestSuite.export_field_mode) {
+          differences.push("output contract");
+        }
+        const groupChecksum = group.suite.evaluation_dataset_checksum_sha256;
+        const latestChecksum = latestSuite.evaluation_dataset_checksum_sha256;
+        if (groupChecksum && latestChecksum) {
+          if (groupChecksum !== latestChecksum) differences.push("evaluation set");
+        } else if (
+          group.suite.evaluation_dataset_export_id !==
+          latestSuite.evaluation_dataset_export_id
+        ) {
+          differences.push("unverified evaluation set");
+        }
+        if (differences.length > 0) {
+          messages.push(
+            `Different ${differences.join(", ")} from the latest training run. Cross-run score differences are directional.`,
+          );
+        }
+      }
+
+      const hasTeacherMismatch = group.students.some((student) => {
+        if (!student.quality_evaluation_run_id) return false;
+        return !teacherComparableByStudentId[student.student_model_id];
+      });
+      if (hasTeacherMismatch && teacherBaselineRun) {
+        messages.push(
+          "The Teacher baseline uses a different Guidance, Test Pool, or output contract; Student-vs-Teacher deltas are hidden.",
+        );
+      }
+      warnings[group.key] = messages.length > 0 ? messages.join(" ") : null;
+    }
+    return warnings;
+  }, [latestSuite, runGroups, teacherBaselineRun, teacherComparableByStudentId]);
+
+  const chartContextWarning = Object.values(warningByRunKey).some(Boolean)
+    ? "This chart includes results from different or unverified evaluation contexts. Use it for directional review; rely on deltas only where the run cards confirm compatible provenance."
+    : null;
+
+  const modelSummaryByRunKey = useMemo(() => {
+    const summaries: Record<string, string> = {};
+    for (const group of runGroups) {
+      const selectedIds =
+        group.suite?.selected_student_base_model_config_ids ??
+        group.students.map((student) => student.student_base_model_config_id);
+      const names = Array.from(
+        new Set(
+          selectedIds.map(
+            (modelConfigId) =>
+              friendlyLabelByModelConfigId[modelConfigId] ?? modelConfigId,
+          ),
+        ),
+      );
+      summaries[group.key] = `Models: ${names.join(" · ") || "Unavailable"}`;
+    }
+    return summaries;
+  }, [friendlyLabelByModelConfigId, runGroups]);
 
   // ── Selection helpers ─────────────────────────────────────────────────────
   const toggleSelected = (id: string) => {
@@ -549,15 +834,44 @@ export function CompareBenchmarkPage() {
       changed.push("Guidance");
     }
     return changed.length > 0
-      ? `Teacher baseline predates the current ${changed.join(" and ")}`
+      ? `Teacher baseline predates the current ${changed
+          .map((field) => {
+            if (field !== "Teacher") return field;
+            const currentId = project.teacher_model_config_id;
+            const currentLabel = currentId
+              ? (friendlyLabelByModelConfigId[currentId] ?? currentId)
+              : "not selected";
+            return `Teacher (${currentLabel})`;
+          })
+          .join(" and ")}. Run a new evaluation to refresh the baseline.`
       : null;
-  }, [teacherBaselineRun, project.active_guidance_id, project.teacher_model_config_id]);
+  }, [
+    teacherBaselineRun,
+    project.active_guidance_id,
+    project.teacher_model_config_id,
+    friendlyLabelByModelConfigId,
+  ]);
 
   // ── Chart data ───────────────────────────────────────────────────────────
   const chartData = useMemo(() => {
-    if (!chartOpen || !guidance) return null;
+    if (!chartOpen) return null;
 
-    const coreFields = guidance.schema_fields.filter((f) => f.role === "core");
+    // A historical Guidance can rename or replace Core fields. Build a union
+    // so every retained Student keeps its measured fields visible; the run
+    // warnings above explain when those columns are directional rather than
+    // directly comparable.
+    const coreFieldByName = new Map<string, SchemaFieldResponse>();
+    const addCoreFields = (candidate: GuidanceResponse | undefined) => {
+      for (const field of candidate?.schema_fields ?? []) {
+        if (field.role === "core" && !coreFieldByName.has(field.field_name)) {
+          coreFieldByName.set(field.field_name, field);
+        }
+      }
+    };
+    addCoreFields(guidance);
+    for (const variant of variants) addCoreFields(guidanceById[variant.guidance_id]);
+    const coreFields = Array.from(coreFieldByName.values());
+    if (coreFields.length === 0) return null;
 
     const teacherSeries: ChartSeries = {
       label: `Teacher · ${teacherBaselineLabel}`,
@@ -566,10 +880,7 @@ export function CompareBenchmarkPage() {
     };
 
     const variantSeries: ChartSeries[] = variants.map((v, idx) => ({
-      label: `${
-        friendlyLabelByModelConfigId[v.student_base_model_config_id] ??
-        v.student_base_model_config_id
-      }${v.quantization_method ? ` · ${v.quantization_method}` : ""}`,
+      label: chartLabelByStudentId[v.student_model_id],
       color: variantColor(idx),
       values: {},
     }));
@@ -645,11 +956,12 @@ export function CompareBenchmarkPage() {
   }, [
     chartOpen,
     guidance,
+    guidanceById,
     metricSelection,
     variants,
     teacherBaselineMetrics,
     qualityRunByStudentId,
-    friendlyLabelByModelConfigId,
+    chartLabelByStudentId,
     teacherBaselineLabel,
   ]);
 
@@ -664,7 +976,10 @@ export function CompareBenchmarkPage() {
       variants
         .filter(
           (v) =>
-            v.serving_status !== "validated" && v.nim_preflight_status !== "failed",
+            (v.serving_status !== "validated" ||
+              v.serving_benchmark_current !== true) &&
+            v.serving_status !== "pending" &&
+            v.nim_preflight_status !== "failed",
         )
         .map((v) => v.student_model_id),
     [variants],
@@ -673,43 +988,51 @@ export function CompareBenchmarkPage() {
   // ``busy`` disables the scope-bar action buttons and the per-card
   // checkboxes while an NIM benchmark is in flight — a sequential
   // workload where re-firing the trigger would double-fire the queue.
-  const busy = activeBenchmarkId != null;
+  const durablePendingBenchmark = variants.some(
+    (student) => student.serving_status === "pending",
+  );
+  const busy = activeBenchmarkId != null || durablePendingBenchmark;
 
-  // Among dual-validated variants, only the one with the best quality
-  // Exact Match keeps the full-strength green handoff CTA (first in list
-  // order on ties); the rest demote to secondary. Several identical
-  // primaries down the page would leave nothing reading as "the" action.
-  const primaryHandoffId = useMemo<string | null>(() => {
-    let best: { id: string; rate: number } | null = null;
-    for (const v of variants) {
-      if (v.quality_status !== "validated" || v.serving_status !== "validated") {
-        continue;
-      }
-      const rate =
-        qualityRunByStudentId.metricsByStudentId[v.student_model_id]?.overall
-          ?.exact_match_rate ?? -1;
-      if (best == null || rate > best.rate) {
-        best = { id: v.student_model_id, rate };
-      }
-    }
-    return best?.id ?? null;
-  }, [variants, qualityRunByStudentId]);
+  // When no production handoff is available, promote the first failed-quality
+  // Student that still needs serving validation as the primary recovery action.
+  const primaryFailedRecoveryId = useMemo<string | null>(() => {
+    const hasProductionHandoff = variants.some(
+      (v) =>
+        v.quality_status === "validated" &&
+        v.serving_status === "validated" &&
+        v.serving_benchmark_current === true,
+    );
+    if (hasProductionHandoff) return null;
+    return (
+      failedVariants.find((v) => v.serving_status !== "validated")?.student_model_id ??
+      null
+    );
+  }, [failedVariants, variants]);
 
   // ── Render ───────────────────────────────────────────────────────────────
-  if (studentsLoading) {
+  if (comparisonDataLoading) {
     return (
       <PageContainer data-testid="compare-benchmark-page-loading">
         <div className="flex items-center justify-center py-20">
-          <Spinner aria-label="Loading Student variants" size="large" />
+          <Spinner aria-label="Loading comparison data" size="large" />
         </div>
       </PageContainer>
     );
   }
 
-  if (variants.length === 0) {
+  if (variants.length === 0 && failedVariants.length === 0) {
     return (
       <PageContainer data-testid="compare-benchmark-page-empty">
-        <Text kind="title/md">Compare and Benchmark</Text>
+        <div className="flex min-w-0 flex-col gap-1">
+          <Text kind="title/md">Compare and Benchmark</Text>
+          <Text
+            kind="body/regular/sm"
+            style={{ color: "var(--text-secondary)" }}
+            data-testid="compare-project-name"
+          >
+            Project: {project.name}
+          </Text>
+        </div>
         <div
           className="glass-card p-6 flex flex-col gap-2"
           data-testid="compare-empty-state"
@@ -751,8 +1074,17 @@ export function CompareBenchmarkPage() {
       maxWidthClass="max-w-6xl"
       data-testid="compare-benchmark-page"
     >
-      <div className="flex items-baseline justify-between gap-3">
-        <Text kind="title/md">Compare and Benchmark</Text>
+      <div className="flex items-end justify-between gap-3">
+        <div className="flex min-w-0 flex-col gap-1">
+          <Text kind="title/md">Compare and Benchmark</Text>
+          <Text
+            kind="body/regular/sm"
+            style={{ color: "var(--text-secondary)" }}
+            data-testid="compare-project-name"
+          >
+            Project: {project.name}
+          </Text>
+        </div>
         {teacherBaselineRun && (
           <Text
             kind="body/regular/sm"
@@ -806,62 +1138,128 @@ export function CompareBenchmarkPage() {
         staleNote={staleTeacherBaselineNote}
         coreFields={coreFields}
         metricSelection={metricSelection}
+        perFieldMatchThreshold={project.scaleup_per_field_match_threshold}
+        minPerValueF1Threshold={project.scaleup_min_per_value_f1_threshold}
       />
 
-      {variants.map((v) => {
-        const stage = stageByStudentId[v.student_model_id];
-        const baseLabel =
-          friendlyLabelByModelConfigId[v.student_base_model_config_id] ??
-          v.student_base_model_config_id;
-        const qualityFullRun =
-          qualityRunByStudentId.runByStudentId[v.student_model_id] ?? null;
+      {runGroups.map((group) => {
+        const suite = group.suite;
+        const groupGuidance =
+          guidanceById[suite?.guidance_id ?? group.students[0]?.guidance_id];
         return (
-          <StudentVariantCard
-            key={v.student_model_id}
-            projectId={projectId}
-            student={v}
-            baseModelLabel={baseLabel}
-            qualityRun={qualityFullRun}
-            servingRun={servingRunByStudentId[v.student_model_id] ?? null}
-            teacherOverallExactMatch={teacherOverallExactMatch}
-            coreFields={coreFields}
-            metricSelection={metricSelection}
-            concurrencies={environment.student_latency_test_concurrencies}
-            selected={selectedIds.has(v.student_model_id)}
-            onToggleSelected={() => toggleSelected(v.student_model_id)}
-            benchmarkStage={stage?.stage ?? null}
-            benchmarkStartupBudgetS={environment.nim_startup_timeout_s}
-            benchmarkElapsedMs={stage?.elapsedMs ?? 0}
-            benchmarkConcurrency={stage?.concurrency ?? null}
-            benchmarkEvalProgress={stage?.evalProgress ?? null}
-            busy={busy && activeBenchmarkId !== v.student_model_id}
-            benchmarkError={benchmarkErrorByStudentId[v.student_model_id] ?? null}
-            onBenchmark={() => enqueueBenchmark([v.student_model_id])}
-            singleGpuHost={singleGpuHost}
-            teacherLabel={currentTeacherLabel}
-            handoffEmphasis={
-              primaryHandoffId === null || primaryHandoffId === v.student_model_id
-                ? "primary"
-                : "secondary"
+          <TrainingRunGroup
+            key={group.key}
+            groupKey={group.key}
+            latest={group.latest}
+            unassigned={suite == null}
+            startedAt={formatTimestamp(
+              suite?.started_at ?? suite?.created_at ?? group.students[0]?.created_at,
+            )}
+            presetLabel={
+              suite
+                ? titleCasePreset(suite.training_preset)
+                : group.students[0]
+                  ? titleCasePreset(group.students[0].training_preset)
+                  : null
             }
-          />
+            guidanceVersion={groupGuidance?.version_number ?? null}
+            trainingExampleCount={suite?.training_example_count ?? null}
+            evaluationExampleCount={suite?.evaluation_example_count ?? null}
+            modelSummary={modelSummaryByRunKey[group.key]}
+            warning={warningByRunKey[group.key]}
+          >
+            <div className="flex flex-col gap-3">
+              {group.students.map((student) => {
+                const stage = stageByStudentId[student.student_model_id];
+                const baseLabel =
+                  friendlyLabelByModelConfigId[student.student_base_model_config_id] ??
+                  student.student_base_model_config_id;
+                if (student.quality_status === "failed") {
+                  return (
+                    <QualityFailedVariantCard
+                      key={student.student_model_id}
+                      projectId={projectId}
+                      student={student}
+                      baseModelLabel={baseLabel}
+                      benchmarkStage={stage?.stage ?? null}
+                      benchmarkStartupBudgetS={environment.nim_startup_timeout_s}
+                      benchmarkElapsedMs={stage?.elapsedMs ?? 0}
+                      benchmarkConcurrency={stage?.concurrency ?? null}
+                      benchmarkEvalProgress={stage?.evalProgress ?? null}
+                      benchmarkError={
+                        benchmarkErrorByStudentId[student.student_model_id] ?? null
+                      }
+                      benchmarkEmphasis={
+                        primaryFailedRecoveryId === student.student_model_id
+                          ? "primary"
+                          : "secondary"
+                      }
+                      busy={busy && activeBenchmarkId !== student.student_model_id}
+                      onBenchmark={() => enqueueBenchmark([student.student_model_id])}
+                    />
+                  );
+                }
+
+                const qualityFullRun =
+                  qualityRunByStudentId.runByStudentId[student.student_model_id] ??
+                  null;
+                const studentGuidance = guidanceById[student.guidance_id] ?? guidance;
+                const studentCoreFields =
+                  studentGuidance?.schema_fields.filter(
+                    (field) => field.role === "core",
+                  ) ?? [];
+                return (
+                  <StudentVariantCard
+                    key={student.student_model_id}
+                    projectId={projectId}
+                    student={student}
+                    baseModelLabel={baseLabel}
+                    qualityRun={qualityFullRun}
+                    servingRun={servingRunByStudentId[student.student_model_id] ?? null}
+                    teacherOverallExactMatch={
+                      teacherComparableByStudentId[student.student_model_id]
+                        ? teacherOverallExactMatch
+                        : null
+                    }
+                    coreFields={studentCoreFields}
+                    metricSelection={metricSelection}
+                    perFieldMatchThreshold={project.scaleup_per_field_match_threshold}
+                    minPerValueF1Threshold={project.scaleup_min_per_value_f1_threshold}
+                    concurrencies={environment.student_latency_test_concurrencies}
+                    selected={selectedIds.has(student.student_model_id)}
+                    onToggleSelected={() => toggleSelected(student.student_model_id)}
+                    benchmarkStage={stage?.stage ?? null}
+                    benchmarkStartupBudgetS={environment.nim_startup_timeout_s}
+                    benchmarkElapsedMs={stage?.elapsedMs ?? 0}
+                    benchmarkConcurrency={stage?.concurrency ?? null}
+                    benchmarkEvalProgress={stage?.evalProgress ?? null}
+                    busy={busy && activeBenchmarkId !== student.student_model_id}
+                    benchmarkError={
+                      benchmarkErrorByStudentId[student.student_model_id] ?? null
+                    }
+                    onBenchmark={() => enqueueBenchmark([student.student_model_id])}
+                    singleGpuHost={singleGpuHost}
+                  />
+                );
+              })}
+            </div>
+          </TrainingRunGroup>
         );
       })}
 
-      {failedVariants.map((v) => (
-        <QualityFailedVariantCard
-          key={v.student_model_id}
-          projectId={projectId}
-          student={v}
-          baseModelLabel={
-            friendlyLabelByModelConfigId[v.student_base_model_config_id] ??
-            v.student_base_model_config_id
-          }
-        />
-      ))}
-
       {chartOpen && chartData && (
         <div ref={chartRef}>
+          {chartContextWarning && (
+            <div
+              className="glass-card glass-card--static px-4 py-3 mb-3"
+              data-testid="chart-context-warning"
+              role="note"
+            >
+              <Text kind="body/regular/xs" style={{ color: "var(--warning-amber)" }}>
+                {chartContextWarning}
+              </Text>
+            </div>
+          )}
           <GroupedBarChart
             title={chartData.title}
             groups={chartData.groups}

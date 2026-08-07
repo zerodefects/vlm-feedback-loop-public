@@ -26,9 +26,9 @@ scheme adds a ``quantize → evaluate`` job pair to the chain after the
 baseline ``train → evaluate``. Empty list = baseline only.
 
 Base model selection (``--base-model``): chooses ``2b`` (default) or ``8b``
-Cosmos Reason 2 base. Provisioning patches BOTH ModelConfigs the first
-time it runs in a given project so subsequent invocations on the same
-project don't need to re-provision.
+Cosmos Reason 2 base. Provisioning resolves and patches only the Reason2
+bases required by the current invocation; later 2B/8B invocations remain
+idempotent.
 
 Schema is a single core enum ``gesture ∈ {rock, paper, scissors}``.
 
@@ -124,6 +124,21 @@ BASE_MODEL_NAMES: dict[str, str] = {
     "2b": MODEL_NAME_2B,
     "8b": MODEL_NAME_8B,
 }
+
+
+def _provisioning_target_model_names(
+    base_model: str, *, project_id: str | None
+) -> list[str]:
+    """Return only the Reason2 bases required by this harness invocation.
+
+    Fresh project assembly uses the 2B base experiment while seeding both
+    ModelConfigs, so a fresh 8B run needs both Reason2 bases. Reusing an
+    existing project needs only the selected base.
+    """
+    selected = BASE_MODEL_NAMES[base_model]
+    if project_id is None and selected != MODEL_NAME_2B:
+        return [MODEL_NAME_2B, selected]
+    return [selected]
 
 
 def _load_rps(rps_root: Path) -> dict[str, list[Path]]:
@@ -1143,10 +1158,9 @@ async def _amain() -> int:
 
     await probe_and_confirm_workspace(settings)
 
-    # Provisioning gives us {model_name: base_experiment_uuid} for both
-    # 2B and 8B. Build path uses the 2B UUID for its single in-line patch;
-    # _patch_modelconfigs_with_base_experiments() re-applies the dict to
-    # patch both ModelConfigs (idempotent).
+    # Provision only the Reason2 bases required by this invocation. Fresh 8B
+    # project assembly also needs 2B; existing-project 8B mode does not.
+    # Neither path implicitly pulls the optional Cosmos 3 roster.
     uuid_by_model_name: dict[str, str] = {}
     base_experiment_id_2b: str | None = None
 
@@ -1159,7 +1173,13 @@ async def _amain() -> int:
         hf_token = os.environ.get("HF_TOKEN") or os.environ.get(
             "HUGGING_FACE_HUB_TOKEN"
         )
-        prov = await provision_base_experiments(settings, hf_token=hf_token)
+        prov = await provision_base_experiments(
+            settings,
+            target_model_names=_provisioning_target_model_names(
+                args.base_model, project_id=args.project_id
+            ),
+            hf_token=hf_token,
+        )
         print(
             f"  registered={prov.registered}  "
             f"already_registered={prov.already_registered}  "

@@ -11,6 +11,7 @@
  */
 
 import { Button, Text } from "@kui/react";
+import { useId } from "react";
 
 export type MetricSelection =
   | "match_rate"
@@ -53,6 +54,8 @@ export function CompareScopeBar({
   onBenchmarkSelected,
   busy,
 }: CompareScopeBarProps) {
+  const metricLabelId = useId();
+
   return (
     // p-4 (not the p-6 content-card inset): this is a toolbar strip, not
     // a content card — the tighter padding keeps it reading as chrome.
@@ -61,11 +64,16 @@ export function CompareScopeBar({
       data-testid="compare-scope-bar"
     >
       <div className="flex items-center gap-2">
-        <Text kind="label/regular/xs" style={{ color: "var(--text-muted)" }}>
+        <Text
+          id={metricLabelId}
+          kind="label/regular/xs"
+          style={{ color: "var(--text-muted)" }}
+        >
           Per-field metric:
         </Text>
         <select
           className="glass-input px-3 py-1.5 text-sm"
+          aria-labelledby={metricLabelId}
           value={metricSelection}
           onChange={(e) => onMetricChange(e.target.value as MetricSelection)}
           data-testid="compare-metric-select"
@@ -85,7 +93,7 @@ export function CompareScopeBar({
           disabled={busy || unbenchmarkedCount === 0}
           data-testid="benchmark-all-button"
         >
-          Benchmark All
+          Benchmark All ({unbenchmarkedCount})
         </Button>
         <Button
           kind="secondary"

@@ -15,7 +15,7 @@
  * domains (Training, Batch Run, etc.) share the same semantic colors.
  */
 
-import type { TAOJobStatus } from "@/types/training";
+import type { TAOJobOutputsFetchStatus, TAOJobStatus } from "@/types/training";
 import type { Tone } from "@/lib/tone";
 
 export interface StatusDisplay {
@@ -43,6 +43,13 @@ const TABLE: Readonly<Record<TAOJobStatus, StatusDisplay>> = {
   deleted: { label: "Deleted", tone: "subdued", spinner: false },
 };
 
+const AUTO_SKIP_REASON_PREFIX = "auto-skip:";
+
+/** True when a canceled TAO job was deliberately omitted by chain policy. */
+export function isAutoSkippedReason(reason: string | null | undefined): boolean {
+  return (reason ?? "").startsWith(AUTO_SKIP_REASON_PREFIX);
+}
+
 /**
  * Resolve the visible badge representation for a TAOJob.
  *
@@ -54,9 +61,22 @@ const TABLE: Readonly<Record<TAOJobStatus, StatusDisplay>> = {
 export function statusDisplay(
   status: TAOJobStatus,
   chainHaltedReason: string | null | undefined,
+  outputsFetchStatus?: TAOJobOutputsFetchStatus | null,
 ): StatusDisplay {
+  if (status === "canceled" && isAutoSkippedReason(chainHaltedReason)) {
+    return { label: "Not Required", tone: "info", spinner: false };
+  }
   if (status === "failed" && chainHaltedReason) {
     return { label: "Halted", tone: "warning", spinner: false };
+  }
+  if (status === "succeeded" && outputsFetchStatus === "failed") {
+    return { label: "Artifact Failed", tone: "error", spinner: false };
+  }
+  if (
+    status === "succeeded" &&
+    (outputsFetchStatus === "pending" || outputsFetchStatus === "in_progress")
+  ) {
+    return { label: "Finalizing", tone: "info", spinner: true };
   }
   return TABLE[status];
 }

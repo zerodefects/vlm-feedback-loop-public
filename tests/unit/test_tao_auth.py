@@ -33,11 +33,9 @@ def _settings_with(tmp_path: Path, tao_api_key: str, **overrides: Any) -> Settin
 
 
 @pytest.fixture(autouse=True)
-def _reset_cache() -> None:
+def _reset_cache(monkeypatch) -> None:
     """Clear the module-level JWT cache before every test."""
-    tao_auth.reset_tao_bearer_cache()
-    yield
-    tao_auth.reset_tao_bearer_cache()
+    monkeypatch.setattr(tao_auth, "_token_cache", {})
 
 
 class _LoginRecorder:

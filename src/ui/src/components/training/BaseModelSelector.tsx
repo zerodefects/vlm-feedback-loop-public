@@ -69,7 +69,7 @@ export function BaseModelSelector({
                 style={{ color: "var(--text-muted)" }}
                 data-testid={`base-model-first-run-${opt.modelConfigId}`}
               >
-                Provisioned in Training Jobs
+                Will be provisioned in Training Jobs
               </Text>
             )}
           </label>

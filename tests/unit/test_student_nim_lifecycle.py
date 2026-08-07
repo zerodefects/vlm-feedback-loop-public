@@ -14,7 +14,8 @@ Covers the base sequence, with adjacent behaviors tested elsewhere:
     test_local_nim_deploy_generator.py.
   - Variant timeout mid-sweep: covered in
     test_lifecycle_benchmark_sweep.py.
-  - genai-perf fallback: covered in test_benchmark_adapter.py.
+  - Pinned AIPerf parsing and failure behavior: covered in
+    test_benchmark_adapter.py.
 
 The lifecycle has many side-effecting collaborators
 (``deploy_local_nim``, ``stop_local_nim``, ``start_evaluation_run``,
@@ -40,6 +41,9 @@ from vlm_feedback_loop.db.models.run import RunRecord
 from vlm_feedback_loop.db.models.student_model import StudentModel
 from vlm_feedback_loop.services import student_nim_lifecycle as lifecycle
 from vlm_feedback_loop.services.benchmark_adapter import BenchmarkResult
+from vlm_feedback_loop.services.serving_benchmark_workload import (
+    ServingBenchmarkWorkload,
+)
 
 # ── Fixtures + helpers ────────────────────────────────────────────────────────
 
@@ -183,15 +187,19 @@ class _StubAdapter:
             latency_p50_ms=10.0,
             latency_p90_ms=20.0,
             latency_p99_ms=30.0,
+            request_throughput_rps=25.0,
             ttft_p50_ms=None,
             ttft_p90_ms=None,
             itl_p50_ms=None,
             itl_p90_ms=None,
-            request_count=100,
+            request_count=kwargs["request_count"],
             error_count=self._error_count,
             prometheus={},
             artifact_dir="/tmp/bench",
             driver=self.driver_name,
+            status="failed" if self._error_count else "passed",
+            failed=bool(self._error_count),
+            failure_reason="request_failure" if self._error_count else None,
         )
 
 
@@ -207,7 +215,7 @@ class _CapturingSSE:
 
 
 @pytest.fixture()
-def patched_lifecycle(monkeypatch):
+def patched_lifecycle(monkeypatch, tmp_path):
     """Patch all external collaborators of the lifecycle module."""
     sse = _CapturingSSE()
     state = {
@@ -222,6 +230,7 @@ def patched_lifecycle(monkeypatch):
         "stop_called": [],
         "ar_calls": [],
         "scrape_calls": [],
+        "preflight_calls": [],
         "deploy_calls": [],  # captures kwargs passed to deploy_local_nim
         "displaced_returned": [],  # seeds rows the fake "displaces"
         "restore_calls": [],  # captures _restore_displaced_deployment invocations
@@ -231,6 +240,7 @@ def patched_lifecycle(monkeypatch):
         return explicit_gpu or "device=0"
 
     async def _fake_preflight(**kwargs):
+        state["preflight_calls"].append(kwargs)
         return state["preflight"]
 
     async def _fake_deploy(**kwargs):
@@ -325,6 +335,21 @@ def patched_lifecycle(monkeypatch):
             "gpu_cache_usage_perc": 0.5,
         }
 
+    async def _fake_workload(**kwargs):
+        temp_dir = tmp_path / "benchmark-payload"
+        temp_dir.mkdir(exist_ok=True)
+        input_file = temp_dir / "requests.jsonl"
+        input_file.write_text("{}\n")
+        artifact_root = tmp_path / "benchmark-artifacts"
+        artifact_root.mkdir(exist_ok=True)
+        return ServingBenchmarkWorkload(
+            input_file=input_file,
+            artifact_root=artifact_root,
+            temporary_dir=temp_dir,
+            request_count=100,
+            manifest={"version": "test", "selected_count": 100},
+        )
+
     def _fake_action_request(*args, **kwargs):
         state["ar_calls"].append((args, kwargs))
         return {"rendered_text": "ar"}
@@ -357,6 +382,7 @@ def patched_lifecycle(monkeypatch):
     monkeypatch.setattr(lifecycle, "_register_temp_endpoint", _fake_register)
     monkeypatch.setattr(lifecycle, "_run_evaluation_phase", _fake_run_evaluation)
     monkeypatch.setattr(lifecycle, "scrape_prometheus", _fake_scrape)
+    monkeypatch.setattr(lifecycle, "build_serving_benchmark_workload", _fake_workload)
     monkeypatch.setattr(lifecycle, "generate_action_request", _fake_action_request)
 
     return state, sse
@@ -366,6 +392,98 @@ def patched_lifecycle(monkeypatch):
 
 
 class TestLocalHappyPath:
+    def test_shared_image_student_preflight_omits_base_profile_for_checkpoint(
+        self, test_app_client, patched_lifecycle
+    ):
+        """A Nano Student probes its mounted weights, not the bundled base profile."""
+
+        from vlm_feedback_loop.db.models.model_config import ModelConfig
+        from vlm_feedback_loop.services.project_service import get_project_engine
+
+        state, _sse = patched_lifecycle
+        state["deploy_status"] = "running"
+        pid, sid, settings = _make_project_and_student(test_app_client)
+        engine = get_project_engine(pid, settings.WORKSPACE_ROOT)
+        with Session(engine) as session:
+            student = session.get(StudentModel, sid)
+            base = session.get(ModelConfig, student.student_base_model_config_id)
+            base.model_name = "nvidia/cosmos3-nano-reasoner"
+            base.local_deploy_metadata = {
+                **(base.local_deploy_metadata or {}),
+                "nim_container_image": "nvcr.io/nim/nvidia/cosmos3-reasoner:1.7.0",
+                "nim_model_size": "nano",
+                "nim_model_profile": "nano-base-profile",
+            }
+            session.commit()
+
+        asyncio.run(
+            lifecycle.run_student_deployment_lifecycle(
+                project_id=pid,
+                student_model_id=sid,
+                mode="local",
+                nim_endpoint_url=None,
+                nim_container_image=None,
+                nim_release_version=None,
+                gpu_assignment=None,
+                auth_mode="none",
+                settings=settings,
+                workspace_root=settings.WORKSPACE_ROOT,
+                benchmark_adapter=_StubAdapter(),
+            )
+        )
+
+        assert state["preflight_calls"][0]["nim_model_size"] == "nano"
+        assert state["preflight_calls"][0]["nim_model_profile"] is None
+        assert (
+            state["preflight_calls"][0]["nim_served_model_name"]
+            == "nvidia/cosmos3-nano-reasoner"
+        )
+
+    def test_shared_image_student_preflight_uses_super_selector(
+        self, test_app_client, patched_lifecycle
+    ):
+        """A Super Student must probe the Super profile, not image-default Nano."""
+        from vlm_feedback_loop.db.models.model_config import ModelConfig
+        from vlm_feedback_loop.services.project_service import get_project_engine
+
+        state, _sse = patched_lifecycle
+        state["deploy_status"] = "running"
+        pid, sid, settings = _make_project_and_student(test_app_client)
+        engine = get_project_engine(pid, settings.WORKSPACE_ROOT)
+        with Session(engine) as session:
+            student = session.get(StudentModel, sid)
+            base = session.get(ModelConfig, student.student_base_model_config_id)
+            base.model_name = "nvidia/cosmos3-super-reasoner"
+            base.local_deploy_metadata = {
+                **(base.local_deploy_metadata or {}),
+                "nim_model_size": "super",
+            }
+            session.commit()
+
+        asyncio.run(
+            lifecycle.run_student_deployment_lifecycle(
+                project_id=pid,
+                student_model_id=sid,
+                mode="local",
+                nim_endpoint_url=None,
+                nim_container_image=None,
+                nim_release_version=None,
+                gpu_assignment=None,
+                auth_mode="none",
+                settings=settings,
+                workspace_root=settings.WORKSPACE_ROOT,
+                benchmark_adapter=_StubAdapter(),
+            )
+        )
+
+        assert state["preflight_calls"][0]["nim_model_size"] == "super"
+        assert state["preflight_calls"][0]["nim_model_profile"] is None
+        assert (
+            state["preflight_calls"][0]["nim_served_model_name"]
+            == "nvidia/cosmos3-super-reasoner"
+        )
+        assert state["deploy_calls"][0]["nim_served_model_name"].startswith("student-")
+
     def test_full_local_lifecycle_flips_serving_validated(
         self, test_app_client, patched_lifecycle
     ):
@@ -401,6 +519,7 @@ class TestLocalHappyPath:
             assert student.nim_endpoint_url == state["endpoint_url"]
             assert student.nim_container_id == "containerid"
             assert student.nim_preflight_status == "passed"
+            assert student.nim_vlm_release_version == "1.6.0"
 
         # SSE stage progression — every documented stage emitted in order.
         progress_stages = [
@@ -567,6 +686,77 @@ class TestNimEvalQualityPromotion:
                             "stack trace ... "
                             "vllm/model_executor/layers/vocab_parallel_embedding.py "
                             "AssertionError"
+                        ),
+                    },
+                )
+            )
+            session.commit()
+
+        asyncio.run(
+            lifecycle.run_student_deployment_lifecycle(
+                project_id=pid,
+                student_model_id=sid,
+                mode="local",
+                nim_endpoint_url=None,
+                nim_container_image=None,
+                nim_release_version=None,
+                gpu_assignment=None,
+                auth_mode="none",
+                settings=settings,
+                workspace_root=settings.WORKSPACE_ROOT,
+                benchmark_adapter=_StubAdapter(),
+            )
+        )
+
+        with Session(engine) as session:
+            student = session.get(StudentModel, sid)
+            assert student.quality_status == "validated"
+            assert student.quality_evaluation_run_id == "run-id"
+            assert student.serving_status == "validated"
+
+    def test_quantized_student_classifies_its_quantize_evaluate_failure(
+        self, test_app_client, patched_lifecycle
+    ):
+        """A quantized Student's failed evaluate is parented by ``quantize``.
+
+        The NIM fallback must classify that exact artifact lineage rather than
+        the baseline evaluate parented by ``train``; otherwise a clean FP8 NIM
+        evaluation remains incorrectly quality-failed.
+        """
+        from vlm_feedback_loop.db.models.tao_job import TAOJob
+        from vlm_feedback_loop.services.project_service import get_project_engine
+
+        state, _sse = patched_lifecycle
+        state["deploy_status"] = "running"
+        pid, sid, settings = _make_project_and_student(test_app_client)
+
+        engine = get_project_engine(pid, settings.WORKSPACE_ROOT)
+        with Session(engine) as session:
+            student = session.get(StudentModel, sid)
+            student.quality_status = "failed"
+            student.quality_evaluation_run_id = None
+            student.tao_job_id = "train-tao-job-id"
+            student.quantize_tao_job_id = "quantize-tao-job-id"
+            session.add(
+                TAOJob(
+                    tao_job_id="quantized-eval-tao-job-id",
+                    project_id=pid,
+                    student_base_model_config_id=student.student_base_model_config_id,
+                    parent_tao_job_id="quantize-tao-job-id",
+                    action="evaluate",
+                    chain_id="chain-1",
+                    chain_sequence=4,
+                    training_backend="cosmos_rl_tao_vlm",
+                    dataset_export_ids=[],
+                    job_config={},
+                    tao_create_job_request={},
+                    status="failed",
+                    tao_status_raw="Error",
+                    tao_external_job_id="external-quantized-eval-id",
+                    completed_at=utc_now(),
+                    outputs={
+                        "tao_logs_text": (
+                            "RuntimeError while loading Qwen3VLForConditionalGeneration"
                         ),
                     },
                 )
@@ -946,8 +1136,8 @@ class TestExternalMode:
             assert student.serving_evaluation_run_id == "run-id"
             assert student.nim_endpoint_url == "https://student.example/v1"
 
-        # No local stages emitted — only register, evaluate, and the
-        # final completed event.
+        # No local orchestration stages emitted. External endpoints still run
+        # the same production serving workload before validation.
         progress_stages = [
             data["stage"]
             for (_, etype, data) in sse.events
@@ -955,14 +1145,52 @@ class TestExternalMode:
         ]
         assert "preflight" not in progress_stages
         assert "docker_run" not in progress_stages
-        assert "benchmark" not in progress_stages
+        assert "benchmark" in progress_stages
         assert "registering_endpoint" in progress_stages
         assert "evaluation" in progress_stages
 
-        # Adapter never called in external mode — the Compare & Benchmark
-        # UI owns benchmarking for external endpoints.
-        assert not adapter.calls
+        assert len(adapter.calls) == len(settings.STUDENT_LATENCY_TEST_CONCURRENCIES)
         # No container stop call (we never started one).
+        assert not state["stop_called"]
+
+    def test_workload_build_failure_is_a_benchmark_failure(
+        self, test_app_client, patched_lifecycle, monkeypatch
+    ):
+        state, _sse = patched_lifecycle
+        pid, sid, settings = _make_project_and_student(test_app_client)
+
+        async def _fail_workload(**_kwargs):
+            raise RuntimeError("test pool image unavailable")
+
+        monkeypatch.setattr(
+            lifecycle, "build_serving_benchmark_workload", _fail_workload
+        )
+        adapter = _StubAdapter()
+        asyncio.run(
+            lifecycle.run_student_deployment_lifecycle(
+                project_id=pid,
+                student_model_id=sid,
+                mode="external",
+                nim_endpoint_url="https://student.example/v1",
+                nim_container_image=None,
+                nim_release_version=None,
+                gpu_assignment=None,
+                auth_mode="none",
+                settings=settings,
+                workspace_root=settings.WORKSPACE_ROOT,
+                benchmark_adapter=adapter,
+            )
+        )
+
+        from vlm_feedback_loop.services.project_service import get_project_engine
+
+        engine = get_project_engine(pid, settings.WORKSPACE_ROOT)
+        with Session(engine) as session:
+            student = session.get(StudentModel, sid)
+            assert student.serving_status == "failed"
+            assert student.nim_preflight_details["failure_stage"] == "benchmark_failed"
+            assert "RuntimeError" in student.nim_preflight_details["error_detail"]
+        assert adapter.calls == []
         assert not state["stop_called"]
 
 
@@ -1432,6 +1660,8 @@ class TestEvaluationPhaseDeploymentParity:
             base_max_images_per_request=5,
             dataset_export_ids=[],
             guidance_id="guid-1",
+            tao_job_id="train-1",
+            quantize_tao_job_id=None,
         )
         run_id, run, err = await lifecycle._run_evaluation_phase(
             snapshot, str(tmp_path), make_stub_settings(), "mc-target"
@@ -1439,6 +1669,74 @@ class TestEvaluationPhaseDeploymentParity:
         assert err == "error: stop here"
         assert captured["icl_mode"] == "disabled"
         assert captured["visual_budget_preset_key"] == "native"
+
+    @pytest.mark.asyncio
+    async def test_student_eval_uses_paired_held_out_export_checksum(
+        self, test_app_client, monkeypatch
+    ):
+        """Serving evaluation provenance follows the evaluate job because a
+        Student's own export IDs correctly contain training data only.
+        """
+        from vlm_feedback_loop.db.models.dataset_export import DatasetExport
+        from vlm_feedback_loop.db.models.tao_job import TAOJob
+        from vlm_feedback_loop.services.project_service import get_project_engine
+
+        pid, sid, settings = _make_project_and_student(test_app_client)
+        engine = get_project_engine(pid, settings.WORKSPACE_ROOT)
+        with Session(engine) as session:
+            student = session.get(StudentModel, sid)
+            assert student is not None
+            evaluation_export_id = generate_uuid4()
+            session.add(
+                DatasetExport(
+                    dataset_export_id=evaluation_export_id,
+                    project_id=pid,
+                    dataset_intent="evaluation",
+                    export_field_mode="core_only",
+                    guidance_id="g-1",
+                    label_tier_filter="verified",
+                    selection_definition_snapshot={},
+                    artifact_refs={"checksum_sha256": "held-out-sha"},
+                    manifest_ref="evaluation-manifest",
+                    example_count=20,
+                )
+            )
+            session.add(
+                TAOJob(
+                    tao_job_id=generate_uuid4(),
+                    project_id=pid,
+                    student_base_model_config_id=(student.student_base_model_config_id),
+                    dataset_export_ids=[evaluation_export_id],
+                    action="evaluate",
+                    status="succeeded",
+                    training_backend="cosmos_rl_tao_vlm",
+                    job_config={},
+                    tao_create_job_request={},
+                    parent_tao_job_id=student.tao_job_id,
+                    chain_sequence=2,
+                )
+            )
+            session.commit()
+
+        captured: dict[str, Any] = {}
+
+        async def fake_start_evaluation_run(project_id, **kwargs):
+            captured.update(kwargs, project_id=project_id)
+            return "error: stop here"
+
+        monkeypatch.setattr(
+            lifecycle, "start_evaluation_run", fake_start_evaluation_run
+        )
+        snapshot = lifecycle._load_student_snapshot(pid, sid, settings.WORKSPACE_ROOT)
+        assert snapshot is not None
+        _, _, err = await lifecycle._run_evaluation_phase(
+            snapshot,
+            settings.WORKSPACE_ROOT,
+            settings,
+            "mc-target",
+        )
+        assert err == "error: stop here"
+        assert captured["dataset_manifest_sha256"] == "held-out-sha"
 
 
 class TestWriteStudentStateLockRetry:

@@ -206,7 +206,21 @@ function createWrapper(initialPath = "/projects/test-pid/confirm-defaults") {
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={[initialPath]}>
+        <MemoryRouter
+          initialEntries={[
+            {
+              pathname: initialPath,
+              // Confirm Defaults is an onboarding transition, not a mature
+              // project deep link. Carry the same ephemeral chain state that
+              // NIMSetupGatePage now forwards in production.
+              state: {
+                activePath: "hosted",
+                cameFromAutoSkip: false,
+                localDeployQueued: [],
+              },
+            },
+          ]}
+        >
           <Routes>
             <Route path="/projects/:projectId" element={<ProjectSetupLayout />}>
               <Route path="setup" element={<div data-testid="setup-page">Setup</div>} />
@@ -271,6 +285,7 @@ describe("ConfirmDefaultsPage", () => {
     // but NOT kimi-k2-thinking (no image input)
     const user = userEvent.setup();
     const teacherTrigger = screen.getByTestId("teacher-select");
+    expect(screen.getByRole("combobox", { name: "Teacher" })).toBe(teacherTrigger);
     await user.click(teacherTrigger);
     const options = await screen.findAllByRole("option");
     const optionNames = options.map((o) => o.textContent);

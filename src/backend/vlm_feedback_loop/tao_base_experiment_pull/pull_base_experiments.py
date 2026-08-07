@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Out-of-process driver for self-service base-experiment provisioning.
+"""Packaged subprocess driver for self-service base-experiment provisioning.
 
 Standalone helper invoked as a subprocess by
 ``services.tao_base_experiment_provisioning_service``. Kept out of the
@@ -11,13 +11,10 @@ backend import path so the main FastAPI process does not pull in
 the rest of NVIDIA's PTM packaging tooling. Mirrors the contract of
 ``scripts/merge_lora.py``.
 
-Usage::
-
-    python scripts/pull_base_experiments.py \\
-        --csv  /tmp/.../pretrained_models.csv \\
-        --shared-folder-path /tmp/.../airgapped_stage
-
-    # Export PTM_API_KEY (and HF_TOKEN for gated repositories) first.
+Operators normally invoke this helper through
+``vlm-feedback-loop tao-pull-base-experiments``. It lives inside the backend
+package so source, container, and installed-wheel executions use the same
+resource.
 
 What it does
 ------------
@@ -45,12 +42,14 @@ This script is exercised end-to-end by
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NoReturn, cast
 
 
 def _redact_environment_secrets(text: str) -> str:
@@ -66,7 +65,7 @@ def _redact_environment_secrets(text: str) -> str:
     return redacted
 
 
-def _die(msg: str, code: int = 2) -> None:
+def _die(msg: str, code: int = 2) -> NoReturn:
     print(json.dumps({"error": _redact_environment_secrets(msg)}), file=sys.stderr)
     sys.exit(code)
 
@@ -75,15 +74,18 @@ def _locate_bundled_csv() -> Path:
     """Find the ``pretrained_models.csv`` shipped inside nvidia_tao_core."""
     try:
         # Imported here so help/validation runs do not require the lib.
-        import nvidia_tao_core.microservices as ms_pkg  # type: ignore
+        package = importlib.import_module("nvidia_tao_core.microservices")
     except ImportError as exc:
         _die(
             f"nvidia-tao-core is not installed ({exc}). "
             "Use the Blueprint provisioning command's default isolated helper, "
-            "or install scripts/pull_base_experiments_requirements.txt into an "
+            "or install the packaged TAO pull requirements into an "
             "operator-managed environment and pass --skip-install."
         )
-    bundled = Path(ms_pkg.__file__).parent / "pretrained_models.csv"
+    package_file = package.__file__
+    if package_file is None:
+        _die("nvidia_tao_core.microservices has no filesystem package path")
+    bundled = Path(package_file).parent / "pretrained_models.csv"
     if not bundled.is_file():
         _die(f"bundled pretrained_models.csv not found at {bundled}")
     return bundled
@@ -184,7 +186,8 @@ def main(argv: list[str] | None = None) -> int:
     except json.JSONDecodeError as exc:
         _die(f"ptm_metadatas.json malformed: {exc}")
 
-    registered = sorted(body.keys()) if isinstance(body, dict) else []
+    metadata = cast("dict[str, object]", body) if isinstance(body, dict) else {}
+    registered = sorted(metadata)
 
     print(json.dumps({"ptm_metadatas_path": str(metadatas), "registered": registered}))
     return 0

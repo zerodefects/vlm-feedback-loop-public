@@ -37,6 +37,7 @@ from conftest import (
 from vlm_feedback_loop.db.base import generate_uuid4, utc_now
 from vlm_feedback_loop.db.models.label import Label
 from vlm_feedback_loop.db.models.model_config import ModelConfig
+from vlm_feedback_loop.db.models.nim_endpoint import NimEndpoint
 from vlm_feedback_loop.db.models.operation import OperationRecord
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -183,6 +184,7 @@ class TestProposalEndpointResponseShape:
         assert kw["generation_preset_key"] == "explore"
         assert kw["thinking_on"] is False
         assert kw["visual_budget_preset_key"] == "fast"
+        assert kw["settings"] is settings
 
     @pytest.mark.asyncio
     async def test_proposal_forwards_adaptive_k_params(self, tmp_path: Path):
@@ -864,6 +866,36 @@ class TestErrorHandling:
         )
         assert isinstance(result, str)
         assert "not found" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_disabled_teacher_endpoint_is_not_invoked(self, tmp_path: Path):
+        """A reused host port must not bypass a disabled Teacher attachment."""
+        engine, pid, _gid, mcid, keys, settings = seed_proposal_project(tmp_path)
+        with Session(engine) as session:
+            model_config = session.get(ModelConfig, mcid)
+            assert model_config is not None
+            endpoint = session.get(NimEndpoint, model_config.endpoint_id)
+            assert endpoint is not None
+            endpoint.is_enabled = False
+            endpoint.last_probe_status = "unreachable"
+            session.commit()
+
+        invoke_mock = AsyncMock()
+        with patch(
+            "vlm_feedback_loop.services.proposal_service.invoke_teacher",
+            new=invoke_mock,
+        ):
+            from vlm_feedback_loop.services.proposal_service import create_proposal
+
+            result = await create_proposal(
+                pid,
+                example_key=keys[0],
+                settings=settings,
+            )
+
+        assert isinstance(result, str)
+        assert result.startswith("nim_unreachable:")
+        invoke_mock.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

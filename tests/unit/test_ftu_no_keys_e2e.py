@@ -83,18 +83,17 @@ def no_keys_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # env-var override applies (this test simulates a process that loaded
     # with VLM_FEEDBACK_LOOP_ENV_FILE set from the start).
     monkeypatch.setattr(cfg, "_active_env_file", None)
+    monkeypatch.setattr(runtime_secrets, "_runtime_overrides", {})
 
     app.dependency_overrides[get_current_settings] = lambda: settings
-    project_service.clear_engine_cache()
-    runtime_secrets.reset_overrides_for_testing()
+    project_service.close_project_resources()
 
     client = TestClient(app, raise_server_exceptions=False)
     try:
         yield client, settings, env_file
     finally:
         app.dependency_overrides.clear()
-        project_service.clear_engine_cache()
-        runtime_secrets.reset_overrides_for_testing()
+        project_service.close_project_resources()
         # The persist step calls init_settings() against the temp .env,
         # replacing the process-wide Settings singleton with one rooted in
         # this test's (soon-deleted) tmp dir — clear it so later tests in

@@ -71,6 +71,8 @@ def _sample_record() -> dict:
         "tao_external_job_id": "ext-42",
         "progress": None,
         "outputs": None,
+        "outputs_fetch_status": "pending",
+        "outputs_fetch_error_ref": None,
         "parent_tao_job_id": None,
         "chain_id": None,
         "chain_sequence": None,
@@ -105,6 +107,7 @@ class TestPostCreate:
         assert body["training_backend"] == "cosmos_rl_tao_vlm"
         assert body["training_policy_type"] == "sft"
         assert body["action"] == "train"
+        assert body["outputs_fetch_status"] == "pending"
 
     def test_mixed_export_field_mode_returns_400(self, test_app_client):
         with patch(f"{_SVC}.create_tao_job", new_callable=AsyncMock) as mock_create:
@@ -248,6 +251,16 @@ class TestList:
         assert resp.status_code == 422
         errors = resp.json()["detail"]
         assert any("limit" in err.get("loc", []) for err in errors), errors
+
+
+class TestRawArtifactDownload:
+    def test_route_is_not_exposed(self, test_app_client):
+        """Raw TAO outputs are internal; model delivery uses the NIM bundle."""
+        resp = test_app_client.get(
+            f"/v1/projects/{PID}/tao_jobs/{TID}/artifacts/checkpoint.bin"
+        )
+
+        assert resp.status_code == 404
 
 
 # ═══════════════════════════════════════════════════════════════════════════

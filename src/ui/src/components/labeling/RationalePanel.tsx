@@ -12,6 +12,7 @@
 
 import { Button, Spinner, Text } from "@kui/react";
 import { Sparkles, Check, AlertTriangle } from "lucide-react";
+import { useId } from "react";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -44,7 +45,19 @@ export function RationalePanel({
   regenerationError,
   disabled = false,
 }: RationalePanelProps) {
+  const textareaId = useId();
+  const helperId = useId();
+  const errorId = useId();
+
   if (state === "hidden") return null;
+
+  const helperVisible = state === "needs_review" || state === "ai_review_required";
+  const descriptionIds = [
+    helperVisible ? helperId : null,
+    regenerationError ? errorId : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <div
@@ -57,35 +70,37 @@ export function RationalePanel({
          (CONFIGURATION / AGENT PERFORMANCE). Title-case rendering reads as a
          body label rather than a section divider. */}
       <div className="flex items-center gap-2">
-        <Text
-          kind="label/regular/xs"
-          className="section-eyebrow"
-          style={{
-            color: "var(--text-secondary)",
-            letterSpacing: "0.08em",
-            textTransform: "uppercase",
-          }}
-        >
-          Rationale
-        </Text>
+        <label htmlFor={textareaId}>
+          <Text
+            kind="label/regular/xs"
+            className="section-eyebrow"
+            style={{
+              color: "var(--text-secondary)",
+              letterSpacing: "0.08em",
+              textTransform: "uppercase",
+            }}
+          >
+            Rationale
+          </Text>
+        </label>
         {state === "needs_review" && (
           <span className="glass-pill yellow" data-testid="rationale-state-badge">
-            <span className="text-xs">Needs review</span>
+            <Text kind="body/regular/xs">Needs review</Text>
           </span>
         )}
         {state === "edited" && (
           <span className="glass-pill green" data-testid="rationale-state-badge">
-            <span className="text-xs">Edited</span>
+            <Text kind="body/regular/xs">Edited</Text>
           </span>
         )}
         {state === "approved" && (
           <span className="glass-pill green" data-testid="rationale-state-badge">
-            <span className="text-xs">Approved</span>
+            <Text kind="body/regular/xs">Approved</Text>
           </span>
         )}
         {state === "ai_review_required" && (
           <span className="glass-pill yellow" data-testid="rationale-state-badge">
-            <span className="text-xs">AI-generated, review required</span>
+            <Text kind="body/regular/xs">AI-generated, review required</Text>
           </span>
         )}
       </div>
@@ -93,6 +108,7 @@ export function RationalePanel({
       {/* Needs review: helper text */}
       {state === "needs_review" && (
         <Text
+          id={helperId}
           kind="body/regular/sm"
           style={{ color: "var(--text-muted)" }}
           data-testid="rationale-helper"
@@ -104,6 +120,7 @@ export function RationalePanel({
       {/* AI review required: helper text */}
       {state === "ai_review_required" && (
         <Text
+          id={helperId}
           kind="body/regular/sm"
           style={{ color: "var(--text-muted)" }}
           data-testid="rationale-helper"
@@ -126,11 +143,13 @@ export function RationalePanel({
       ) : (
         /* Textarea — visible in all states except hidden and regenerating */
         <textarea
+          id={textareaId}
           className="glass-input w-full px-3 py-2 text-sm leading-relaxed"
           style={{ minHeight: 80, resize: "vertical" }}
           value={rationaleText}
           onChange={(e) => onRationaleTextChange(e.target.value)}
           disabled={disabled}
+          aria-describedby={descriptionIds || undefined}
           placeholder="Describe the visible evidence that supports this label..."
           data-testid="rationale-textarea"
         />
@@ -138,7 +157,12 @@ export function RationalePanel({
 
       {/* Regeneration error */}
       {regenerationError && (
-        <div className="flex items-center gap-2" data-testid="rationale-regen-error">
+        <div
+          id={errorId}
+          className="flex items-center gap-2"
+          role="alert"
+          data-testid="rationale-regen-error"
+        >
           <AlertTriangle size={14} className="text-error" />
           <Text kind="body/regular/sm" className="text-error">
             {regenerationError}

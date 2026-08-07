@@ -17,6 +17,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
 
 import { ApiError } from "@/api/client";
+import type { QuantizationScheme } from "@/types/training";
 import { StudentTrainingPage } from "../StudentTrainingPage";
 
 vi.mock("@/api/training", () => ({
@@ -38,7 +39,7 @@ vi.mock("@/api/nim", () => ({
   logActionRequestCopy: vi.fn().mockResolvedValue({ audit_event_id: "ae-1" }),
 }));
 
-vi.mock("@/pages/ProjectSetupLayout", () => ({
+vi.mock("@/pages/setup-context", () => ({
   useSetupContext: vi.fn(),
 }));
 
@@ -50,7 +51,7 @@ import {
   resolveTrainingPresets,
   runTrainingPreflight,
 } from "@/api/training";
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useSetupContext } from "@/pages/setup-context";
 
 const mockCreateSuite = createTrainingSuite as ReturnType<typeof vi.fn>;
 const mockListBases = listStudentBaseModelConfigs as ReturnType<typeof vi.fn>;
@@ -172,10 +173,19 @@ function preflight(includeAutoLabeled = true) {
         provisioning_required: false,
         remediation: null,
       },
+      {
+        check_name: "min_test_pool_size" as const,
+        passed: true,
+        message: "Test Pool has 48 held-out evaluation examples (need 48).",
+        model_config_id: null,
+        provisioning_required: false,
+        remediation: null,
+      },
     ],
     data_summary: {
       verified_training_count: 72,
       test_pool_count: 48,
+      required_test_pool_count: 48,
       auto_labeled_eligible_count: 341,
       auto_labeled_included_count: includeAutoLabeled ? 341 : 0,
       excluded_test_pool_count: 48,
@@ -201,8 +211,13 @@ beforeEach(() => {
   mockListBases.mockResolvedValue(BASES);
   mockResolvePresets.mockResolvedValue(RESOLVED_PRESETS);
   mockRunPreflight.mockImplementation(
-    (_projectId: string, _ids: string[], includeAutoLabeled: boolean) =>
-      Promise.resolve(preflight(includeAutoLabeled)),
+    (
+      _projectId: string,
+      _ids: string[],
+      includeAutoLabeled: boolean,
+      _enableLora: boolean,
+      _quantizationSchemes: QuantizationScheme[],
+    ) => Promise.resolve(preflight(includeAutoLabeled)),
   );
   mockCreateSuite.mockResolvedValue({
     training_suite_id: "ts-1",
@@ -261,6 +276,9 @@ describe("StudentTrainingPage", () => {
     expect(
       (screen.getByTestId("training-preset-select") as HTMLSelectElement).value,
     ).toBe("quick");
+    expect(screen.getByRole("combobox", { name: "Training intensity" })).toBe(
+      screen.getByTestId("training-preset-select"),
+    );
     expect(
       (screen.getByTestId("quant-checkbox-FP8_DYNAMIC") as HTMLInputElement).checked,
     ).toBe(true);
@@ -268,6 +286,8 @@ describe("StudentTrainingPage", () => {
       (screen.getByTestId("quant-checkbox-W4A16") as HTMLInputElement).checked,
     ).toBe(false);
     expect(screen.getByTestId("training-start")).toHaveTextContent("Review 4 jobs");
+    expect(screen.getByTestId("training-method-lora")).toHaveTextContent("LoRA");
+    expect(screen.queryByTestId("training-method-full-weight")).not.toBeInTheDocument();
   });
 
   it("makes the broad multi-model comparison an explicit advanced intent", async () => {
@@ -290,6 +310,34 @@ describe("StudentTrainingPage", () => {
       (screen.getByTestId("quant-checkbox-W4A16") as HTMLInputElement).checked,
     ).toBe(true);
     expect(screen.getByTestId("training-start")).toHaveTextContent("Review 12 jobs");
+  });
+
+  it("confirms selected bases in the same order sent to the backend", async () => {
+    renderPage();
+    await screen.findByText("Ready to create the training jobs");
+    fireEvent.click(screen.getByTestId("training-intent-compare"));
+
+    for (const modelId of ["mc-8b", "mc-2b"]) {
+      fireEvent.click(screen.getByTestId(`base-model-checkbox-${modelId}`));
+    }
+    fireEvent.click(screen.getByTestId("base-model-checkbox-mc-2b"));
+    fireEvent.click(screen.getByTestId("base-model-checkbox-mc-8b"));
+
+    await waitFor(() => expect(screen.getByTestId("training-start")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("training-start"));
+    expect(
+      await screen.findByTestId("training-confirmation-summary"),
+    ).toHaveTextContent("Cosmos Reason2 2B, Cosmos Reason2 8B");
+
+    fireEvent.click(screen.getByTestId("training-confirm-start"));
+    await waitFor(() =>
+      expect(mockCreateSuite).toHaveBeenCalledWith(
+        "pid-1",
+        expect.objectContaining({
+          student_base_model_config_ids: ["mc-2b", "mc-8b"],
+        }),
+      ),
+    );
   });
 
   it("renders backend-authoritative train, Test Pool, exclusion, and usable counts", async () => {
@@ -327,6 +375,7 @@ describe("StudentTrainingPage", () => {
       data_summary: {
         verified_training_count: 0,
         test_pool_count: 12,
+        required_test_pool_count: 12,
         auto_labeled_eligible_count: 0,
         auto_labeled_included_count: 0,
         excluded_test_pool_count: 12,
@@ -341,6 +390,39 @@ describe("StudentTrainingPage", () => {
     expect(screen.getByTestId("training-data-verified-count")).toHaveTextContent("0");
     expect(screen.getByTestId("training-data-test-pool-count")).toHaveTextContent("12");
     expect(screen.getByTestId("training-start")).toBeDisabled();
+  });
+
+  it("treats an undersized Test Pool as a data blocker, not TAO setup", async () => {
+    mockRunPreflight.mockResolvedValueOnce({
+      ...preflight(),
+      status: "failed",
+      checks: [
+        preflight().checks[0],
+        preflight().checks[1],
+        {
+          check_name: "min_test_pool_size",
+          passed: false,
+          message:
+            "Test Pool has 12 of 60 required held-out evaluation examples. Continue labeling to grow the pool.",
+          model_config_id: null,
+          provisioning_required: false,
+          remediation: null,
+        },
+      ],
+      data_summary: {
+        ...preflight().data_summary,
+        test_pool_count: 12,
+        required_test_pool_count: 60,
+        excluded_test_pool_count: 12,
+      },
+    });
+
+    renderPage();
+    expect(await screen.findByTestId("test-pool-minimum-warning")).toHaveTextContent(
+      "12 of 60 required",
+    );
+    expect(screen.getByTestId("training-start")).toBeDisabled();
+    expect(screen.queryByTestId("training-request-tao-setup")).not.toBeInTheDocument();
   });
 
   it("surfaces TAO setup as a structured Action Request", async () => {
@@ -411,13 +493,16 @@ describe("StudentTrainingPage", () => {
     expect(mockCreateSuite).not.toHaveBeenCalled();
     expect(await screen.findByText("Start 4 TAO jobs?")).toBeInTheDocument();
     expect(screen.getByTestId("training-confirmation-summary")).toHaveTextContent(
-      "Full precision + FP8_DYNAMIC",
+      "Full precision + FP8 Dynamic",
     );
     expect(screen.getByTestId("training-confirmation-summary")).toHaveTextContent(
       "413 usable · 48 held out",
     );
     expect(screen.getByTestId("training-confirmation-summary")).toHaveTextContent(
       "1 train · 1 baseline evaluate · 1 quantize · 1 quantized evaluate",
+    );
+    expect(screen.getByTestId("training-confirmation-summary")).toHaveTextContent(
+      "may incur compute, storage, and egress charges",
     );
 
     fireEvent.click(screen.getByTestId("training-confirm-start"));
@@ -428,6 +513,7 @@ describe("StudentTrainingPage", () => {
           student_base_model_config_ids: ["mc-2b"],
           training_preset: "quick",
           include_auto_labeled: true,
+          enable_lora: true,
           quantization_schemes: ["FP8_DYNAMIC"],
         }),
       ),
@@ -435,11 +521,113 @@ describe("StudentTrainingPage", () => {
     await screen.findByTestId("monitor-page");
   });
 
+  it("keeps the confirmation visibly locked while suite creation is pending", async () => {
+    let resolveSuite:
+      | ((value: Awaited<ReturnType<typeof createTrainingSuite>>) => void)
+      | undefined;
+    mockCreateSuite.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveSuite = resolve;
+        }),
+    );
+
+    renderPage();
+    await screen.findByText("Ready to create the training jobs");
+    fireEvent.click(screen.getByTestId("training-start"));
+    fireEvent.click(await screen.findByTestId("training-confirm-start"));
+
+    expect(screen.getByText("Start 4 TAO jobs?")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("training-confirm-start")).toHaveTextContent(
+        "Starting…",
+      ),
+    );
+    expect(screen.getByTestId("training-confirm-start")).toBeDisabled();
+    expect(screen.getByTestId("training-confirm-cancel")).toBeDisabled();
+
+    resolveSuite?.({
+      training_suite_id: "ts-pending",
+      project_id: "pid-1",
+      idempotency_key: "idem-pending",
+      guidance_id: "g-1",
+      training_preset: "quick",
+      export_field_mode: "all",
+      include_auto_labeled: true,
+      quantization_schemes: ["FP8_DYNAMIC"],
+      training_dataset_export_id: "de-train",
+      evaluation_dataset_export_id: "de-eval",
+      selected_student_base_model_config_ids: ["mc-2b"],
+      chain_ids_ordered: ["chain-2b"],
+      chains: [],
+      provisioning_run_id: null,
+      provisioning_model_names: [],
+      setup_error_ref: null,
+      status: "initialized",
+      created_at: "2026-07-29T00:00:00Z",
+      started_at: null,
+      completed_at: null,
+    });
+    await screen.findByTestId("monitor-page");
+  });
+
+  it("keeps the Training UI on the qualified LoRA path", async () => {
+    renderPage();
+    await screen.findByText("Ready to create the training jobs");
+
+    expect(screen.getByTestId("training-method-lora")).toHaveTextContent("LoRA");
+    expect(screen.queryByText("Full-weight")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("training-start"));
+    expect(
+      await screen.findByTestId("training-confirmation-summary"),
+    ).toHaveTextContent("LoRA");
+    fireEvent.click(screen.getByTestId("training-confirm-start"));
+    await waitFor(() =>
+      expect(mockCreateSuite).toHaveBeenCalledWith(
+        "pid-1",
+        expect.objectContaining({ enable_lora: true }),
+      ),
+    );
+  });
+
   it("shows a data-sufficiency warning without claiming a tiny run is production-ready", async () => {
     renderPage();
     const warning = await screen.findByTestId("small-training-data-warning");
     expect(warning).toHaveTextContent(/fewer than 150 Verified images/i);
     expect(warning).toHaveTextContent("not evidence of a production-quality model");
+  });
+
+  it("does not expose Cosmos 3 Super returned by the catalog API", async () => {
+    mockListBases.mockResolvedValueOnce({
+      items: [
+        ...BASES.items,
+        {
+          ...BASES.items[0],
+          model_config_id: "mc-super",
+          model_name: "nvidia/cosmos3-super-reasoner",
+          tao_base_experiment_id: "base-super",
+        },
+      ],
+      next_cursor: null,
+    });
+
+    renderPage();
+    await screen.findByText("Ready to create the training jobs");
+    expect(
+      screen.queryByTestId("base-model-checkbox-mc-super"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Cosmos 3 Super (Reasoner)")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("training-intent-compare"));
+    await waitFor(() =>
+      expect(mockRunPreflight).toHaveBeenLastCalledWith(
+        "pid-1",
+        ["mc-8b", "mc-2b"],
+        true,
+        true,
+        ["FP8_DYNAMIC", "W4A16"],
+      ),
+    );
   });
 
   it("turns a backend conflict into plain-language copy without raw status JSON", async () => {

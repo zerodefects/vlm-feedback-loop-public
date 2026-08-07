@@ -7,8 +7,9 @@ Covers: start / gate verification, config snapshot, input selection, background
 execution, circuit breaker, resume, cancel, get/list, SSE events, restart
 recovery, idempotency, and include_auto_labeled re-labeling.
 
-All inference calls are mocked via monkeypatch on ``_invoke_for_batch_label``.
-Gate checks are mocked via patch on ``compute_scaleup_gate``.
+Most orchestration tests mock ``_invoke_for_batch_label``. Persistence and
+restart tests mock the NIM/image boundaries so they exercise the real atomic
+operation and Label transaction. Gate checks mock ``compute_scaleup_gate``.
 """
 
 from __future__ import annotations
@@ -16,9 +17,11 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from conftest import (
@@ -40,6 +43,7 @@ from support import fake_nim_failure, fake_nim_success, fake_prepare_result
 from vlm_feedback_loop.db.base import generate_uuid4, utc_now
 from vlm_feedback_loop.db.models.example import Example
 from vlm_feedback_loop.db.models.label import Label
+from vlm_feedback_loop.db.models.model_config import ModelConfig
 from vlm_feedback_loop.db.models.operation import OperationRecord
 from vlm_feedback_loop.db.models.project import Project
 from vlm_feedback_loop.db.models.run import RunRecord
@@ -70,7 +74,14 @@ def _add_example(
     )
 
 
-def _add_auto_label(session, project_id, key, guidance_id=GID, run_id="old-run"):
+def _add_auto_label(
+    session,
+    project_id,
+    key,
+    guidance_id=GID,
+    run_id="old-run",
+    invocation_id=None,
+):
     session.add(
         Label(
             label_id=generate_uuid4(),
@@ -78,7 +89,7 @@ def _add_auto_label(session, project_id, key, guidance_id=GID, run_id="old-run")
             example_key=key,
             label_status="auto_labeled",
             guidance_id=guidance_id,
-            inference_invocation_id=generate_uuid4(),
+            inference_invocation_id=invocation_id or generate_uuid4(),
             label_json={"rationale_note": "old", "severity": "low", "damaged": False},
             labeled_at=utc_now(),
             batch_label_run_id=run_id,
@@ -234,6 +245,44 @@ class TestStart:
             assert run.status == "queued"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("project_field", "invalid_value", "error_fragment"),
+        [
+            (
+                "labeling_generation_preset_key",
+                "removed-generation-preset",
+                "invalid generation_preset_key",
+            ),
+            (
+                "visual_budget_preset_key",
+                "removed-visual-preset",
+                "invalid visual_budget_preset_key",
+            ),
+        ],
+    )
+    async def test_start_rejects_project_presets_missing_from_runtime_config(
+        self,
+        tmp_path,
+        project_field,
+        invalid_value,
+        error_fragment,
+    ):
+        """A stale project preset fails clearly before a run is created."""
+        engine, _, settings = _setup_batch_project(tmp_path)
+        with Session(engine) as session:
+            project = session.get(Project, PID)
+            assert project is not None
+            setattr(project, project_field, invalid_value)
+            session.commit()
+
+        result = await start_batch_label_run(PID, settings=settings)
+
+        assert isinstance(result, str)
+        assert error_fragment in result
+        with Session(engine) as session:
+            assert session.query(RunRecord).count() == 0
+
+    @pytest.mark.asyncio
     async def test_start_rejects_when_batch_run_already_active(self, tmp_path):
         """One batch run per project — a second start returns a 409 conflict.
 
@@ -341,6 +390,185 @@ class TestConfigSnapshot:
         assert result["thinking_mode_effective"] == "on"
         assert result["visual_budget_preset_key"] == "balanced"
         assert result["structured_generation_mode_effective"] == "auto"
+        with Session(engine) as s:
+            run = s.query(RunRecord).filter_by(run_id=result["run_id"]).one()
+            assert run.runtime_config_snapshot == {
+                "version": 2,
+                "project_id": PID,
+                "model_config_id": MCID,
+                "model_name": "test-model",
+                "endpoint_id": EID,
+                "endpoint_base_url": "https://test.nvidia.com/v1",
+                "endpoint_mode": "hosted",
+                "endpoint_auth_mode": "bearer",
+                "context_window_tokens": 256000,
+                "thinking_toggle_mode": "none",
+                "thinking_toggle_support": "unsupported",
+                "visual_budget_mode": "none",
+                "visual_budget_support": "unsupported",
+                "structured_generation_support": "supported",
+                "max_images_per_request": 5,
+                "default_icl_max_examples": None,
+                "inference_settings": {
+                    "generation_preset_key": "precise",
+                    "sampling_params": {"temperature": 0.0, "top_p": 1.0},
+                    "visual_budget_preset_key": "balanced",
+                    "visual_budget_params_effective": None,
+                    "base_output_tokens_floor": 256,
+                    "json_structural_overhead": 48,
+                    "max_output_fraction": 0.25,
+                    "rationale_note_estimate": 160,
+                    "default_unbounded_string_budget": 200,
+                    "model_reasoning_headroom_tokens": 16384,
+                    "runtime_prompt_output_max_tokens_override": None,
+                    "token_safety_margin": 0.85,
+                    "icl_max_examples": None,
+                    "icl_candidate_limit": None,
+                    "icl_sim_gap": 0.05,
+                    "icl_abs_threshold": None,
+                    "image_transport_max_longest_edge": 2090,
+                },
+            }
+
+    @pytest.mark.asyncio
+    async def test_delayed_execution_uses_frozen_semantic_settings(self, tmp_path):
+        """Restart-time Settings changes cannot alter a run's model request."""
+        engine, pdir, _ = _setup_batch_project(tmp_path, n_unlabeled=1)
+        with Session(engine) as session:
+            model_config = session.get(ModelConfig, MCID)
+            assert model_config is not None
+            model_config.visual_budget_mode = "mm_processor_pixels"
+            model_config.visual_budget_support = "supported"
+            session.commit()
+        start_settings = make_stub_settings(
+            WORKSPACE_ROOT=str(tmp_path / "workspace"),
+            LABELING_PRESETS={"precise": {"temperature": 0.11, "top_p": 0.88}},
+            VISUAL_BUDGET_PRESETS={
+                "balanced": {
+                    "mm_processor_pixels": {"images_kwargs": {"max_pixels": 1234}}
+                }
+            },
+            BASE_OUTPUT_TOKENS_FLOOR=333,
+            JSON_STRUCTURAL_OVERHEAD_TOKENS=44,
+            MAX_OUTPUT_FRACTION=0.2,
+            RATIONALE_NOTE_ESTIMATE_TOKENS=111,
+            DEFAULT_UNBOUNDED_STRING_BUDGET=222,
+            MODEL_REASONING_HEADROOM_TOKENS=4444,
+            RUNTIME_PROMPT_OUTPUT_MAX_TOKENS_OVERRIDE=555,
+            RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN=0.75,
+            ICL_MAX_EXAMPLES=3,
+            ICL_SIM_GAP=0.12,
+            ICL_ABS_THRESHOLD=0.34,
+            IMAGE_TRANSPORT_MAX_LONGEST_EDGE=1024,
+        )
+        with (
+            patch(_GATE_PATCH, side_effect=_mock_gate_ready),
+            patched_register(batch_label_service_module),
+        ):
+            created = await start_batch_label_run(PID, settings=start_settings)
+        assert not isinstance(created, str), created
+
+        resumed_settings = make_stub_settings(
+            WORKSPACE_ROOT=start_settings.WORKSPACE_ROOT,
+            LABELING_PRESETS={"precise": {"temperature": 0.91, "top_p": 0.18}},
+            VISUAL_BUDGET_PRESETS={
+                "balanced": {
+                    "mm_processor_pixels": {"images_kwargs": {"max_pixels": 9876}}
+                }
+            },
+            BASE_OUTPUT_TOKENS_FLOOR=999,
+            JSON_STRUCTURAL_OVERHEAD_TOKENS=99,
+            MAX_OUTPUT_FRACTION=0.9,
+            RATIONALE_NOTE_ESTIMATE_TOKENS=999,
+            DEFAULT_UNBOUNDED_STRING_BUDGET=999,
+            MODEL_REASONING_HEADROOM_TOKENS=9999,
+            RUNTIME_PROMPT_OUTPUT_MAX_TOKENS_OVERRIDE=999,
+            RUNTIME_PROMPT_TOKEN_SAFETY_MARGIN=0.95,
+            ICL_MAX_EXAMPLES=9,
+            ICL_SIM_GAP=0.9,
+            ICL_ABS_THRESHOLD=-0.9,
+            IMAGE_TRANSPORT_MAX_LONGEST_EDGE=4096,
+            HTTP_DEADLINE_BACKGROUND_S=77,
+            HTTP_MAX_RETRIES=1,
+            NVIDIA_API_KEY="rotated-secret",
+        )
+        with Session(engine) as session:
+            run = session.get(RunRecord, created["run_id"])
+            assert run is not None
+            run_config = batch_label_service_module.snapshot_run_config(
+                session,
+                PID,
+                run,
+                example_keys=["ex_000"],
+                settings=resumed_settings,
+            )
+        run_config["icl_mode"] = "enabled"
+
+        captured: dict[str, Any] = {}
+
+        async def fake_invoke_teacher(**kwargs):
+            from vlm_feedback_loop.services.prompt_service import (
+                TeacherInvocationResult,
+            )
+
+            captured.update(kwargs)
+            return TeacherInvocationResult(
+                inference_invocation_id=kwargs["inference_invocation_id"],
+                content=json.dumps(
+                    {
+                        "rationale_note": "test",
+                        "severity": "high",
+                        "damaged": True,
+                    }
+                ),
+                finish_reason="stop",
+                invocation_status="success",
+                latency_ms=1,
+                usage={},
+                icl_example_keys_used=[],
+                prompt_hash="frozen-settings",
+                structured_generation_attempted=False,
+                structured_generation_fallback_used=False,
+            )
+
+        with patch.object(
+            batch_label_service_module,
+            "invoke_teacher",
+            side_effect=fake_invoke_teacher,
+        ):
+            result = await batch_label_service_module._invoke_for_batch_label(
+                PID,
+                created["run_id"],
+                "ex_000",
+                run_config=run_config,
+                engine=engine,
+                settings=resumed_settings,
+            )
+
+        assert result.schema_valid_core is True
+        assert captured["labeling_presets"] == {
+            "precise": {"temperature": 0.11, "top_p": 0.88}
+        }
+        assert captured["visual_budget_presets"] == {
+            "balanced": {"mm_processor_pixels": {"images_kwargs": {"max_pixels": 1234}}}
+        }
+        assert captured["base_output_tokens_floor"] == 333
+        assert captured["json_structural_overhead"] == 44
+        assert captured["max_output_fraction"] == 0.2
+        assert captured["rationale_note_estimate"] == 111
+        assert captured["default_unbounded_string_budget"] == 222
+        assert captured["model_reasoning_headroom_tokens"] == 4444
+        assert captured["runtime_prompt_output_max_tokens_override"] == 555
+        assert captured["token_safety_margin"] == 0.75
+        assert captured["icl_max_examples"] == 3
+        assert captured["icl_sim_gap"] == 0.12
+        assert captured["icl_abs_threshold"] == 0.34
+        assert captured["image_transport_max_longest_edge"] == 1024
+        # Credentials and transport reliability remain live operational policy.
+        assert captured["auth_headers"] == {"Authorization": "Bearer rotated-secret"}
+        assert captured["deadline_s"] == 77.0
+        assert captured["max_retries"] == 1
+        assert captured["settings"] is resumed_settings
 
     @pytest.mark.asyncio
     async def test_structured_generation_mode_override(self, tmp_path):
@@ -430,6 +658,34 @@ class TestInputSelection:
         assert result["examples_total"] == 3
 
     @pytest.mark.asyncio
+    async def test_run_limit_selects_examples_in_ingestion_order(self, tmp_path):
+        engine, pdir = setup_project_db(tmp_path)
+        settings = make_stub_settings(WORKSPACE_ROOT=str(tmp_path / "workspace"))
+        with Session(engine) as s:
+            add_standard_project_row(s, PID, pdir)
+            add_fixture_guidance_row(s)
+            add_endpoint_and_model_rows(s)
+            _add_example(s, PID, "z-first", ingested_at="2026-01-01T00:00:00Z")
+            _add_example(s, PID, "a-second", ingested_at="2026-01-02T00:00:00Z")
+            _add_example(s, PID, "m-third", ingested_at="2026-01-03T00:00:00Z")
+            s.commit()
+
+        with (
+            patch(_GATE_PATCH, side_effect=_mock_gate_ready),
+            patched_register(batch_label_service_module),
+        ):
+            result = await start_batch_label_run(
+                PID,
+                run_limit=2,
+                settings=settings,
+            )
+
+        with Session(engine) as s:
+            run = s.get(RunRecord, result["run_id"])
+            assert run is not None
+            assert run.metrics["input_keys"] == ["z-first", "a-second"]
+
+    @pytest.mark.asyncio
     async def test_run_limit_from_settings(self, tmp_path):
         _setup_batch_project(tmp_path, n_unlabeled=10)
         settings = make_stub_settings(
@@ -442,6 +698,27 @@ class TestInputSelection:
         ):
             result = await start_batch_label_run(PID, settings=settings)
         assert result["examples_total"] == 4
+
+    @pytest.mark.asyncio
+    async def test_start_snapshots_circuit_breaker_threshold_for_paused_ui(
+        self, tmp_path
+    ):
+        """A paused screen reports the configured consecutive threshold, not
+        the run's aggregate lifetime error count."""
+        _setup_batch_project(tmp_path, n_unlabeled=3)
+        settings = make_stub_settings(
+            WORKSPACE_ROOT=str(tmp_path / "workspace"),
+            BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD=3,
+        )
+        with (
+            patch(_GATE_PATCH, side_effect=_mock_gate_ready),
+            patched_register(batch_label_service_module),
+        ):
+            created = await start_batch_label_run(PID, settings=settings)
+
+        detail = get_batch_label_run(PID, created["run_id"], settings=settings)
+        assert not isinstance(detail, str)
+        assert detail["circuit_breaker_threshold"] == 3
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -463,8 +740,11 @@ class TestExecution:
         run_id = generate_uuid4()
         keys = [f"ex_{i:03d}" for i in range(2)]
         _seed_bl_run(engine, run_id, keys)
+        invoke_count = 0
 
         async def _mock_invoke(pid, rid, ek, **kw):
+            nonlocal invoke_count
+            invoke_count += 1
             # Terminalize the run while this invocation is "in flight".
             _terminalize_run(engine, rid)
             return _make_batch_success(ek)
@@ -472,10 +752,14 @@ class TestExecution:
         with (
             patch(_INVOKE_PATCH, side_effect=_mock_invoke),
             patch(_SSE_PATCH) as mock_sse,
+            patch(_TR_SSE_PATCH) as mock_finalizer_sse,
         ):
             mock_sse.emit = AsyncMock()
+            mock_finalizer_sse.emit = AsyncMock()
             await _execute_batch_label(PID, run_id, settings)
 
+        assert invoke_count == 1
+        mock_finalizer_sse.emit.assert_not_awaited()
         with Session(engine) as s:
             labels = (
                 s.query(Label)
@@ -486,6 +770,48 @@ class TestExecution:
             run = s.query(RunRecord).filter_by(run_id=run_id).one()
             assert run.status == "failed"
             assert run.status_reason == "schema_evolution_canceled"
+            assert run.examples_succeeded == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "snapshot",
+        ["invalid_shape", "duplicate_keys", "wrong_total", "missing_example"],
+    )
+    async def test_invalid_input_snapshot_fails_before_dispatch(
+        self, tmp_path, snapshot
+    ):
+        """A malformed frozen input set never reaches the Teacher."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        metrics: dict = {"input_keys": ["ex_000"]}
+        examples_total = 1
+        if snapshot == "invalid_shape":
+            metrics["input_keys"] = "ex_000"
+        elif snapshot == "duplicate_keys":
+            metrics["input_keys"] = ["ex_000", "ex_000"]
+            examples_total = 2
+        elif snapshot == "wrong_total":
+            examples_total = 2
+        else:
+            metrics["input_keys"] = ["missing"]
+        _seed_bl_run(
+            engine,
+            run_id,
+            ["ex_000"],
+            examples_total=examples_total,
+            metrics=metrics,
+        )
+
+        invoke_mock = AsyncMock(return_value=_make_batch_success("ex_000"))
+        with patch(_INVOKE_PATCH, new=invoke_mock), patch(_SSE_PATCH) as mock_sse:
+            mock_sse.emit = AsyncMock()
+            await _execute_batch_label(PID, run_id, settings)
+
+        invoke_mock.assert_not_awaited()
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "failed"
+            assert run.status_reason == "unhandled_exception"
 
     @pytest.mark.asyncio
     async def test_run_snapshotted_under_retired_guidance_fails_at_claim(
@@ -545,13 +871,21 @@ class TestExecution:
         )
 
         async def _mock_invoke(pid, rid, ek, **kw):
-            # Terminalize mid-flight, then return the endpoint error that
-            # trips the breaker — the pause write follows the trip.
-            _terminalize_run(engine, rid)
             return _make_batch_failure(ek, "endpoint_error")
+
+        async def _terminalize_after_drain(*_args, **_kwargs):
+            # The breaker outcome has already committed. Terminalize at the
+            # next awaited seam so execution really reaches the pause CAS.
+            _terminalize_run(engine, run_id)
+            return False
 
         with (
             patch(_INVOKE_PATCH, side_effect=_mock_invoke),
+            patch.object(
+                batch_label_service_module,
+                "finalize_runtime_rejection",
+                side_effect=_terminalize_after_drain,
+            ),
             patch(_SSE_PATCH) as mock_sse,
         ):
             mock_sse.emit = AsyncMock()
@@ -1006,6 +1340,244 @@ class TestCircuitBreaker:
             assert run.status == "paused"
             assert run.examples_timeout == 3
 
+    @pytest.mark.asyncio
+    async def test_restart_uses_the_frozen_threshold(self, tmp_path):
+        """A settings change cannot alter an existing run's spend boundary."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=5)
+        settings = make_stub_settings(
+            WORKSPACE_ROOT=str(tmp_path / "workspace"),
+            BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD=10,
+        )
+        run_id = generate_uuid4()
+        keys = [f"ex_{i:03d}" for i in range(5)]
+        _seed_bl_run(
+            engine,
+            run_id,
+            keys,
+            metrics={
+                "input_keys": keys,
+                "circuit_breaker_threshold": 3,
+                "circuit_breaker_consecutive": 0,
+            },
+        )
+        invoke_mock = AsyncMock(
+            side_effect=lambda _pid, _rid, key, **_kwargs: _make_batch_failure(key)
+        )
+        with patch(_INVOKE_PATCH, new=invoke_mock), patch(_SSE_PATCH) as mock_sse:
+            mock_sse.emit = AsyncMock()
+            await _execute_batch_label(PID, run_id, settings)
+
+        assert invoke_mock.await_count == 3
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "paused"
+            assert run.examples_timeout == 3
+
+    @pytest.mark.asyncio
+    async def test_restart_preserves_the_endpoint_failure_streak(self, tmp_path):
+        """Automatic recovery continues, rather than resets, an outage streak."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=3)
+        settings = make_stub_settings(
+            WORKSPACE_ROOT=str(tmp_path / "workspace"),
+            BATCH_LABEL_CIRCUIT_BREAKER_THRESHOLD=10,
+        )
+        run_id = generate_uuid4()
+        keys = ["ex_000", "ex_001", "ex_002"]
+        _seed_bl_run(
+            engine,
+            run_id,
+            keys,
+            metrics={
+                "input_keys": keys,
+                "circuit_breaker_threshold": 3,
+                "circuit_breaker_consecutive": 2,
+            },
+        )
+        with Session(engine) as session:
+            for key in keys[:2]:
+                session.add(
+                    OperationRecord(
+                        inference_invocation_id=generate_uuid4(),
+                        project_id=PID,
+                        purpose="batch_label",
+                        example_key=key,
+                        guidance_id=GID,
+                        model_config_id=MCID,
+                        endpoint_id=EID,
+                        model_name="test-model",
+                        invocation_status="timeout",
+                        label_tier="auto_labeled",
+                        batch_label_run_id=run_id,
+                    )
+                )
+            session.commit()
+
+        invoke_mock = AsyncMock(return_value=_make_batch_failure("ex_002", "timeout"))
+        with patch(_INVOKE_PATCH, new=invoke_mock), patch(_SSE_PATCH) as mock_sse:
+            mock_sse.emit = AsyncMock()
+            await _execute_batch_label(PID, run_id, settings)
+
+        invoke_mock.assert_awaited_once()
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "paused"
+            assert run.examples_timeout == 3
+
+    @pytest.mark.asyncio
+    async def test_restart_preserves_a_tripped_breaker_after_streak_reset(
+        self, tmp_path
+    ):
+        """A drained success cannot erase an earlier durable breaker trip."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        _seed_bl_run(
+            engine,
+            run_id,
+            ["ex_000"],
+            metrics={
+                "input_keys": ["ex_000"],
+                "circuit_breaker_threshold": 3,
+                "circuit_breaker_consecutive": 0,
+                "circuit_breaker_tripped": True,
+            },
+        )
+
+        invoke_mock = AsyncMock(return_value=_make_batch_success("ex_000"))
+        with patch(_INVOKE_PATCH, new=invoke_mock), patch(_SSE_PATCH) as mock_sse:
+            mock_sse.emit = AsyncMock()
+            await _execute_batch_label(PID, run_id, settings)
+
+        invoke_mock.assert_not_awaited()
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "paused"
+            assert run.paused_reason == "circuit_breaker_threshold_reached"
+            assert run.metrics["circuit_breaker_consecutive"] == 0
+            assert run.metrics["circuit_breaker_tripped"] is True
+
+    @pytest.mark.asyncio
+    async def test_inflight_success_cannot_clear_a_tripped_breaker(self, tmp_path):
+        """Concurrent drain persists the latch even when the streak resets."""
+        engine, _pdir, _settings = _setup_batch_project_with_mode(
+            tmp_path, "self_hosted", n_unlabeled=2
+        )
+        settings = make_stub_settings(
+            WORKSPACE_ROOT=str(tmp_path / "workspace"),
+            BATCH_LABEL_CONCURRENCY_SELF_HOSTED=2,
+        )
+        run_id = generate_uuid4()
+        keys = ["ex_000", "ex_001"]
+        _seed_bl_run(
+            engine,
+            run_id,
+            keys,
+            metrics={
+                "input_keys": keys,
+                "circuit_breaker_threshold": 1,
+                "circuit_breaker_consecutive": 0,
+                "circuit_breaker_tripped": False,
+            },
+        )
+        success_started = asyncio.Event()
+        failure_committed = asyncio.Event()
+        real_commit = batch_label_service_module._commit_batch_result
+
+        async def _mock_invoke(_pid, _rid, key, **_kwargs):
+            if key == "ex_001":
+                success_started.set()
+                await failure_committed.wait()
+                return _make_batch_success(key)
+            await success_started.wait()
+            return _make_batch_failure(key, "endpoint_error")
+
+        def _commit_and_signal(*args, **kwargs):
+            disposition = real_commit(*args, **kwargs)
+            if args[3].example_key == "ex_000":
+                failure_committed.set()
+            return disposition
+
+        with (
+            patch(_INVOKE_PATCH, side_effect=_mock_invoke),
+            patch.object(
+                batch_label_service_module,
+                "_commit_batch_result",
+                side_effect=_commit_and_signal,
+            ),
+            patch(_SSE_PATCH) as mock_sse,
+        ):
+            mock_sse.emit = AsyncMock()
+            await _execute_batch_label(PID, run_id, settings)
+
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "paused"
+            assert run.examples_endpoint_error == 1
+            assert run.examples_succeeded == 1
+            assert run.metrics["circuit_breaker_consecutive"] == 0
+            assert run.metrics["circuit_breaker_tripped"] is True
+
+    @pytest.mark.asyncio
+    async def test_breaker_is_rechecked_after_foreground_hold(self, tmp_path):
+        """A lane released after another lane trips cannot start new spend."""
+        engine, _pdir, _settings = _setup_batch_project(tmp_path, n_unlabeled=2)
+        settings = make_stub_settings(
+            WORKSPACE_ROOT=str(tmp_path / "workspace"),
+            BATCH_LABEL_CONCURRENCY_HOSTED=2,
+        )
+        run_id = generate_uuid4()
+        keys = ["ex_000", "ex_001"]
+        _seed_bl_run(
+            engine,
+            run_id,
+            keys,
+            metrics={
+                "input_keys": keys,
+                "circuit_breaker_threshold": 1,
+                "circuit_breaker_consecutive": 0,
+            },
+        )
+        first_lane_waiting = asyncio.Event()
+        release_first_lane = asyncio.Event()
+        wait_count = 0
+
+        async def _wait_for_background():
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 1:
+                first_lane_waiting.set()
+                await release_first_lane.wait()
+
+        invoked: list[str] = []
+
+        async def _mock_invoke(_pid, _rid, key, **_kwargs):
+            invoked.append(key)
+            return _make_batch_failure(key, "timeout")
+
+        with (
+            patch.object(
+                batch_label_service_module.priority_dispatch,
+                "wait_for_background",
+                side_effect=_wait_for_background,
+            ),
+            patch(_INVOKE_PATCH, side_effect=_mock_invoke),
+            patch(_SSE_PATCH) as mock_sse,
+        ):
+            mock_sse.emit = AsyncMock()
+            executor = asyncio.create_task(_execute_batch_label(PID, run_id, settings))
+            await asyncio.wait_for(first_lane_waiting.wait(), timeout=2)
+            for _ in range(10):
+                if invoked:
+                    break
+                await asyncio.sleep(0)
+            release_first_lane.set()
+            await executor
+
+        assert invoked == ["ex_001"]
+        with Session(engine) as session:
+            assert session.query(RunRecord).filter_by(run_id=run_id).one().status == (
+                "paused"
+            )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Section F: Resume
@@ -1023,6 +1595,11 @@ class TestResume:
             ["ex_000", "ex_001", "ex_002"],
             status="paused",
             paused_reason="circuit_breaker_threshold_reached",
+            metrics={
+                "input_keys": ["ex_000", "ex_001", "ex_002"],
+                "circuit_breaker_threshold": 3,
+                "circuit_breaker_consecutive": 3,
+            },
         )
 
         with patched_register(batch_label_service_module) as mock_reg:
@@ -1034,6 +1611,99 @@ class TestResume:
         with Session(engine) as s:
             run = s.query(RunRecord).filter_by(run_id=run_id).first()
             assert run.paused_reason is None
+            assert run.metrics["circuit_breaker_consecutive"] == 0
+
+    @pytest.mark.asyncio
+    async def test_resume_joins_the_still_finishing_owner_before_dispatch(
+        self, tmp_path
+    ):
+        """The paused-to-queued handoff cannot strand behind the old task ID."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        task_id = f"batch-label-{run_id}"
+        _seed_bl_run(
+            engine,
+            run_id,
+            ["ex_000"],
+            status="paused",
+            paused_reason="circuit_breaker_threshold_reached",
+            metrics={
+                "input_keys": ["ex_000"],
+                "circuit_breaker_threshold": 1,
+                "circuit_breaker_consecutive": 1,
+            },
+        )
+        old_owner_started = asyncio.Event()
+        old_owner_finished = asyncio.Event()
+        hold_old_owner = asyncio.Event()
+
+        async def _old_owner():
+            old_owner_started.set()
+            try:
+                await hold_old_owner.wait()
+            finally:
+                old_owner_finished.set()
+
+        batch_label_service_module.background_manager.register(task_id, _old_owner())
+        await asyncio.wait_for(old_owner_started.wait(), timeout=2)
+        invoke_mock = AsyncMock(return_value=_make_batch_success("ex_000"))
+        try:
+            with patch(_INVOKE_PATCH, new=invoke_mock), patch(_SSE_PATCH) as mock_sse:
+                mock_sse.emit = AsyncMock()
+                result = await resume_batch_label_run(PID, run_id, settings=settings)
+                assert not isinstance(result, str), result
+                for _ in range(200):
+                    with Session(engine) as session:
+                        status = (
+                            session.query(RunRecord.status)
+                            .filter_by(run_id=run_id)
+                            .scalar()
+                        )
+                    if status in batch_label_service_module.TERMINAL_STATUSES:
+                        break
+                    await asyncio.sleep(0.01)
+        finally:
+            await batch_label_service_module.background_manager.cancel_task(task_id)
+
+        assert old_owner_finished.is_set()
+        invoke_mock.assert_awaited_once()
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "completed"
+            assert run.metrics["circuit_breaker_consecutive"] == 0
+
+    @pytest.mark.asyncio
+    async def test_resume_registration_failure_restores_paused_state(self, tmp_path):
+        """A scheduling failure leaves a retryable run and closes its coroutine."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        original_metrics = {
+            "input_keys": ["ex_000"],
+            "circuit_breaker_threshold": 2,
+            "circuit_breaker_consecutive": 2,
+        }
+        _seed_bl_run(
+            engine,
+            run_id,
+            ["ex_000"],
+            status="paused",
+            paused_reason="circuit_breaker_threshold_reached",
+            metrics=original_metrics,
+        )
+
+        with patch.object(
+            batch_label_service_module.background_manager,
+            "register",
+            side_effect=RuntimeError("injected registration failure"),
+        ):
+            with pytest.raises(RuntimeError, match="injected registration failure"):
+                await resume_batch_label_run(PID, run_id, settings=settings)
+
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "paused"
+            assert run.paused_reason == "circuit_breaker_threshold_reached"
+            assert run.metrics == original_metrics
 
     @pytest.mark.asyncio
     async def test_resume_non_paused_returns_conflict(self, tmp_path):
@@ -1045,90 +1715,97 @@ class TestResume:
         assert "conflict" in result.lower()
 
     @pytest.mark.asyncio
-    async def test_resume_skips_already_processed(self, tmp_path):
-        """On resume, examples with existing OperationRecords are skipped."""
-        engine, pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=3)
+    async def test_resume_repairs_success_without_its_domain_write(self, tmp_path):
+        """A torn terminal success is retried under its original identity."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
         run_id = generate_uuid4()
-        keys = ["ex_000", "ex_001", "ex_002"]
-        _seed_bl_run(engine, run_id, keys)
+        operation_id = generate_uuid4()
+        _seed_bl_run(engine, run_id, ["ex_000"])
         with Session(engine) as s:
-            # Simulate ex_000 already processed
             s.add(
                 OperationRecord(
-                    inference_invocation_id=generate_uuid4(),
+                    inference_invocation_id=operation_id,
                     project_id=PID,
                     purpose="batch_label",
                     example_key="ex_000",
+                    guidance_id=GID,
+                    model_config_id=MCID,
+                    endpoint_id=EID,
                     batch_label_run_id=run_id,
                     invocation_status="success",
                     schema_valid_core=True,
+                    label_tier="auto_labeled",
                     model_name="test-model",
                 )
             )
             s.commit()
 
-        invoke_calls = []
-
-        async def _mock_invoke(pid, rid, ek, **kw):
-            invoke_calls.append(ek)
-            return _make_batch_success(ek)
-
-        with (
-            patch(_INVOKE_PATCH, side_effect=_mock_invoke),
-            patch(_SSE_PATCH) as mock_sse,
-        ):
+        payload = '{"rationale_note":"ok","severity":"high","damaged":true}'
+        chat_patch, prepare_patch = _bl_patch_nim_pipeline(fake_nim_success(payload))
+        with chat_patch as chat_mock, prepare_patch, patch(_SSE_PATCH) as mock_sse:
             mock_sse.emit = AsyncMock()
             await _execute_batch_label(PID, run_id, settings)
 
-        # ex_000 should have been skipped
-        assert "ex_000" not in invoke_calls
-        assert "ex_001" in invoke_calls
-        assert "ex_002" in invoke_calls
-
-    async def test_resume_reinvokes_pending_record(self, tmp_path):
-        """A ``pending`` OperationRecord (written before the NIM call, then
-        orphaned by a crash) is NOT done: resume must re-invoke that example,
-        not strand it forever and miscount it as schema_invalid."""
-        engine, pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=2)
-        run_id = generate_uuid4()
-        keys = ["ex_000", "ex_001"]
-        _seed_bl_run(engine, run_id, keys)
+        assert chat_mock.await_count == 1
         with Session(engine) as s:
-            # ex_000 crashed mid-invoke: a pending record with no terminal
-            # status. It must be retried, not treated as already-done.
+            operation = (
+                s.query(OperationRecord).filter_by(batch_label_run_id=run_id).one()
+            )
+            assert operation.inference_invocation_id == operation_id
+            assert operation.invocation_status == "success"
+            label = s.query(Label).filter_by(example_key="ex_000").one()
+            assert label.inference_invocation_id == operation_id
+            assert label.batch_label_run_id == run_id
+            assert s.query(Example).filter_by(example_key="ex_000").one().state == (
+                "Auto-Labeled"
+            )
+            run = s.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "completed"
+            assert run.examples_succeeded == 1
+
+    async def test_resume_reuses_pending_operation_identity(self, tmp_path):
+        """A crashed pending item is re-invoked without a second audit row."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        operation_id = generate_uuid4()
+        _seed_bl_run(engine, run_id, ["ex_000"])
+        with Session(engine) as s:
             s.add(
                 OperationRecord(
-                    inference_invocation_id=generate_uuid4(),
+                    inference_invocation_id=operation_id,
                     project_id=PID,
                     purpose="batch_label",
                     example_key="ex_000",
+                    guidance_id=GID,
+                    model_config_id=MCID,
+                    endpoint_id=EID,
                     batch_label_run_id=run_id,
                     invocation_status="pending",
+                    label_tier="auto_labeled",
                     model_name="test-model",
                 )
             )
             s.commit()
 
-        invoke_calls = []
-
-        async def _mock_invoke(pid, rid, ek, **kw):
-            invoke_calls.append(ek)
-            return _make_batch_success(ek)
-
-        with (
-            patch(_INVOKE_PATCH, side_effect=_mock_invoke),
-            patch(_SSE_PATCH) as mock_sse,
-        ):
+        payload = '{"rationale_note":"ok","severity":"high","damaged":true}'
+        chat_patch, prepare_patch = _bl_patch_nim_pipeline(fake_nim_success(payload))
+        with chat_patch as chat_mock, prepare_patch, patch(_SSE_PATCH) as mock_sse:
             mock_sse.emit = AsyncMock()
             await _execute_batch_label(PID, run_id, settings)
 
-        # The crashed-pending example is re-invoked, not stranded.
-        assert "ex_000" in invoke_calls
-        assert "ex_001" in invoke_calls
+        assert chat_mock.await_count == 1
         with Session(engine) as s:
-            run = s.query(RunRecord).filter_by(run_id=run_id).first()
+            operations = (
+                s.query(OperationRecord).filter_by(batch_label_run_id=run_id).all()
+            )
+            assert len(operations) == 1
+            assert operations[0].inference_invocation_id == operation_id
+            assert operations[0].invocation_status == "success"
+            label = s.query(Label).filter_by(example_key="ex_000").one()
+            assert label.inference_invocation_id == operation_id
+            run = s.query(RunRecord).filter_by(run_id=run_id).one()
             assert run.status == "completed"
-            assert run.examples_succeeded == 2
+            assert run.examples_succeeded == 1
             assert run.examples_schema_invalid == 0
 
 
@@ -1244,15 +1921,11 @@ class TestCancel:
         async def _mock_invoke(pid, rid, ek, **kw):
             nonlocal invoke_count
             invoke_count += 1
-            # After 2 invocations, simulate cancel
-            if invoke_count >= 2:
-                from vlm_feedback_loop.services.batch_label_service import (
-                    _cancel_events,
+            if invoke_count == 2:
+                cancel_result = await cancel_batch_label_run(
+                    PID, run_id, settings=settings
                 )
-
-                evt = _cancel_events.get(run_id)
-                if evt:
-                    evt.set()
+                assert not isinstance(cancel_result, str), cancel_result
             return _make_batch_success(ek)
 
         with (
@@ -1268,6 +1941,168 @@ class TestCancel:
         with Session(engine) as s:
             run = s.query(RunRecord).filter_by(run_id=run_id).first()
             assert run.status == "canceled"
+
+    @pytest.mark.asyncio
+    async def test_cancel_marks_only_the_operation_crossing_its_boundary(
+        self, tmp_path
+    ):
+        """Cancellation preserves outcomes committed before the request."""
+        engine, _pdir, _ = _setup_batch_project(tmp_path, n_unlabeled=2)
+        settings = make_stub_settings(
+            WORKSPACE_ROOT=str(tmp_path / "workspace"),
+            BATCH_LABEL_CONCURRENCY_HOSTED=1,
+            BATCH_LABEL_CONCURRENCY_SELF_HOSTED=1,
+        )
+        run_id = generate_uuid4()
+        _seed_bl_run(engine, run_id, ["ex_000", "ex_001"])
+        second_request_started = asyncio.Event()
+        release_second_response = asyncio.Event()
+        call_count = 0
+        payload = '{"rationale_note":"ok","severity":"high","damaged":true}'
+
+        async def _chat(*_args, **_kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                second_request_started.set()
+                await release_second_response.wait()
+            return fake_nim_success(payload)
+
+        chat_patch, prepare_patch = _bl_patch_nim_pipeline(_chat)
+        with chat_patch as chat_mock, prepare_patch, patch(_SSE_PATCH) as mock_sse:
+            mock_sse.emit = AsyncMock()
+            executor = asyncio.create_task(_execute_batch_label(PID, run_id, settings))
+            try:
+                await asyncio.wait_for(second_request_started.wait(), timeout=2)
+                result = await cancel_batch_label_run(PID, run_id, settings=settings)
+                assert not isinstance(result, str), result
+                assert result["status"] == "canceling"
+            finally:
+                release_second_response.set()
+                await executor
+
+        assert chat_mock.await_count == 2
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "canceled"
+            assert run.examples_succeeded == 1
+            assert run.examples_schema_invalid == 0
+            assert run.examples_timeout == 0
+            assert run.examples_endpoint_error == 0
+            operations = (
+                session.query(OperationRecord)
+                .filter_by(batch_label_run_id=run_id)
+                .order_by(OperationRecord.example_key)
+                .all()
+            )
+            assert [row.ignored_due_to_run_cancellation for row in operations] == [
+                False,
+                True,
+            ]
+            labels = (
+                session.query(Label)
+                .filter_by(project_id=PID, label_status="auto_labeled")
+                .all()
+            )
+            assert [label.example_key for label in labels] == ["ex_000"]
+            states = {
+                row.example_key: row.state
+                for row in session.query(Example)
+                .filter_by(project_id=PID)
+                .order_by(Example.example_key)
+                .all()
+            }
+            assert states == {"ex_000": "Auto-Labeled", "ex_001": "Unlabeled"}
+
+    @pytest.mark.asyncio
+    async def test_cancel_wins_over_a_crossing_capability_rejection(self, tmp_path):
+        """A rejected response arriving after durable cancel stays ignored."""
+        engine, _pdir, _settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        settings = make_stub_settings(
+            WORKSPACE_ROOT=str(tmp_path / "workspace"),
+            BATCH_LABEL_CONCURRENCY_HOSTED=1,
+        )
+        run_id = generate_uuid4()
+        _seed_bl_run(engine, run_id, ["ex_000"])
+        request_started = asyncio.Event()
+        release_response = asyncio.Event()
+
+        async def _chat(*_args, **_kwargs):
+            request_started.set()
+            await release_response.wait()
+            return fake_nim_failure(
+                "HTTP 400: response_format json_schema not supported"
+            )
+
+        chat_patch, prepare_patch = _bl_patch_nim_pipeline(_chat)
+        with (
+            chat_patch,
+            prepare_patch,
+            patch(_SSE_PATCH) as mock_sse,
+            patch(_TR_SSE_PATCH) as mock_finalizer_sse,
+        ):
+            mock_sse.emit = AsyncMock()
+            mock_finalizer_sse.emit = AsyncMock()
+            executor = asyncio.create_task(_execute_batch_label(PID, run_id, settings))
+            await asyncio.wait_for(request_started.wait(), timeout=2)
+            canceled = await cancel_batch_label_run(PID, run_id, settings=settings)
+            assert not isinstance(canceled, str), canceled
+            release_response.set()
+            await executor
+
+        with Session(engine) as session:
+            run = session.get(RunRecord, run_id)
+            operation = (
+                session.query(OperationRecord)
+                .filter_by(batch_label_run_id=run_id)
+                .one()
+            )
+            assert run is not None
+            assert run.status == "canceled"
+            assert run.status_reason is None
+            assert operation.ignored_due_to_run_cancellation is True
+        assert all(
+            call.args[1] != "run_failed"
+            for call in mock_finalizer_sse.emit.call_args_list
+        )
+
+    @pytest.mark.asyncio
+    async def test_durable_cancel_wins_over_an_inflight_lane_error(self, tmp_path):
+        """A request already committed as canceling cannot become failed by race."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        _seed_bl_run(engine, run_id, ["ex_000"])
+        invocation_started = asyncio.Event()
+        release_failure = asyncio.Event()
+
+        async def _mock_invoke(_pid, _rid, _key, **_kwargs):
+            invocation_started.set()
+            await release_failure.wait()
+            raise RuntimeError("request failed while cancellation was settling")
+
+        with (
+            patch(_INVOKE_PATCH, side_effect=_mock_invoke),
+            patch(_SSE_PATCH) as mock_sse,
+            patch(_TR_SSE_PATCH) as mock_finalizer_sse,
+        ):
+            mock_sse.emit = AsyncMock()
+            mock_finalizer_sse.emit = AsyncMock()
+            executor = asyncio.create_task(_execute_batch_label(PID, run_id, settings))
+            await asyncio.wait_for(invocation_started.wait(), timeout=2)
+            cancel_result = await cancel_batch_label_run(PID, run_id, settings=settings)
+            assert not isinstance(cancel_result, str), cancel_result
+            release_failure.set()
+            await executor
+
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "canceled"
+            assert run.status_reason is None
+        mock_finalizer_sse.emit.assert_awaited_once_with(
+            PID,
+            "batch_label_completed",
+            {"run_id": run_id, "status": "canceled"},
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1645,19 +2480,24 @@ class TestIdempotency:
         """When an example already has an OperationRecord + Label, skip it."""
         engine, pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=2)
         run_id = generate_uuid4()
+        operation_id = generate_uuid4()
         keys = ["ex_000", "ex_001"]
         _seed_bl_run(engine, run_id, keys)
         with Session(engine) as s:
             # Simulate ex_000 already processed
             s.add(
                 OperationRecord(
-                    inference_invocation_id=generate_uuid4(),
+                    inference_invocation_id=operation_id,
                     project_id=PID,
                     purpose="batch_label",
                     example_key="ex_000",
+                    guidance_id=GID,
+                    model_config_id=MCID,
+                    endpoint_id=EID,
                     batch_label_run_id=run_id,
                     invocation_status="success",
                     schema_valid_core=True,
+                    label_tier="auto_labeled",
                     model_name="test-model",
                 )
             )
@@ -1669,7 +2509,7 @@ class TestIdempotency:
                     example_key="ex_000",
                     label_status="auto_labeled",
                     guidance_id=GID,
-                    inference_invocation_id=generate_uuid4(),
+                    inference_invocation_id=operation_id,
                     label_json={
                         "rationale_note": "t",
                         "severity": "high",
@@ -1679,9 +2519,15 @@ class TestIdempotency:
                     batch_label_run_id=run_id,
                 )
             )
+            s.query(Example).filter_by(
+                example_key="ex_000"
+            ).one().state = "Auto-Labeled"
             s.commit()
 
+        invoke_calls: list[str] = []
+
         async def _mock_invoke(pid, rid, ek, **kw):
+            invoke_calls.append(ek)
             return _make_batch_success(ek)
 
         with (
@@ -1691,6 +2537,7 @@ class TestIdempotency:
             mock_sse.emit = AsyncMock()
             await _execute_batch_label(PID, run_id, settings)
 
+        assert invoke_calls == ["ex_001"]
         with Session(engine) as s:
             # ex_000 should have exactly 1 label (not duplicated)
             labels_000 = (
@@ -1713,6 +2560,344 @@ class TestIdempotency:
                 .all()
             )
             assert len(labels_001) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sme_state", ["Verified", "Omitted"])
+    async def test_resume_preserves_completed_sme_disposition(
+        self, tmp_path, sme_state
+    ):
+        """A persisted success stays complete after later SME disposition."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        operation_id = generate_uuid4()
+        _seed_bl_run(engine, run_id, ["ex_000"])
+        with Session(engine) as s:
+            s.add(
+                OperationRecord(
+                    inference_invocation_id=operation_id,
+                    project_id=PID,
+                    purpose="batch_label",
+                    example_key="ex_000",
+                    guidance_id=GID,
+                    model_config_id=MCID,
+                    endpoint_id=EID,
+                    model_name="test-model",
+                    invocation_status="success",
+                    schema_valid_core=True,
+                    label_tier="auto_labeled",
+                    batch_label_run_id=run_id,
+                )
+            )
+            example = s.query(Example).filter_by(example_key="ex_000").one()
+            example.state = sme_state
+            if sme_state == "Verified":
+                s.add(
+                    Label(
+                        label_id=generate_uuid4(),
+                        project_id=PID,
+                        example_key="ex_000",
+                        label_status="verified",
+                        guidance_id=GID,
+                        inference_invocation_id=generate_uuid4(),
+                        label_json={"severity": "high", "damaged": True},
+                        labeled_at=utc_now(),
+                        verified_outcome="Accept",
+                        verified_at=utc_now(),
+                    )
+                )
+            s.commit()
+
+        invoke_mock = AsyncMock(return_value=_make_batch_success("ex_000"))
+        with patch(_INVOKE_PATCH, new=invoke_mock), patch(_SSE_PATCH) as mock_sse:
+            mock_sse.emit = AsyncMock()
+            await _execute_batch_label(PID, run_id, settings)
+
+        invoke_mock.assert_not_awaited()
+        with Session(engine) as s:
+            assert s.query(Example).filter_by(example_key="ex_000").one().state == (
+                sme_state
+            )
+            assert (
+                s.query(Label)
+                .filter_by(example_key="ex_000", label_status="auto_labeled")
+                .all()
+                == []
+            )
+            run = s.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "completed"
+            assert run.examples_succeeded == 1
+
+    @pytest.mark.asyncio
+    async def test_outcome_and_domain_write_roll_back_together(self, tmp_path):
+        """A failed Label flush cannot leave a terminal operation behind."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        _seed_bl_run(
+            engine,
+            run_id,
+            ["ex_000"],
+            metrics={
+                "input_keys": ["ex_000"],
+                "circuit_breaker_threshold": 10,
+                "circuit_breaker_consecutive": 2,
+                "circuit_breaker_tripped": False,
+            },
+        )
+        injected = False
+
+        def _fail_label_flush(session, _flush_context, _instances):
+            nonlocal injected
+            if not injected and any(isinstance(row, Label) for row in session.new):
+                injected = True
+                raise RuntimeError("injected Label persistence failure")
+
+        payload = '{"rationale_note":"ok","severity":"high","damaged":true}'
+        chat_patch, prepare_patch = _bl_patch_nim_pipeline(fake_nim_success(payload))
+        event.listen(Session, "before_flush", _fail_label_flush)
+        try:
+            with chat_patch as chat_mock, prepare_patch, patch(_SSE_PATCH) as mock_sse:
+                mock_sse.emit = AsyncMock()
+                await _execute_batch_label(PID, run_id, settings)
+        finally:
+            event.remove(Session, "before_flush", _fail_label_flush)
+
+        assert injected
+        assert chat_mock.await_count == 1
+        with Session(engine) as s:
+            operation = (
+                s.query(OperationRecord).filter_by(batch_label_run_id=run_id).one()
+            )
+            assert operation.invocation_status == "pending"
+            assert s.query(Label).filter_by(example_key="ex_000").all() == []
+            assert s.query(Example).filter_by(example_key="ex_000").one().state == (
+                "Unlabeled"
+            )
+            run = s.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "failed"
+            assert run.status_reason == "unhandled_exception"
+            assert run.metrics["circuit_breaker_consecutive"] == 2
+            assert run.metrics["circuit_breaker_tripped"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("broken_link", ["run", "invocation", "guidance", "state"])
+    async def test_resume_repairs_mismatched_success_lineage(
+        self, tmp_path, broken_link
+    ):
+        """State and Label alone cannot satisfy exact batch-item lineage."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        operation_id = generate_uuid4()
+        _seed_bl_run(engine, run_id, ["ex_000"])
+        with Session(engine) as s:
+            s.add(
+                OperationRecord(
+                    inference_invocation_id=operation_id,
+                    project_id=PID,
+                    purpose="batch_label",
+                    example_key="ex_000",
+                    guidance_id=GID,
+                    model_config_id=MCID,
+                    endpoint_id=EID,
+                    model_name="test-model",
+                    invocation_status="success",
+                    schema_valid_core=True,
+                    label_tier="auto_labeled",
+                    batch_label_run_id=run_id,
+                )
+            )
+            _add_auto_label(
+                s,
+                PID,
+                "ex_000",
+                guidance_id=("other-guidance" if broken_link == "guidance" else GID),
+                run_id="other-run" if broken_link == "run" else run_id,
+                invocation_id=(
+                    generate_uuid4() if broken_link == "invocation" else operation_id
+                ),
+            )
+            if broken_link != "state":
+                s.query(Example).filter_by(
+                    example_key="ex_000"
+                ).one().state = "Auto-Labeled"
+            s.commit()
+
+        payload = '{"rationale_note":"ok","severity":"high","damaged":true}'
+        chat_patch, prepare_patch = _bl_patch_nim_pipeline(fake_nim_success(payload))
+        with chat_patch as chat_mock, prepare_patch, patch(_SSE_PATCH) as mock_sse:
+            mock_sse.emit = AsyncMock()
+            await _execute_batch_label(PID, run_id, settings)
+
+        assert chat_mock.await_count == 1
+        with Session(engine) as s:
+            operation = (
+                s.query(OperationRecord).filter_by(batch_label_run_id=run_id).one()
+            )
+            assert operation.inference_invocation_id == operation_id
+            label = s.query(Label).filter_by(example_key="ex_000").one()
+            assert label.batch_label_run_id == run_id
+            assert label.inference_invocation_id == operation_id
+            assert s.query(Example).filter_by(example_key="ex_000").one().state == (
+                "Auto-Labeled"
+            )
+
+    @pytest.mark.asyncio
+    async def test_resume_fails_before_dispatch_on_ambiguous_operation_rows(
+        self, tmp_path
+    ):
+        """Duplicate audit rows are preserved and never guessed apart."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        _seed_bl_run(engine, run_id, ["ex_000"])
+        with Session(engine) as s:
+            for _ in range(2):
+                s.add(
+                    OperationRecord(
+                        inference_invocation_id=generate_uuid4(),
+                        project_id=PID,
+                        purpose="batch_label",
+                        example_key="ex_000",
+                        guidance_id=GID,
+                        model_config_id=MCID,
+                        endpoint_id=EID,
+                        model_name="test-model",
+                        invocation_status="pending",
+                        label_tier="auto_labeled",
+                        batch_label_run_id=run_id,
+                    )
+                )
+            s.commit()
+
+        invoke_mock = AsyncMock(return_value=_make_batch_success("ex_000"))
+        with patch(_INVOKE_PATCH, new=invoke_mock), patch(_SSE_PATCH) as mock_sse:
+            mock_sse.emit = AsyncMock()
+            await _execute_batch_label(PID, run_id, settings)
+
+        invoke_mock.assert_not_awaited()
+        with Session(engine) as s:
+            operations = (
+                s.query(OperationRecord).filter_by(batch_label_run_id=run_id).all()
+            )
+            assert len(operations) == 2
+            assert {row.invocation_status for row in operations} == {"pending"}
+            run = s.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "failed"
+            assert run.status_reason == "unhandled_exception"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "invalid_lineage",
+        [
+            "wrong_project",
+            "wrong_purpose",
+            "wrong_guidance",
+            "wrong_model_config",
+            "wrong_endpoint",
+            "wrong_model_name",
+            "wrong_label_tier",
+            "invalid_status",
+            "outside_input",
+        ],
+    )
+    async def test_resume_rejects_foreign_operation_lineage(
+        self, tmp_path, invalid_lineage
+    ):
+        """Recovery never counts an operation outside its frozen run item."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        _seed_bl_run(engine, run_id, ["ex_000"])
+        with Session(engine) as session:
+            session.add(
+                OperationRecord(
+                    inference_invocation_id=generate_uuid4(),
+                    project_id=(
+                        "other-project" if invalid_lineage == "wrong_project" else PID
+                    ),
+                    purpose=(
+                        "evaluation"
+                        if invalid_lineage == "wrong_purpose"
+                        else "batch_label"
+                    ),
+                    example_key=(
+                        "outside-snapshot"
+                        if invalid_lineage == "outside_input"
+                        else "ex_000"
+                    ),
+                    guidance_id=(
+                        "other-guidance" if invalid_lineage == "wrong_guidance" else GID
+                    ),
+                    model_config_id=(
+                        "other-model-config"
+                        if invalid_lineage == "wrong_model_config"
+                        else MCID
+                    ),
+                    endpoint_id=(
+                        "other-endpoint" if invalid_lineage == "wrong_endpoint" else EID
+                    ),
+                    model_name=(
+                        "other-model"
+                        if invalid_lineage == "wrong_model_name"
+                        else "test-model"
+                    ),
+                    invocation_status=(
+                        "bogus" if invalid_lineage == "invalid_status" else "timeout"
+                    ),
+                    label_tier=(
+                        "proposal"
+                        if invalid_lineage == "wrong_label_tier"
+                        else "auto_labeled"
+                    ),
+                    batch_label_run_id=run_id,
+                )
+            )
+            session.commit()
+
+        invoke_mock = AsyncMock(return_value=_make_batch_success("ex_000"))
+        with patch(_INVOKE_PATCH, new=invoke_mock), patch(_SSE_PATCH) as mock_sse:
+            mock_sse.emit = AsyncMock()
+            await _execute_batch_label(PID, run_id, settings)
+
+        invoke_mock.assert_not_awaited()
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "failed"
+            assert run.status_reason == "unhandled_exception"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_executor_cannot_replace_the_run_owner(self, tmp_path):
+        """One live executor owns dispatch and the cancellation event."""
+        engine, _pdir, settings = _setup_batch_project(tmp_path, n_unlabeled=1)
+        run_id = generate_uuid4()
+        _seed_bl_run(engine, run_id, ["ex_000"])
+        invocation_started = asyncio.Event()
+        release_invocation = asyncio.Event()
+        invoke_count = 0
+
+        async def _mock_invoke(_pid, _rid, example_key, **_kwargs):
+            nonlocal invoke_count
+            invoke_count += 1
+            invocation_started.set()
+            await release_invocation.wait()
+            return _make_batch_success(example_key)
+
+        with (
+            patch(_INVOKE_PATCH, side_effect=_mock_invoke),
+            patch(_SSE_PATCH) as mock_sse,
+        ):
+            mock_sse.emit = AsyncMock()
+            owner = asyncio.create_task(_execute_batch_label(PID, run_id, settings))
+            await asyncio.wait_for(invocation_started.wait(), timeout=2)
+            owner_event = batch_label_service_module._cancel_events[run_id]
+
+            await _execute_batch_label(PID, run_id, settings)
+
+            assert invoke_count == 1
+            assert batch_label_service_module._cancel_events[run_id] is owner_event
+            release_invocation.set()
+            await owner
+
+        with Session(engine) as session:
+            run = session.query(RunRecord).filter_by(run_id=run_id).one()
+            assert run.status == "completed"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2042,12 +3227,13 @@ class TestRestartAutoResumeEndToEnd:
 
         # Pre-restart state: the run was mid-flight and ex_000 was already
         # fully processed (OperationRecord + auto-label + state flip).
+        operation_id = generate_uuid4()
         with Session(engine) as s:
             run = s.query(RunRecord).filter_by(run_id=run_id).first()
             run.status = "running"
             s.add(
                 OperationRecord(
-                    inference_invocation_id=generate_uuid4(),
+                    inference_invocation_id=operation_id,
                     project_id=PID,
                     purpose="batch_label",
                     example_key="ex_000",
@@ -2061,7 +3247,13 @@ class TestRestartAutoResumeEndToEnd:
                     batch_label_run_id=run_id,
                 )
             )
-            _add_auto_label(s, PID, "ex_000", run_id=run_id)
+            _add_auto_label(
+                s,
+                PID,
+                "ex_000",
+                run_id=run_id,
+                invocation_id=operation_id,
+            )
             ex = s.query(Example).filter_by(example_key="ex_000").first()
             ex.state = "Auto-Labeled"
             s.commit()

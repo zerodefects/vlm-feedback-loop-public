@@ -33,6 +33,15 @@ function renderFailure(status: Exclude<InvocationStatus, "success">) {
 }
 
 describe("ProposalFailure", () => {
+  it.each(["schema_invalid", "timeout", "rate_limited", "endpoint_error"] as const)(
+    "%s announces the terminal failure",
+    (status) => {
+      renderFailure(status);
+
+      expect(screen.getByRole("alert")).toHaveTextContent("Proposal failed");
+    },
+  );
+
   it("rate_limited renders wait-and-retry copy without the Report NIM Issue CTA", () => {
     // A 429-exhausted hosted invocation is a transient shared-quota
     // condition — telling the SME the endpoint is unreachable (and

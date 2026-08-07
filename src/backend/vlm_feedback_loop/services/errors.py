@@ -17,7 +17,8 @@ mandates for NIM-driven workflows:
 
 Upstream 503/504 (unreachable / timed-out NIM and TAO endpoints) are
 produced by :func:`map_service_error` from the ``tao_unreachable:`` /
-``tao_timeout:`` machine tokens.
+``tao_timeout:`` machine tokens. The endpoint-specific
+``tao_dataset_upload_failed:`` token is a 409 conflict.
 
 Services signal request-path errors by returning a message string instead
 of a result dict; :func:`map_service_error` turns those service-layer
@@ -96,9 +97,11 @@ def not_found(detail: str) -> APIError:
 _TOKEN_RULES: tuple[tuple[str, int], ...] = (
     ("VISUAL_BUDGET_PARITY_VIOLATION", 400),
     ("INFERENCE_CONTRACT_MISMATCH", 409),
+    ("tao_dataset_upload_failed:", 409),
     ("student_nim_not_deployed", 409),
     ("tao_eval_already_in_suite", 409),
     ("student_nim_serving_run_missing", 409),
+    ("nim_unreachable:", 503),
     ("tao_unreachable:", 503),
     ("tao_timeout:", 504),
     ("tao_error:", 502),

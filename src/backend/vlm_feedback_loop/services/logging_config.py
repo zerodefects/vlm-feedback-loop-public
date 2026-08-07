@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import sys
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -54,6 +55,14 @@ def redact(text: str) -> str:
     """Replace secret patterns with [REDACTED]."""
     for pattern in REDACTION_PATTERNS:
         text = pattern.sub(REDACTED, text)
+    return text
+
+
+def redact_exact_secrets(text: str, values: Iterable[str | None]) -> str:
+    """Remove known opaque secret values that pattern matching cannot infer."""
+    private_values = {value for value in values if value}
+    for value in sorted(private_values, key=len, reverse=True):
+        text = text.replace(value, REDACTED)
     return text
 
 

@@ -22,6 +22,21 @@ describe("parseApiErrorDetail", () => {
     expect(parseApiErrorDetail(err)).toBe("Project not found");
   });
 
+  it("extracts the message from a coded backend error body", () => {
+    const err = new ApiError(
+      409,
+      JSON.stringify({
+        detail: {
+          code: "model_in_active_use",
+          message: "Cannot change this Teacher while an evaluation is active.",
+        },
+      }),
+    );
+    expect(parseApiErrorDetail(err)).toBe(
+      "Cannot change this Teacher while an evaluation is active.",
+    );
+  });
+
   it("returns null for a plain-text proxy body instead of throwing", () => {
     // nginx 502/504 pages are HTML, not JSON — the JSON.parse failure must
     // be swallowed so callers can fall back to their own message.
@@ -29,7 +44,7 @@ describe("parseApiErrorDetail", () => {
     expect(parseApiErrorDetail(err)).toBeNull();
   });
 
-  it("returns null when detail is not a string (FastAPI 422 array shape)", () => {
+  it("returns null when detail has no message (FastAPI 422 array shape)", () => {
     const err = new ApiError(
       422,
       JSON.stringify({ detail: [{ loc: ["body", "name"], msg: "field required" }] }),

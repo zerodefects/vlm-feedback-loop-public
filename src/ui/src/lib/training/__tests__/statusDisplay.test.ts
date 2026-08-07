@@ -36,6 +36,20 @@ describe("statusDisplay — training-job display-label mapping", () => {
     expect(statusDisplay("succeeded", null).label).not.toBe("Succeeded");
   });
 
+  it("distinguishes Blueprint artifact finalization from TAO completion", () => {
+    expect(statusDisplay("succeeded", null, "in_progress")).toEqual({
+      label: "Finalizing",
+      tone: "info",
+      spinner: true,
+    });
+    expect(statusDisplay("succeeded", null, "failed")).toEqual({
+      label: "Artifact Failed",
+      tone: "error",
+      spinner: false,
+    });
+    expect(statusDisplay("succeeded", null, "completed").label).toBe("Completed");
+  });
+
   it("failed + chain_halted_reason renders as 'Halted' (warning), not 'Failed'", () => {
     const d = statusDisplay(
       "failed",
@@ -43,6 +57,12 @@ describe("statusDisplay — training-job display-label mapping", () => {
     );
     expect(d.label).toBe("Halted");
     expect(d.tone).toBe("warning");
+  });
+
+  it("distinguishes an intentional evaluation omission from cancellation", () => {
+    expect(
+      statusDisplay("canceled", "auto-skip: action=evaluate auto-skipped"),
+    ).toEqual({ label: "Not Required", tone: "info", spinner: false });
   });
 
   it("failed with empty-string halt reason stays 'Failed'", () => {

@@ -7,15 +7,16 @@ Coverage:
   * Validation (422): invalid preset, invalid quantization scheme,
     unknown student_base model, non-student_base role, missing project,
     missing guidance.
-  * Idempotency replay: second POST with same key returns existing suite.
-  * Phase-1d atomicity: a mid-flight chain failure rolls back the
-    TrainingSuite + TAOJob rows; the Phase-1b DatasetExports stay
-    committed (consistent with their archives on disk).
+  * Idempotency: materialized suites replay; retryable pre-chain transfers
+    resume the same suite and frozen exports for an identical request.
+  * Atomic chain creation: a mid-flight failure rolls back every TAOJob
+    and marks the durable pre-chain TrainingSuite failed while preserving its
+    linked DatasetExports.
   * SQLite write discipline: no write transaction held across the
     S3 uploads (concurrent-writer probe).
   * Chain structure: per-model TAOJob rows with correct chain_id,
     chain_sequence, parent_tao_job_id, action ordering, status=not_started.
-  * Phase 2 kickoff: first chain's first train job is submitted via
+  * Chain kickoff: the first chain's train job is submitted via
     submit_chain_job; on success → status=submitted + external id.
   * resolved_training_fields.policy.model_name_or_path persisted for
     the downstream LoRA-merge dependency.
@@ -24,8 +25,10 @@ Coverage:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
@@ -40,6 +43,7 @@ from conftest import (
     make_tao_settings,
     open_project_workspace,
 )
+from support import FakeS3Client
 from vlm_feedback_loop.db.base import generate_uuid4, utc_now
 from vlm_feedback_loop.db.models.label import Label
 from vlm_feedback_loop.db.models.model_config import ModelConfig
@@ -54,6 +58,9 @@ from vlm_feedback_loop.model_catalog_constants import (
     COSMOS_REASON2_8B_HF_PATH,
 )
 from vlm_feedback_loop.services import tao_job_service, training_suite_service
+from vlm_feedback_loop.services.tao_dataset_upload_service import (
+    upload_dataset_archive as _real_upload_dataset_archive,
+)
 
 PID = "test-proj"
 GID = "guid-001"
@@ -218,10 +225,8 @@ async def _noop_upload(
     session,
     *,
     dataset_export,
-    archive_path,
     deployment_config,
     s3_client,
-    annotations_path,
     **_kwargs,
 ):
     """Default no-op upload used by the autouse fixture.
@@ -236,6 +241,9 @@ async def _noop_upload(
         build_tao_spec_reference,
     )
 
+    refs = dataset_export.artifact_refs or {}
+    archive_path = Path(refs["archive_path"])
+    annotations_path = Path(refs["annotations_path"])
     key = build_s3_key(
         project_id=dataset_export.project_id,
         dataset_export_id=dataset_export.dataset_export_id,
@@ -286,14 +294,16 @@ def _autostub_upload_archive(monkeypatch):
     from vlm_feedback_loop.services import training_suite_service as _tss
 
     monkeypatch.setattr(_uploads, "upload_dataset_archive", _noop_upload)
-    monkeypatch.setattr(_tss, "build_s3_client", lambda _cfg: object())
+    monkeypatch.setattr(_tss, "build_s3_client", lambda _cfg, **_kwargs: object())
 
 
 @pytest.fixture()
 def seeded(tmp_path):
     engine, project_dir, workspace = _setup_project_db(tmp_path)
     with Session(engine) as s:
-        _add_project(s, project_dir=project_dir)
+        # Keep this focused fixture compact while satisfying the same
+        # project-configured held-out minimum enforced in production.
+        _add_project(s, project_dir=project_dir, scaleup_min_test_pool_size=2)
         _add_guidance(s)
         _add_endpoint(s)
         _add_model(s, MC_8B, COSMOS_REASON2_8B, ["teacher", "student_base"])
@@ -334,6 +344,79 @@ def mock_submit(monkeypatch):
 
 
 class TestTrainingJobsLaunch:
+    @pytest.mark.asyncio
+    async def test_post_provisioning_upload_failure_retains_actionable_token(
+        self, seeded, monkeypatch
+    ):
+        engine, _, settings = seeded
+        suite_id = generate_uuid4()
+        with Session(engine) as session:
+            session.add(
+                TrainingSuite(
+                    training_suite_id=suite_id,
+                    project_id=PID,
+                    idempotency_key="provisional-upload-failure",
+                    guidance_id=GID,
+                    training_preset="quick",
+                    export_field_mode="all",
+                    include_auto_labeled=False,
+                    training_dataset_export_id=None,
+                    evaluation_dataset_export_id=None,
+                    selected_student_base_model_config_ids=[MC_8B],
+                    quantization_schemes=[],
+                    chain_ids_ordered=[],
+                    provisioning_run_id="provisioning-run",
+                    provisioning_model_names=[COSMOS_REASON2_8B],
+                    status="provisioning",
+                )
+            )
+            session.commit()
+
+        monkeypatch.setattr(
+            training_suite_service,
+            "get_provisioning_run",
+            lambda *_args: {"status": "succeeded"},
+        )
+        failure = (
+            "tao_dataset_upload_failed: Training dataset upload failed. "
+            "Re-export the dataset before retrying."
+        )
+
+        async def fail_after_recording_upload_error(*_args, **_kwargs):
+            with Session(engine) as session:
+                suite = session.get(TrainingSuite, suite_id)
+                assert suite is not None
+                suite.status = "failed"
+                suite.setup_error_ref = failure
+                session.commit()
+            return failure
+
+        monkeypatch.setattr(
+            training_suite_service,
+            "create_training_suite",
+            fail_after_recording_upload_error,
+        )
+
+        await training_suite_service._complete_suite_after_provisioning(
+            PID,
+            suite_id,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="quick",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=[],
+            enable_lora=True,
+            idempotency_key="provisional-upload-failure",
+            settings=settings,
+        )
+
+        with Session(engine) as session:
+            suite = session.get(TrainingSuite, suite_id)
+            assert suite is not None
+            assert suite.status == "failed"
+            assert suite.setup_error_ref == failure
+            assert session.query(TAOJob).count() == 0
+
     @pytest.mark.asyncio
     async def test_missing_selected_bases_share_one_provisional_suite_step(
         self, seeded, monkeypatch
@@ -436,6 +519,61 @@ class TestTrainingJobsLaunch:
         create.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_ready_base_launch_resumes_failed_prechain_upload(
+        self, seeded, monkeypatch
+    ):
+        """The public launch path must not replay a repairable failed snapshot."""
+        engine, _, settings = seeded
+        suite_id = generate_uuid4()
+        with Session(engine) as session:
+            session.add(
+                TrainingSuite(
+                    training_suite_id=suite_id,
+                    project_id=PID,
+                    idempotency_key="launch-upload-retry",
+                    guidance_id=GID,
+                    training_preset="quick",
+                    export_field_mode="all",
+                    include_auto_labeled=False,
+                    training_dataset_export_id="training-export",
+                    evaluation_dataset_export_id="evaluation-export",
+                    selected_student_base_model_config_ids=[MC_8B],
+                    quantization_schemes=[],
+                    chain_ids_ordered=[],
+                    setup_error_ref=(
+                        "tao_dataset_upload_failed: Evaluation S3 transfer failed"
+                    ),
+                    status="failed",
+                )
+            )
+            session.commit()
+
+        async def ready(**_kwargs):
+            return {"status": "passed", "checks": [], "resolved_presets": {}}
+
+        monkeypatch.setattr(
+            training_suite_service.training_preflight_service,
+            "run_training_preflight",
+            ready,
+        )
+        create = AsyncMock(return_value={"training_suite_id": suite_id})
+        monkeypatch.setattr(training_suite_service, "create_training_suite", create)
+
+        result = await training_suite_service.launch_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="quick",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=[],
+            idempotency_key="launch-upload-retry",
+            settings=settings,
+        )
+
+        assert result == {"training_suite_id": suite_id}
+        create.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_server_readiness_failure_starts_no_transfer(
         self, seeded, monkeypatch
     ):
@@ -477,6 +615,55 @@ class TestTrainingJobsLaunch:
         assert isinstance(result, str)
         assert result.startswith("tao_unreachable:")
         start.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_test_pool_shortfall_starts_no_provisioning_or_tao_work(
+        self, seeded, monkeypatch
+    ):
+        """Dataset readiness fails before base transfer or job creation."""
+
+        async def blocked(**_kwargs):
+            return {
+                "status": "failed",
+                "checks": [
+                    {
+                        "check_name": "min_test_pool_size",
+                        "passed": False,
+                        "message": (
+                            "Test Pool has 2 of 60 required held-out evaluation "
+                            "examples. Continue labeling to grow the pool."
+                        ),
+                    }
+                ],
+                "resolved_presets": {},
+            }
+
+        monkeypatch.setattr(
+            training_suite_service.training_preflight_service,
+            "run_training_preflight",
+            blocked,
+        )
+        start = Mock()
+        create = AsyncMock()
+        monkeypatch.setattr(training_suite_service, "start_provisioning_run", start)
+        monkeypatch.setattr(training_suite_service, "create_training_suite", create)
+        _, _, settings = seeded
+
+        result = await training_suite_service.launch_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="standard",
+            include_auto_labeled=True,
+            export_field_mode="all",
+            quantization_schemes=["FP8_DYNAMIC"],
+            idempotency_key="launch-data-blocked",
+            settings=settings,
+        )
+
+        assert isinstance(result, str)
+        assert result.startswith("validation: Test Pool has 2 of 60")
+        start.assert_not_called()
+        create.assert_not_awaited()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -537,6 +724,42 @@ class TestValidation:
         assert "validation" in result.lower()
 
     @pytest.mark.asyncio
+    async def test_super_quantization_is_rejected_before_export_or_tao_work(
+        self, seeded, mock_submit, monkeypatch
+    ):
+        """Direct materialization cannot bypass Super's baseline-only matrix."""
+        engine, _, settings = seeded
+        with Session(engine) as session:
+            model = session.get(ModelConfig, MC_8B)
+            assert model is not None
+            model.model_name = COSMOS3_SUPER_REASONER
+            session.commit()
+
+        export = Mock()
+        monkeypatch.setattr(
+            training_suite_service,
+            "persist_dataset_export_in_session",
+            export,
+        )
+        result = await training_suite_service.create_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="quick",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=["FP8_DYNAMIC"],
+            enable_lora=False,
+            idempotency_key="super-quantization-blocked",
+            settings=settings,
+        )
+
+        assert isinstance(result, str)
+        assert result.startswith("validation:")
+        assert "Super quantization is not currently supported" in result
+        export.assert_not_called()
+        mock_submit.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_model_not_found(self, seeded, mock_submit):
         _, _, settings = seeded
         result = await training_suite_service.create_training_suite(
@@ -586,6 +809,47 @@ class TestValidation:
         assert isinstance(result, str)
         assert "not found" in result.lower()
 
+    @pytest.mark.asyncio
+    async def test_final_evaluation_export_rechecks_pool_minimum(
+        self, seeded, mock_submit, monkeypatch
+    ):
+        """A data change during setup cannot create an undersized eval chain."""
+        _, _, settings = seeded
+        build_count = 0
+
+        def shrinking_exports(*_args, **_kwargs):
+            nonlocal build_count
+            build_count += 1
+            return {
+                "dataset_export_id": f"de-{build_count}",
+                "example_count": 1,
+                "artifact_refs": {},
+            }
+
+        monkeypatch.setattr(
+            training_suite_service,
+            "persist_dataset_export_in_session",
+            shrinking_exports,
+        )
+
+        result = await training_suite_service.create_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="standard",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=["FP8_DYNAMIC"],
+            idempotency_key="eval-pool-shrank",
+            settings=settings,
+        )
+
+        assert result == (
+            "validation: Test Pool export has 1 of 2 required held-out "
+            "evaluation examples. Continue labeling and retry."
+        )
+        assert build_count == 2
+        mock_submit.assert_not_called()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Happy path: chain structure + kickoff
@@ -608,6 +872,10 @@ class TestHappyPathSingleModel:
         )
         assert not isinstance(result, str), result
         assert result["status"] == "running"
+        assert result["training_example_count"] == 3
+        assert result["evaluation_example_count"] == 2
+        assert result["evaluation_dataset_checksum_sha256"]
+        assert result["student_model_ids"] == []
         assert len(result["chains"]) == 1
         chain = result["chains"][0]
         assert chain["student_base_model_config_id"] == MC_8B
@@ -626,6 +894,8 @@ class TestHappyPathSingleModel:
         # chain_sequence starts at 1 and increments.
         seqs = [j["chain_sequence"] for j in chain["jobs"]]
         assert seqs == [1, 2, 3, 4, 5, 6]
+        assert {j["outputs_fetch_status"] for j in chain["jobs"]} == {"pending"}
+        assert all(j["outputs_fetch_error_ref"] is None for j in chain["jobs"])
 
         # The pinned TAO / Cosmos-RL versions are persisted on the job for
         # reproducibility. This suite runs with default Settings for these
@@ -1184,7 +1454,7 @@ class TestHappyPathSingleModel:
         """
         engine, project_dir, workspace = _setup_project_db(tmp_path)
         with Session(engine) as session:
-            _add_project(session, project_dir)
+            _add_project(session, project_dir, scaleup_min_test_pool_size=1)
             _add_guidance(session)
             _add_endpoint(session)
             _add_model(
@@ -1196,7 +1466,11 @@ class TestHappyPathSingleModel:
             )
             for i in range(3):
                 _add_example_with_image(session, tmp_path, f"ex-{i}")
-                _add_verified_label(session, f"ex-{i}")
+                _add_verified_label(
+                    session,
+                    f"ex-{i}",
+                    pool_assignment="test_pool" if i == 0 else None,
+                )
             session.commit()
         _bootstrap_tao_deployment_config(workspace)
 
@@ -1282,6 +1556,162 @@ class TestMultiModel:
 
 
 class TestIdempotency:
+    def test_restart_keeps_linked_preparation_retryable(self, seeded):
+        engine, _, settings = seeded
+        suite_id = generate_uuid4()
+        with Session(engine) as session:
+            session.add(
+                TrainingSuite(
+                    training_suite_id=suite_id,
+                    project_id=PID,
+                    idempotency_key="restart-linked-exports",
+                    guidance_id=GID,
+                    training_preset="quick",
+                    export_field_mode="all",
+                    include_auto_labeled=False,
+                    training_dataset_export_id="training-export",
+                    evaluation_dataset_export_id="evaluation-export",
+                    selected_student_base_model_config_ids=[MC_8B],
+                    quantization_schemes=[],
+                    chain_ids_ordered=[],
+                    status="preparing",
+                )
+            )
+            session.commit()
+
+        recovered = training_suite_service.recover_interrupted_training_suite_setups(
+            settings
+        )
+
+        assert recovered == 1
+        with Session(engine) as session:
+            suite = session.get(TrainingSuite, suite_id)
+            assert suite is not None
+            assert suite.status == "failed"
+            assert "tao_dataset_upload_failed:" in (suite.setup_error_ref or "")
+            assert training_suite_service._can_retry_dataset_upload_setup(suite)
+        snapshot = training_suite_service.get_training_suite(
+            PID,
+            suite_id,
+            settings=settings,
+        )
+        assert isinstance(snapshot, dict)
+        assert snapshot["setup_retryable"] is True
+
+    @pytest.mark.asyncio
+    async def test_provisional_shutdown_reuses_real_linked_exports(
+        self, seeded, mock_submit, monkeypatch
+    ):
+        """Canceled setup, restart recovery, and retry keep one frozen pair."""
+        engine, _, settings = seeded
+        suite_id = generate_uuid4()
+        with Session(engine) as session:
+            session.add(
+                TrainingSuite(
+                    training_suite_id=suite_id,
+                    project_id=PID,
+                    idempotency_key="provisional-shutdown-retry",
+                    guidance_id=GID,
+                    training_preset="quick",
+                    export_field_mode="all",
+                    include_auto_labeled=False,
+                    enable_lora=True,
+                    training_dataset_export_id=None,
+                    evaluation_dataset_export_id=None,
+                    selected_student_base_model_config_ids=[MC_8B],
+                    quantization_schemes=[],
+                    chain_ids_ordered=[],
+                    provisioning_run_id="provisioning-run",
+                    provisioning_model_names=[COSMOS_REASON2_8B],
+                    status="provisioning",
+                )
+            )
+            session.commit()
+
+        monkeypatch.setattr(
+            training_suite_service,
+            "get_provisioning_run",
+            Mock(return_value={"status": "succeeded"}),
+        )
+        entered_upload = asyncio.Event()
+        real_upload_driver = training_suite_service._upload_export_archive
+
+        async def blocked_upload(**_kwargs):
+            entered_upload.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr(
+            training_suite_service,
+            "_upload_export_archive",
+            blocked_upload,
+        )
+        setup_task = asyncio.create_task(
+            training_suite_service._complete_suite_after_provisioning(
+                PID,
+                suite_id,
+                student_base_model_config_ids=[MC_8B],
+                training_preset="quick",
+                include_auto_labeled=False,
+                export_field_mode="all",
+                quantization_schemes=[],
+                enable_lora=True,
+                idempotency_key="provisional-shutdown-retry",
+                settings=settings,
+            )
+        )
+        await asyncio.wait_for(entered_upload.wait(), timeout=2)
+        setup_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await setup_task
+
+        with Session(engine) as session:
+            interrupted = session.get(TrainingSuite, suite_id)
+            assert interrupted is not None
+            assert interrupted.status == "failed"
+            assert "tao_dataset_upload_failed:" in (interrupted.setup_error_ref or "")
+            export_ids = (
+                interrupted.training_dataset_export_id,
+                interrupted.evaluation_dataset_export_id,
+            )
+            assert None not in export_ids
+        assert (
+            training_suite_service.recover_interrupted_training_suite_setups(settings)
+            == 0
+        )
+
+        monkeypatch.setattr(
+            training_suite_service,
+            "_upload_export_archive",
+            real_upload_driver,
+        )
+        retry = await training_suite_service.create_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="quick",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=[],
+            enable_lora=True,
+            idempotency_key="provisional-shutdown-retry",
+            settings=settings,
+            _upload_archive=_noop_upload,
+            _s3_client=object(),
+        )
+
+        assert isinstance(retry, dict), retry
+        assert retry["training_suite_id"] == suite_id
+        assert (
+            retry["training_dataset_export_id"],
+            retry["evaluation_dataset_export_id"],
+        ) == export_ids
+        with Session(engine) as session:
+            from vlm_feedback_loop.db.models.dataset_export import DatasetExport
+
+            assert session.query(DatasetExport).count() == 2
+            assert session.query(TAOJob).count() == 2
+        mock_submit.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_replay_returns_existing_suite_without_new_writes(
         self, seeded, mock_submit
@@ -1362,14 +1792,9 @@ class TestAtomicity:
         self, seeded, mock_submit, monkeypatch
     ):
         engine, _, settings = seeded
-        # Force chain creation to explode AFTER the DatasetExports commit
-        # but BEFORE the TrainingSuite insert commits. The chain + suite
-        # rows are all-or-nothing (Phase 1d single transaction); the
-        # DatasetExport rows deliberately survive — they committed in
-        # Phase 1b, matching the archives already on disk and the shape
-        # the standalone exports API produces (write discipline forbids holding
-        # one write transaction across the archive builds and S3 uploads
-        # that separate the two phases).
+        # Force chain creation to explode after the durable suite owns both
+        # exports. The Phase-1d job writes roll back together; the suite then
+        # records the preparation failure for inspection.
         real_fn = training_suite_service._create_chain_rows_in_session
 
         def _boom(*args, **kwargs):  # noqa: ARG001
@@ -1403,15 +1828,21 @@ class TestAtomicity:
                 real_fn,
             )
 
-        # No TAOJob rows, no TrainingSuite rows after rollback; the two
-        # committed DatasetExports (training + evaluation) remain,
-        # consistent with their archives on disk.
+        # No partial TAOJob rows survive. The durable failed suite retains
+        # both frozen export ids for auditability.
         with Session(engine) as s:
-            assert s.query(TrainingSuite).count() == 0
+            suite = s.query(TrainingSuite).one()
+            assert suite.status == "failed"
+            assert "simulated mid-Phase-1" in (suite.setup_error_ref or "")
             assert s.query(TAOJob).count() == 0
             from vlm_feedback_loop.db.models.dataset_export import DatasetExport
 
-            assert s.query(DatasetExport).count() == 2
+            exports = s.query(DatasetExport).all()
+            assert {row.dataset_export_id for row in exports} == {
+                suite.training_dataset_export_id,
+                suite.evaluation_dataset_export_id,
+            }
+
         mock_submit.assert_not_called()
 
 
@@ -1439,7 +1870,6 @@ class TestWriteDiscipline:
             session,
             *,
             dataset_export,
-            archive_path,
             deployment_config,
             s3_client,
             **kw,
@@ -1459,7 +1889,6 @@ class TestWriteDiscipline:
             return await _noop_upload(
                 session,
                 dataset_export=dataset_export,
-                archive_path=archive_path,
                 deployment_config=deployment_config,
                 s3_client=s3_client,
                 **kw,
@@ -1502,7 +1931,7 @@ class TestGuidancePinning:
 
         engine, project_dir, settings = seeded
 
-        real_create = training_suite_service.create_dataset_export
+        real_create = training_suite_service.persist_dataset_export_in_session
         flipped = {"done": False}
 
         def flipping_create(*args, **kwargs):
@@ -1528,7 +1957,7 @@ class TestGuidancePinning:
 
         monkeypatch.setattr(
             training_suite_service,
-            "create_dataset_export",
+            "persist_dataset_export_in_session",
             flipping_create,
         )
         result = await training_suite_service.create_training_suite(
@@ -1538,14 +1967,16 @@ class TestGuidancePinning:
             include_auto_labeled=False,
             export_field_mode="all",
             quantization_schemes=["FP8_DYNAMIC"],
-            idempotency_key="guidance-flip-1",
+            idempotency_key="flip-1",
             settings=settings,
         )
 
         assert isinstance(result, str), result
         assert result.startswith("conflict:")
         with Session(engine) as s:
-            assert s.query(TrainingSuite).count() == 0
+            suite = s.query(TrainingSuite).one()
+            assert suite.status == "failed"
+            assert "active Guidance changed" in (suite.setup_error_ref or "")
             assert s.query(TAOJob).count() == 0
             # Both exports were built under the ORIGINAL pinned Guidance,
             # not split across versions.
@@ -1556,16 +1987,15 @@ class TestGuidancePinning:
 
 class TestGuidanceEditStraddle:
     @pytest.mark.asyncio
-    async def test_edit_committing_inside_phase_1d_window_conflicts(
+    async def test_guidance_edit_before_atomic_chain_commit_conflicts(
         self, seeded, mock_submit
     ):
-        """Every read before Phase 1d's transaction runs on autocommit, so
-        an edit committing just before the suite's first write previously
-        persisted a TrainingSuite pinned to a retired Guidance — hours of
-        TAO training against a schema the SME just retired. The post-flush
-        re-read under the write lock must catch it and refuse with a
-        conflict. The listener commits the edit at the transaction's first
-        TAO write, inside the exact window."""
+        """A Guidance edit before chain commit must invalidate frozen setup.
+
+        The listener commits the edit at the transaction's first TAO write,
+        reproducing the boundary where a stale suite could otherwise start
+        hours of training against a schema the SME just retired.
+        """
         from sqlalchemy import event, text
 
         engine, project_dir, settings = seeded
@@ -1616,7 +2046,10 @@ class TestGuidanceEditStraddle:
         assert result.startswith("conflict:")
         assert "active Guidance changed" in result
         with Session(engine) as s:
-            assert s.query(TrainingSuite).count() == 0
+            suite = s.query(TrainingSuite).one()
+            assert suite.status == "failed"
+            assert "active Guidance changed" in (suite.setup_error_ref or "")
+            assert s.query(TAOJob).count() == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1632,6 +2065,113 @@ class TestWorkspaceS3UploadWiring:
     replay never re-uploads."""
 
     @pytest.mark.asyncio
+    async def test_generated_exports_pass_real_integrity_and_upload_contract(
+        self, seeded, mock_submit
+    ):
+        _, _, settings = seeded
+        s3 = FakeS3Client()
+
+        result = await training_suite_service.create_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="quick",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=[],
+            idempotency_key="real-upload-contract",
+            settings=settings,
+            _upload_archive=_real_upload_dataset_archive,
+            _s3_client=s3,
+        )
+
+        assert isinstance(result, dict), result
+        uploaded_keys = [
+            kwargs["Key"] for method, kwargs in s3.calls if method == "put_object"
+        ]
+        assert len(uploaded_keys) == 4
+        assert sum(key.endswith(".tar.gz") for key in uploaded_keys) == 2
+        assert sum(key.endswith("_annotations.json") for key in uploaded_keys) == 2
+
+    @pytest.mark.asyncio
+    async def test_divergent_generated_sidecar_aborts_before_s3_or_chain_creation(
+        self, seeded, mock_submit
+    ):
+        engine, _, settings = seeded
+        s3 = FakeS3Client()
+
+        async def corrupt_then_upload(
+            session,
+            *,
+            dataset_export,
+            deployment_config,
+            s3_client,
+            settings,
+        ):
+            refs = dataset_export.artifact_refs or {}
+            Path(refs["annotations_path"]).write_text("[]", encoding="utf-8")
+            return await _real_upload_dataset_archive(
+                session,
+                dataset_export=dataset_export,
+                deployment_config=deployment_config,
+                s3_client=s3_client,
+                settings=settings,
+            )
+
+        result = await training_suite_service.create_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="quick",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=[],
+            idempotency_key="corrupt-upload-contract",
+            settings=settings,
+            _upload_archive=corrupt_then_upload,
+            _s3_client=s3,
+        )
+
+        assert isinstance(result, str)
+        assert result.startswith("tao_dataset_upload_failed:")
+        assert "re-export" in result.lower()
+        assert s3.calls == []
+        with Session(engine) as session:
+            suite = session.query(TrainingSuite).one()
+            assert suite.status == "failed"
+            assert "integrity check failed" in (suite.setup_error_ref or "")
+            assert suite.training_dataset_export_id is not None
+            assert suite.evaluation_dataset_export_id is not None
+            suite_id = suite.training_suite_id
+            assert session.query(TAOJob).count() == 0
+
+        snapshot = training_suite_service.get_training_suite(
+            PID,
+            suite_id,
+            settings=settings,
+        )
+        assert isinstance(snapshot, dict)
+        assert snapshot["setup_retryable"] is False
+
+        async def upload_must_not_run(*_args, **_kwargs):
+            pytest.fail("an integrity-failed frozen export must not be resumed")
+
+        replay = await training_suite_service.create_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="quick",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=[],
+            idempotency_key="corrupt-upload-contract",
+            settings=settings,
+            _upload_archive=upload_must_not_run,
+            _s3_client=object(),
+        )
+        assert isinstance(replay, dict)
+        assert replay["training_suite_id"] == suite_id
+        assert replay["status"] == "failed"
+        mock_submit.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_upload_runs_after_export_and_before_chain_rows(
         self, seeded, mock_submit
     ):
@@ -1644,7 +2184,6 @@ class TestWorkspaceS3UploadWiring:
             session,
             *,
             dataset_export,
-            archive_path,
             deployment_config,
             s3_client,
             **kw,
@@ -1659,7 +2198,6 @@ class TestWorkspaceS3UploadWiring:
             return await _noop_upload(
                 session,
                 dataset_export=dataset_export,
-                archive_path=archive_path,
                 deployment_config=deployment_config,
                 s3_client=s3_client,
                 **kw,
@@ -1723,17 +2261,18 @@ class TestWorkspaceS3UploadWiring:
                 # quantize → top-level dataset.{media_dir, annotation_path}
                 # (cosmos-rl-quantize accepts --media_dir;
                 # --media_path is rejected as an unknown arg).
-                all_paths: list[str] = []
+                media_paths: list[str] = []
+                annotation_paths: list[str] = []
                 custom = specs.get("custom") or {}
                 for key in ("train_dataset", "val_dataset"):
                     ds = custom.get(key) or {}
-                    all_paths.append(str(ds.get("media_path", "")))
-                    all_paths.append(str(ds.get("annotation_path", "")))
+                    media_paths.append(str(ds.get("media_path", "")))
+                    annotation_paths.append(str(ds.get("annotation_path", "")))
                 if "dataset" in specs:
                     ds = specs["dataset"]
-                    all_paths.append(str(ds.get("media_dir", "")))
-                    all_paths.append(str(ds.get("annotation_path", "")))
-                for p in all_paths:
+                    media_paths.append(str(ds.get("media_dir", "")))
+                    annotation_paths.append(str(ds.get("annotation_path", "")))
+                for p in [*media_paths, *annotation_paths]:
                     if p:
                         # Test fixture has cloud_type="seaweedfs" so the
                         # spec reference must use the seaweedfs:// scheme
@@ -1747,12 +2286,62 @@ class TestWorkspaceS3UploadWiring:
                         assert "/exports/" not in p, (
                             f"Blueprint-local path leaked into TAO spec: {p!r}"
                         )
+                for annotation_path in annotation_paths:
+                    if annotation_path:
+                        assert annotation_path.endswith("_annotations.json")
+                        assert annotation_path not in media_paths
 
     @pytest.mark.asyncio
-    async def test_upload_failure_rolls_back_without_orphan_chains(
+    async def test_success_without_annotation_reference_refuses_chain_creation(
         self, seeded, mock_submit
     ):
-        """A failed S3 upload aborts Phase 1 — no TAOJobs + no TrainingSuite."""
+        engine, _, settings = seeded
+
+        async def omit_training_annotation_reference(
+            session,
+            *,
+            dataset_export,
+            deployment_config,
+            s3_client,
+            **kwargs,
+        ):
+            result = await _noop_upload(
+                session,
+                dataset_export=dataset_export,
+                deployment_config=deployment_config,
+                s3_client=s3_client,
+                **kwargs,
+            )
+            if dataset_export.dataset_intent == "training":
+                result.annotation_spec_reference = None
+            return result
+
+        with pytest.raises(RuntimeError, match="no spec reference"):
+            await training_suite_service.create_training_suite(
+                PID,
+                student_base_model_config_ids=[MC_8B],
+                training_preset="quick",
+                include_auto_labeled=False,
+                export_field_mode="all",
+                quantization_schemes=[],
+                idempotency_key="missing-annotation-reference",
+                settings=settings,
+                _upload_archive=omit_training_annotation_reference,
+                _s3_client=object(),
+            )
+
+        with Session(engine) as session:
+            suite = session.query(TrainingSuite).one()
+            assert suite.status == "failed"
+            assert "no spec reference" in (suite.setup_error_ref or "")
+            assert session.query(TAOJob).count() == 0
+        mock_submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_upload_failure_persists_retryable_prechain_suite(
+        self, seeded, mock_submit
+    ):
+        """A transfer failure keeps only the suite/export retry lineage."""
         engine, _, settings = seeded
 
         from vlm_feedback_loop.services.tao_dataset_upload_service import UploadResult
@@ -1761,7 +2350,6 @@ class TestWorkspaceS3UploadWiring:
             session,
             *,
             dataset_export,
-            archive_path,
             deployment_config,
             s3_client,
             **kw,
@@ -1784,24 +2372,489 @@ class TestWorkspaceS3UploadWiring:
             _upload_archive=failing_upload,
             _s3_client=object(),
         )
-        # A workspace-S3 upload failure is infra, not client input: the
-        # service must classify it tao_unreachable (→ 503 via
-        # map_service_error), not as a 400 validation error.
+        # Dataset upload has one endpoint-specific public failure contract.
         assert isinstance(result, str)
-        assert result.startswith("tao_unreachable:")
+        assert result.startswith("tao_dataset_upload_failed:")
+        assert "transient transfers" in result.lower()
+        assert "workspace storage" in result.lower()
         from vlm_feedback_loop.services.errors import map_service_error
 
-        assert map_service_error(result).status_code == 503
-        # No TrainingSuite and no TAOJob rows persist. The two Phase-1b
-        # DatasetExports remain — they committed before the upload began
-        # (the upload runs outside any write transaction) and
-        # match the archives already on disk.
+        assert map_service_error(result).status_code == 409
+        # The pre-chain suite owns both exports so a same-key retry can repair
+        # the original object pair. No TAOJob row exists yet.
         with Session(engine) as s:
-            assert s.query(TrainingSuite).count() == 0
+            suite = s.query(TrainingSuite).one()
+            assert suite.status == "failed"
+            assert result in (suite.setup_error_ref or "")
             assert s.query(TAOJob).count() == 0
             from vlm_feedback_loop.db.models.dataset_export import DatasetExport
 
-            assert s.query(DatasetExport).count() == 2
+            exports = s.query(DatasetExport).all()
+            assert {row.dataset_export_id for row in exports} == {
+                suite.training_dataset_export_id,
+                suite.evaluation_dataset_export_id,
+            }
+
+        mismatch = await training_suite_service.create_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="standard",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=["FP8_DYNAMIC"],
+            idempotency_key="upload-fail-k",
+            settings=settings,
+            _upload_archive=failing_upload,
+            _s3_client=object(),
+        )
+        assert isinstance(mismatch, str)
+        assert mismatch.startswith("conflict:")
+        assert "different request body" in mismatch
+
+        lora_mismatch = await training_suite_service.create_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="quick",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=["FP8_DYNAMIC"],
+            idempotency_key="upload-fail-k",
+            settings=settings,
+            enable_lora=False,
+            _upload_archive=failing_upload,
+            _s3_client=object(),
+        )
+        assert isinstance(lora_mismatch, str)
+        assert lora_mismatch.startswith("conflict:")
+        assert "different request body" in lora_mismatch
+        mock_submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failed_sidecar_number", [1, 2])
+    async def test_same_key_retry_repairs_original_export_pairs(
+        self,
+        seeded,
+        mock_submit,
+        failed_sidecar_number: int,
+    ):
+        """Retry reuses both export ids after training or evaluation failure."""
+        engine, _, settings = seeded
+
+        class FailNthSidecarPut(FakeS3Client):
+            def __init__(self, fail_number: int) -> None:
+                super().__init__()
+                self.fail_number = fail_number
+                self.sidecar_puts = 0
+                self.failure_enabled = True
+
+            def put_object(
+                self,
+                *,
+                Bucket: str,  # noqa: N803
+                Key: str,
+                Body: bytes,
+                Metadata: dict[str, str] | None = None,
+            ) -> dict[str, Any]:
+                if Key.endswith("_annotations.json"):
+                    self.sidecar_puts += 1
+                    if self.failure_enabled and self.sidecar_puts == self.fail_number:
+                        self._record(
+                            "put_object",
+                            {
+                                "Bucket": Bucket,
+                                "Key": Key,
+                                "size": len(Body),
+                                "Metadata": Metadata,
+                            },
+                        )
+                        raise RuntimeError("simulated sidecar transfer failure")
+                return super().put_object(
+                    Bucket=Bucket,
+                    Key=Key,
+                    Body=Body,
+                    Metadata=Metadata,
+                )
+
+        s3 = FailNthSidecarPut(failed_sidecar_number)
+        request = {
+            "student_base_model_config_ids": [MC_8B],
+            "training_preset": "quick",
+            "include_auto_labeled": False,
+            "export_field_mode": "all",
+            "quantization_schemes": [],
+            "idempotency_key": f"repair-sidecar-{failed_sidecar_number}",
+            "settings": settings,
+            "_upload_archive": _real_upload_dataset_archive,
+            "_s3_client": s3,
+        }
+
+        first = await training_suite_service.create_training_suite(PID, **request)
+
+        assert isinstance(first, str)
+        assert first.startswith("tao_dataset_upload_failed:")
+        with Session(engine) as session:
+            failed_suite = session.query(TrainingSuite).one()
+            assert failed_suite.status == "failed"
+            suite_id = failed_suite.training_suite_id
+            export_ids = (
+                failed_suite.training_dataset_export_id,
+                failed_suite.evaluation_dataset_export_id,
+            )
+            assert None not in export_ids
+            assert session.query(TAOJob).count() == 0
+        previously_staged_keys = set(s3.objects)
+        assert len(previously_staged_keys) == (1 if failed_sidecar_number == 1 else 3)
+
+        s3.failure_enabled = False
+        second = await training_suite_service.create_training_suite(PID, **request)
+
+        assert isinstance(second, dict), second
+        assert second["training_suite_id"] == suite_id
+        assert (
+            second["training_dataset_export_id"],
+            second["evaluation_dataset_export_id"],
+        ) == export_ids
+        assert len(s3.objects) == 4
+        put_keys = [
+            kwargs["Key"] for method, kwargs in s3.calls if method == "put_object"
+        ]
+        for _, key in previously_staged_keys:
+            assert put_keys.count(key) == 1
+        with Session(engine) as session:
+            assert session.query(TrainingSuite).count() == 1
+            assert session.query(TAOJob).count() == 2
+            from vlm_feedback_loop.db.models.dataset_export import DatasetExport
+
+            assert session.query(DatasetExport).count() == 2
+        mock_submit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_replay_does_not_duplicate_failed_upload_resume(
+        self, seeded, mock_submit
+    ):
+        engine, _, settings = seeded
+
+        async def fail_first_upload(
+            _session,
+            *,
+            dataset_export,
+            **_kwargs,
+        ):
+            from vlm_feedback_loop.services.tao_dataset_upload_service import (
+                UploadResult,
+            )
+
+            return UploadResult(
+                success=False,
+                dataset_export_id=dataset_export.dataset_export_id,
+                error="S3 upload failed: transient",
+            )
+
+        request = {
+            "student_base_model_config_ids": [MC_8B],
+            "training_preset": "quick",
+            "include_auto_labeled": False,
+            "export_field_mode": "all",
+            "quantization_schemes": [],
+            "idempotency_key": "concurrent-upload-retry",
+            "settings": settings,
+            "_s3_client": object(),
+        }
+        failed = await training_suite_service.create_training_suite(
+            PID,
+            **request,
+            _upload_archive=fail_first_upload,
+        )
+        assert isinstance(failed, str)
+
+        entered_upload = asyncio.Event()
+        release_upload = asyncio.Event()
+        calls = 0
+
+        async def blocking_upload(
+            session,
+            *,
+            dataset_export,
+            deployment_config,
+            s3_client,
+            **kwargs,
+        ):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered_upload.set()
+                await release_upload.wait()
+            return await _noop_upload(
+                session,
+                dataset_export=dataset_export,
+                deployment_config=deployment_config,
+                s3_client=s3_client,
+                **kwargs,
+            )
+
+        retry_task = asyncio.create_task(
+            training_suite_service.create_training_suite(
+                PID,
+                **request,
+                _upload_archive=blocking_upload,
+            )
+        )
+        await asyncio.wait_for(entered_upload.wait(), timeout=1)
+
+        replay = await training_suite_service.create_training_suite(
+            PID,
+            **request,
+            _upload_archive=blocking_upload,
+        )
+
+        assert isinstance(replay, dict)
+        assert replay["status"] == "preparing"
+        assert replay["chains"] == []
+        assert calls == 1
+
+        changed_body = await training_suite_service.create_training_suite(
+            PID,
+            **request,
+            enable_lora=False,
+            _upload_archive=blocking_upload,
+        )
+        assert isinstance(changed_body, str)
+        assert changed_body.startswith("conflict:")
+        assert "different request body" in changed_body
+        assert calls == 1
+
+        release_upload.set()
+        completed = await asyncio.wait_for(retry_task, timeout=2)
+        assert isinstance(completed, dict)
+        assert completed["training_suite_id"] == replay["training_suite_id"]
+        assert calls == 2
+        with Session(engine) as session:
+            assert session.query(TrainingSuite).count() == 1
+            assert session.query(TAOJob).count() == 2
+        mock_submit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_late_upload_completion_preserves_suite_cancellation(
+        self, seeded, mock_submit
+    ):
+        """A transfer finishing after cancel cannot reactivate its suite."""
+        engine, _, settings = seeded
+        entered_upload = asyncio.Event()
+        release_upload = asyncio.Event()
+
+        async def blocking_upload(
+            session,
+            *,
+            dataset_export,
+            deployment_config,
+            s3_client,
+            **kwargs,
+        ):
+            entered_upload.set()
+            await release_upload.wait()
+            return await _noop_upload(
+                session,
+                dataset_export=dataset_export,
+                deployment_config=deployment_config,
+                s3_client=s3_client,
+                **kwargs,
+            )
+
+        task = asyncio.create_task(
+            training_suite_service.create_training_suite(
+                PID,
+                student_base_model_config_ids=[MC_8B],
+                training_preset="quick",
+                include_auto_labeled=False,
+                export_field_mode="all",
+                quantization_schemes=[],
+                idempotency_key="cancel-during-upload",
+                settings=settings,
+                _upload_archive=blocking_upload,
+                _s3_client=object(),
+            )
+        )
+        await asyncio.wait_for(entered_upload.wait(), timeout=1)
+
+        with Session(engine) as session:
+            suite = session.query(TrainingSuite).one()
+            suite.status = "canceled"
+            suite.completed_at = utc_now()
+            session.commit()
+
+        release_upload.set()
+        result = await asyncio.wait_for(task, timeout=2)
+
+        assert isinstance(result, str)
+        assert result.startswith("conflict:")
+        with Session(engine) as session:
+            suite = session.query(TrainingSuite).one()
+            assert suite.status == "canceled"
+            assert session.query(TAOJob).count() == 0
+        mock_submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_first_submission_cannot_resurrect_suite(
+        self, seeded, mock_submit, monkeypatch
+    ):
+        """A TAO acceptance arriving after cancel preserves both terminals."""
+        engine, _, settings = seeded
+        entered_submit = asyncio.Event()
+        release_submit = asyncio.Event()
+
+        async def blocking_submit(*_args, **_kwargs):
+            entered_submit.set()
+            await release_submit.wait()
+            return {
+                "success": True,
+                "tao_external_job_id": "ext-after-cancel",
+                "error": None,
+            }
+
+        mock_submit.side_effect = blocking_submit
+        remote_cancel = AsyncMock(return_value={"success": True, "error": None})
+        monkeypatch.setattr(
+            training_suite_service.tao_job_service,
+            "request_tao_job_cancel",
+            remote_cancel,
+        )
+        monkeypatch.setattr(
+            training_suite_service.background_manager,
+            "cancel_task",
+            AsyncMock(return_value=False),
+        )
+        monkeypatch.setattr(training_suite_service.sse_manager, "emit", AsyncMock())
+
+        create_task = asyncio.create_task(
+            training_suite_service.create_training_suite(
+                PID,
+                student_base_model_config_ids=[MC_8B],
+                training_preset="quick",
+                include_auto_labeled=False,
+                export_field_mode="all",
+                quantization_schemes=[],
+                idempotency_key="cancel-during-submit",
+                settings=settings,
+                _upload_archive=_noop_upload,
+                _s3_client=object(),
+            )
+        )
+        await asyncio.wait_for(entered_submit.wait(), timeout=2)
+        with Session(engine) as session:
+            suite_id = session.query(TrainingSuite.training_suite_id).scalar()
+            assert suite_id is not None
+
+        canceled = await training_suite_service.cancel_training_suite(
+            PID,
+            suite_id,
+            settings=settings,
+        )
+        assert not isinstance(canceled, str)
+        release_submit.set()
+        result = await asyncio.wait_for(create_task, timeout=2)
+
+        assert isinstance(result, dict)
+        assert result["status"] == "canceled"
+        remote_cancel.assert_awaited_once_with(
+            "ext-after-cancel",
+            settings=settings,
+        )
+        with Session(engine) as session:
+            suite = session.get(TrainingSuite, suite_id)
+            assert suite is not None
+            assert suite.status == "canceled"
+            train = session.query(TAOJob).filter_by(action="train").one()
+            assert train.status == "canceled"
+            assert train.tao_external_job_id == "ext-after-cancel"
+
+    @pytest.mark.asyncio
+    async def test_export_row_and_suite_link_roll_back_together(
+        self, seeded, mock_submit, monkeypatch
+    ):
+        """A setup transition at the link boundary cannot orphan an export."""
+        engine, project_dir, settings = seeded
+        real_persist = training_suite_service.persist_dataset_export_in_session
+        injected = False
+
+        def interrupt_before_link(session, *args, **kwargs):
+            nonlocal injected
+            result = real_persist(session, *args, **kwargs)
+            if not isinstance(result, str) and not injected:
+                injected = True
+                suite = session.query(TrainingSuite).one()
+                suite.status = "failed"
+                session.flush()
+            return result
+
+        monkeypatch.setattr(
+            training_suite_service,
+            "persist_dataset_export_in_session",
+            interrupt_before_link,
+        )
+        result = await training_suite_service.create_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="quick",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=[],
+            idempotency_key="atomic-export-link",
+            settings=settings,
+            _upload_archive=_noop_upload,
+            _s3_client=object(),
+        )
+
+        assert isinstance(result, str)
+        assert result.startswith("conflict:")
+        with Session(engine) as session:
+            suite = session.query(TrainingSuite).one()
+            assert suite.status == "failed"
+            assert suite.training_dataset_export_id is None
+            assert suite.evaluation_dataset_export_id is None
+            from vlm_feedback_loop.db.models.dataset_export import DatasetExport
+
+            assert session.query(DatasetExport).count() == 0
+        assert list((project_dir / "exports").glob("*")) == []
+        mock_submit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_s3_client_configuration_failure_uses_upload_contract(
+        self, seeded, mock_submit, monkeypatch
+    ):
+        engine, _, settings = seeded
+
+        def reject_missing_credentials(_deployment_config, **_kwargs):
+            raise ValueError("workspace S3 credentials are not configured")
+
+        monkeypatch.setattr(
+            training_suite_service,
+            "build_s3_client",
+            reject_missing_credentials,
+        )
+        result = await training_suite_service.create_training_suite(
+            PID,
+            student_base_model_config_ids=[MC_8B],
+            training_preset="quick",
+            include_auto_labeled=False,
+            export_field_mode="all",
+            quantization_schemes=[],
+            idempotency_key="upload-client-config-fail",
+            settings=settings,
+        )
+
+        assert isinstance(result, str)
+        assert result.startswith("tao_dataset_upload_failed:")
+        assert "workspace storage" in result.lower()
+        from vlm_feedback_loop.services.errors import map_service_error
+
+        assert map_service_error(result).status_code == 409
+        with Session(engine) as session:
+            suite = session.query(TrainingSuite).one()
+            assert suite.status == "failed"
+            assert result in (suite.setup_error_ref or "")
+            assert suite.training_dataset_export_id is not None
+            assert suite.evaluation_dataset_export_id is not None
+            assert session.query(TAOJob).count() == 0
         mock_submit.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1815,7 +2868,6 @@ class TestWorkspaceS3UploadWiring:
             session,
             *,
             dataset_export,
-            archive_path,
             deployment_config,
             s3_client,
             **kw,
@@ -1824,7 +2876,6 @@ class TestWorkspaceS3UploadWiring:
             return await _noop_upload(
                 session,
                 dataset_export=dataset_export,
-                archive_path=archive_path,
                 deployment_config=deployment_config,
                 s3_client=s3_client,
                 **kw,

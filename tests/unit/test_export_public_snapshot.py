@@ -66,7 +66,7 @@ def _committed_repo(tmp_path: Path, files: dict[str, str]) -> Path:
 def test_build_snapshot_uses_committed_files_and_removes_private_paths(
     tmp_path: Path,
 ) -> None:
-    """The candidate contains tracked product files, never private or local state."""
+    """The candidate contains the product, never private acceptance or local state."""
 
     internal_report = "docs" + "/internal/report.md"
     repo = _committed_repo(
@@ -79,9 +79,14 @@ def test_build_snapshot_uses_committed_files_and_removes_private_paths(
                 f"{exporter.AUTORUN_BLOCK_END}\n"
             ),
             "docs/API.md": "API\n",
+            "docs/live-release-acceptance.md": "private run ledger\n",
             internal_report: "private evidence\n",
             "docs/fixtures/pinned/study.json": "{}\n",
+            "scripts/prepare_training_clone.py": "acceptance = True\n",
             "scripts/research/experiment.py": "research = True\n",
+            "tests/unit/test_prepare_training_clone.py": (
+                "def test_acceptance_helper(): pass\n"
+            ),
             ".claude/settings.json": "{}\n",
             ".codex/config.toml": "model = 'private'\n",
         },
@@ -96,9 +101,12 @@ def test_build_snapshot_uses_committed_files_and_removes_private_paths(
 
     assert (snapshot / "README.md").read_text(encoding="utf-8") == "Public readme\n"
     assert (snapshot / "docs/API.md").is_file()
+    assert not (snapshot / "docs/live-release-acceptance.md").exists()
     assert not (snapshot / "docs" / "internal").exists()
     assert not (snapshot / "docs/fixtures/pinned").exists()
+    assert not (snapshot / "scripts/prepare_training_clone.py").exists()
     assert not (snapshot / "scripts/research").exists()
+    assert not (snapshot / "tests/unit/test_prepare_training_clone.py").exists()
     assert not (snapshot / ".claude").exists()
     assert not (snapshot / ".codex").exists()
     assert not (snapshot / ".env").exists()
@@ -168,6 +176,66 @@ def test_build_snapshot_can_include_autorun(tmp_path: Path) -> None:
     readme = (snapshot / "README.md").read_text(encoding="utf-8")
     assert "AutoRun docs" in readme
     assert exporter.AUTORUN_BLOCK_START not in readme
+
+
+def test_build_snapshot_removes_private_machine_agent_instructions(
+    tmp_path: Path,
+) -> None:
+    """Public agent twins retain product guidance without source-host assumptions."""
+
+    agent_text = (
+        "# Agent instructions\n"
+        f"{exporter.SOURCE_ONLY_BLOCK_START}\n"
+        "Full sudo on this machine. Use ~/vlm-ui-inspector.\n"
+        f"{exporter.SOURCE_ONLY_BLOCK_END}\n"
+        "Run ./scripts/ci-local.sh before committing.\n"
+    )
+    repo = _committed_repo(
+        tmp_path,
+        {
+            "AGENTS.md": agent_text,
+            "CLAUDE.md": agent_text,
+            "README.md": "Public readme\n",
+        },
+    )
+    working_dir = tmp_path / "work"
+    working_dir.mkdir()
+
+    snapshot = exporter.build_snapshot(
+        repo,
+        exporter.resolve_commit(repo, "HEAD"),
+        working_dir,
+    )
+
+    public_agents = (snapshot / "AGENTS.md").read_text(encoding="utf-8")
+    assert public_agents == (snapshot / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "Full sudo" not in public_agents
+    assert "vlm-ui-inspector" not in public_agents
+    assert exporter.SOURCE_ONLY_BLOCK_START not in public_agents
+    assert "Run ./scripts/ci-local.sh before committing." in public_agents
+
+
+def test_unbalanced_source_only_markers_stop_export(tmp_path: Path) -> None:
+    """A malformed source-only block cannot silently leak private assumptions."""
+
+    repo = _committed_repo(
+        tmp_path,
+        {
+            "AGENTS.md": (
+                f"{exporter.SOURCE_ONLY_BLOCK_START}\nunterminated private docs\n"
+            ),
+            "README.md": "Public readme\n",
+        },
+    )
+    working_dir = tmp_path / "work"
+    working_dir.mkdir()
+
+    with pytest.raises(exporter.ExportError, match="Unbalanced source-only"):
+        exporter.build_snapshot(
+            repo,
+            exporter.resolve_commit(repo, "HEAD"),
+            working_dir,
+        )
 
 
 def test_unbalanced_autorun_documentation_markers_stop_export(
@@ -302,17 +370,28 @@ def test_public_mirror_name_does_not_match_private_repository_prefix(
     )
 
 
-def test_vendored_nebula_distribution_is_stageable_in_a_fresh_public_repo() -> None:
+def test_vendored_nebula_distribution_is_stageable_in_a_fresh_public_repo(
+    tmp_path: Path,
+) -> None:
     """The generic dist ignore must not drop the UI's vendored dependency."""
 
+    public_repo = tmp_path / "public"
+    public_repo.mkdir()
+    _git(public_repo, "init", "--quiet")
+    _write(
+        public_repo,
+        ".gitignore",
+        (exporter.REPO_ROOT / ".gitignore").read_text(encoding="utf-8"),
+    )
     for relative in (
         "src/ui/src/components/nebula/dist/index.d.mts",
         "src/ui/src/components/nebula/dist/index.mjs",
         "src/ui/src/components/nebula/dist/styles.css",
     ):
+        _write(public_repo, relative, "vendored distribution fixture\n")
         result = subprocess.run(
             ["git", "check-ignore", "--no-index", "--quiet", relative],
-            cwd=exporter.REPO_ROOT,
+            cwd=public_repo,
             check=False,
         )
         assert result.returncode == 1, f"{relative} is still ignored"

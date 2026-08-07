@@ -116,6 +116,33 @@ class TestKeyCollision:
         assert str(img2) in result["error"]
 
 
+class TestStorageRefDuplicate:
+    """The same source image cannot enter one project under a second key."""
+
+    def test_same_path_different_key_is_rejected(self, tmp_path: Path):
+        client = make_api_client(tmp_path)
+        project = create_project_via_api(client)
+        pid = project["project_id"]
+        img = make_test_image(tmp_path / "same.jpg")
+
+        first = _ingest(
+            client, pid, [{"example_key": "first", "storage_ref": str(img)}]
+        )
+        assert first["results"][0]["status"] == "created"
+
+        second = _ingest(
+            client, pid, [{"example_key": "second", "storage_ref": str(img)}]
+        )
+        result = second["results"][0]
+        assert result["status"] == "error"
+        assert result["error_code"] == "storage_ref_already_ingested"
+        assert "first" in result["error"]
+        assert str(img) in result["error"]
+
+        examples = client.get(f"/v1/projects/{pid}/examples").json()["items"]
+        assert [item["example"]["example_key"] for item in examples] == ["first"]
+
+
 class TestServerSetIngestedAt:
     """Verify: ingested_at is server-set, client value ignored."""
 
@@ -169,7 +196,7 @@ class TestPHashAfterSweeper:
         # endpoint kicked off via trigger_ingest_processing — calling
         # _ingest_worker directly here is equivalent and deterministic.
         settings = make_settings(tmp_path / "workspace")
-        asyncio.run(_ingest_worker(pid, settings.WORKSPACE_ROOT))
+        asyncio.run(_ingest_worker(pid, settings.WORKSPACE_ROOT, settings))
 
         # Re-fetch the example and assert pHash is now populated.
         from sqlalchemy import select
@@ -295,8 +322,9 @@ class TestPHashHexEncoded:
     def test_phash_format(self, tmp_path: Path):
         from vlm_feedback_loop.services.phash import compute_phash_from_path
 
+        settings = make_settings(tmp_path / "workspace")
         img_path = make_test_image(tmp_path / "img.jpg")
-        h = compute_phash_from_path(str(img_path))
+        h = compute_phash_from_path(str(img_path), settings=settings)
 
         assert h is not None
         assert len(h) == 16
@@ -326,9 +354,10 @@ class TestPHashDeterministic:
     def test_determinism(self, tmp_path: Path):
         from vlm_feedback_loop.services.phash import compute_phash_from_path
 
+        settings = make_settings(tmp_path / "workspace")
         img_path = make_test_image(tmp_path / "img.jpg", width=200, height=200)
-        h1 = compute_phash_from_path(str(img_path))
-        h2 = compute_phash_from_path(str(img_path))
+        h1 = compute_phash_from_path(str(img_path), settings=settings)
+        h2 = compute_phash_from_path(str(img_path), settings=settings)
         assert h1 == h2
 
 
@@ -354,7 +383,7 @@ class TestPHashAlwaysComputed:
         # disables CLIP, but the pHash sweeper is independent — it must
         # still populate phash.
         settings = make_settings(tmp_path / "workspace", EMBEDDINGS_AUTO_COMPUTE=False)
-        asyncio.run(_ingest_worker(pid, settings.WORKSPACE_ROOT))
+        asyncio.run(_ingest_worker(pid, settings.WORKSPACE_ROOT, settings))
 
         from sqlalchemy import select
         from sqlalchemy.orm import Session
@@ -749,11 +778,12 @@ class TestPHashCorrectness:
     def test_different_images_different_hashes(self, tmp_path: Path):
         from vlm_feedback_loop.services.phash import compute_phash_from_path
 
+        settings = make_settings(tmp_path / "workspace")
         img1 = make_test_image(tmp_path / "red.jpg", width=200, height=200)
         img2 = _make_png(tmp_path / "green.png", width=200, height=200)
 
-        h1 = compute_phash_from_path(str(img1))
-        h2 = compute_phash_from_path(str(img2))
+        h1 = compute_phash_from_path(str(img1), settings=settings)
+        h2 = compute_phash_from_path(str(img2), settings=settings)
 
         assert h1 is not None
         assert h2 is not None

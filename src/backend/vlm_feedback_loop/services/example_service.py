@@ -23,6 +23,7 @@ from vlm_feedback_loop.db.models.audit_event import AuditEvent
 from vlm_feedback_loop.db.models.example import Example
 from vlm_feedback_loop.db.models.label import Label
 from vlm_feedback_loop.services import filesystem_service
+from vlm_feedback_loop.services.authorized_file import open_authorized_image
 
 # PIL format names that map to our supported extensions — canonical set
 # lives in ``image_transport``.
@@ -49,6 +50,7 @@ def _validate_image(
     storage_ref: str,
     *,
     full_decode: bool = True,
+    settings: Settings | None = None,
 ) -> tuple[Image.Image | None, str | None, list[str]]:
     """Validate an image file for ingestion.
 
@@ -64,72 +66,84 @@ def _validate_image(
     ``full_decode=True`` remains available to callers that immediately consume
     the returned pixels (the legacy inline-pHash path).
     """
-    path = Path(storage_ref)
     warnings: list[str] = []
+    if settings is None:
+        from vlm_feedback_loop.config import get_settings
 
-    if not path.is_file():
-        return None, f"File not found: {storage_ref}", warnings
+        settings = get_settings()
 
     try:
-        img = Image.open(path)
+        opened = open_authorized_image(storage_ref, settings)
+    except (FileNotFoundError, PermissionError) as exc:
+        return None, str(exc), warnings
+
+    stream = opened.open_binary()
+    try:
+        img = Image.open(stream)
     except Exception as exc:
+        stream.close()
+        opened.close()
         return None, f"Cannot read image: {storage_ref} ({exc})", warnings
 
-    pil_format = img.format
-    if pil_format not in ACCEPTED_PIL_FORMATS:
-        img.close()
-        return (
-            None,
-            f"Unsupported image format: {pil_format or 'unknown'} ({storage_ref})",
-            warnings,
-        )
-
-    # Multi-page TIFF rejection
-    if pil_format == "TIFF":
-        try:
-            img.seek(1)
-            img.seek(0)  # reset
+    try:
+        pil_format = img.format
+        if pil_format not in ACCEPTED_PIL_FORMATS:
             img.close()
+            stream.close()
             return (
                 None,
-                f"Multi-page TIFFs are not supported ({storage_ref})",
+                f"Unsupported image format: {pil_format or 'unknown'} ({storage_ref})",
                 warnings,
             )
-        except EOFError:
-            pass  # single-page TIFF is fine
 
-    # Size warnings (non-blocking)
-    try:
-        file_size = path.stat().st_size
+        # Multi-page TIFF rejection
+        if pil_format == "TIFF":
+            try:
+                img.seek(1)
+                img.seek(0)
+                img.close()
+                stream.close()
+                return (
+                    None,
+                    f"Multi-page TIFFs are not supported ({storage_ref})",
+                    warnings,
+                )
+            except EOFError:
+                pass
+
+        file_size = opened.stat_result.st_size
+        display_name = Path(storage_ref).name
         if file_size > _SIZE_WARNING_BYTES:
             warnings.append(
-                f"{path.name} {file_size / (1024 * 1024):.1f} MB (exceeds 20 MB)"
+                f"{display_name} {file_size / (1024 * 1024):.1f} MB (exceeds 20 MB)"
             )
-    except OSError:
-        pass
 
-    longest_edge = max(img.width, img.height)
-    if longest_edge > _SIZE_WARNING_PX:
-        warnings.append(
-            f"{path.name} {longest_edge} px longest edge "
-            f"(exceeds {_SIZE_WARNING_PX} px)"
-        )
+        longest_edge = max(img.width, img.height)
+        if longest_edge > _SIZE_WARNING_PX:
+            warnings.append(
+                f"{display_name} {longest_edge} px longest edge "
+                f"(exceeds {_SIZE_WARNING_PX} px)"
+            )
 
-    try:
-        if full_decode:
-            cast("Any", img).load()
-        else:
-            # verify() checks the encoded structure without allocating and
-            # decoding the full-resolution raster. It invalidates the Pillow
-            # object, so reopen a lightweight handle for the caller to close.
-            img.verify()
+        try:
+            if full_decode:
+                cast("Any", img).load()
+            else:
+                # verify() invalidates the Pillow object. Reopen from a fresh
+                # duplicate of the same authorized inode for the caller.
+                img.verify()
+                img.close()
+                stream.close()
+                stream = opened.open_binary()
+                img = Image.open(stream)
+        except Exception as exc:
             img.close()
-            img = Image.open(path)
-    except Exception as exc:
-        img.close()
-        return None, f"Cannot read image: {storage_ref} ({exc})", warnings
+            stream.close()
+            return None, f"Cannot read image: {storage_ref} ({exc})", warnings
 
-    return img, None, warnings
+        return img, None, warnings
+    finally:
+        opened.close()
 
 
 # ── Ingestion ───────────────────────────────────────────────────────────────
@@ -251,9 +265,33 @@ def _ingest_single(
             "example": None,
         }
 
+    # A caller can choose its own example_key and scans from older releases
+    # generated keys relative to the selected scan directory. Treat the
+    # persisted source path as a second idempotency boundary so the same image
+    # cannot enter one project twice under different keys.
+    existing_path = session.execute(
+        select(Example).where(
+            Example.project_id == project_id,
+            Example.storage_ref == storage_ref,
+        )
+    ).scalar_one_or_none()
+    if existing_path is not None:
+        return {
+            "example_key": example_key,
+            "status": "error",
+            "error": (
+                "Image path is already ingested under a different example_key. "
+                f"Existing key: {existing_path.example_key}. Path: {storage_ref}."
+            ),
+            "error_code": "storage_ref_already_ingested",
+            "warnings": [],
+            "example": None,
+        }
+
     img, error, warnings = _validate_image(
         storage_ref,
         full_decode=compute_phash_inline,
+        settings=settings,
     )
     if error is not None or img is None:
         return {

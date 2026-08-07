@@ -143,7 +143,8 @@ class TestRequiredSections:
         # docker run command
         assert "docker run -d" in text
         # GPU requirements (memory minimum)
-        assert "GB memory" in text or "GB" in text
+        assert "GPU: at least 24 GB memory" in text
+        assert "GPU memory minimum (this precision): at least 24 GB" in text
         # checkpoint path (host)
         assert "/tmp/ckpt" in text
         # health check command
@@ -159,6 +160,11 @@ class TestRequiredSections:
         assert "student-abc12345" in text
         assert "FP8_DYNAMIC" in text
         assert "1.6.0" in text
+        assert "NVIDIA driver 580.65.06+" in text
+        assert (
+            result["technical_requirements"]["host_prerequisites"]["nvidia_driver"]
+            == "580.65.06+"
+        )
 
     def test_no_student_section_when_student_id_absent(self):
         """Calling the generator with a base Teacher (non-Student) context

@@ -5,7 +5,9 @@
 
 Confirms TAO reachability + safe job-timeout support + workspace readiness +
 per-student-base experiment readiness + ``student_base`` role on each selected
-base model config. Hardware and
+base model config + training-mode and quantization compatibility + sufficient
+Verified training and held-out evaluation data.
+Hardware and
 environment constraints (GPU count/memory, driver/CUDA, disk) are the
 TAO deployment's responsibility; this system communicates with TAO via
 REST API only and cannot inspect remote infrastructure. Any hardware
@@ -34,6 +36,7 @@ from vlm_feedback_loop.db.models.example import Example
 from vlm_feedback_loop.db.models.label import Label
 from vlm_feedback_loop.db.models.model_config import ModelConfig
 from vlm_feedback_loop.db.models.project import Project
+from vlm_feedback_loop.model_catalog_constants import COSMOS3_SUPER_REASONER
 from vlm_feedback_loop.services.project_service import get_project_engine
 from vlm_feedback_loop.services.tao_auth import TaoAuthError
 from vlm_feedback_loop.services.tao_client import probe_tao_connection
@@ -49,6 +52,24 @@ from vlm_feedback_loop.services.training_preset import (
 logger = logging.getLogger("vlm_feedback_loop.services.training_preflight_service")
 
 
+# Live qualification against this release found that Cosmos-RL 6.26.3 cannot
+# tensor-parallelize Cosmos 3 Super after LoRA has wrapped q_proj/v_proj: the
+# PyTorch TP partitioner attempts to register the wrapper's dotted parameter
+# names and fails before the first training step. Super requires TP=8 on the
+# qualified TAO hardware, so full-weight training is the supported path for
+# this exact runtime. Keep the restriction version-scoped so a future runtime
+# can restore LoRA after it is independently qualified.
+_COSMOS3_SUPER_LORA_INCOMPATIBLE_TAGS = frozenset({"6.26.3-cosmos-rl"})
+
+# The qualified Super full-weight baseline trains, packages, and serves through
+# NIM. Its TAO quantize path does not: Accelerate CPU-offloads part of the
+# 62.6-GiB checkpoint and llmcompressor then attempts to observe an
+# unmaterialized meta-device weight (``Tensor.item() cannot be called on meta
+# tensors``). Keep Super available as a baseline Student while failing closed
+# on every quantized variant until a later stack is independently qualified.
+_QUANTIZATION_UNSUPPORTED_MODELS = frozenset({COSMOS3_SUPER_REASONER})
+
+
 async def run_training_preflight(
     *,
     project_id: str,
@@ -56,6 +77,7 @@ async def run_training_preflight(
     settings: Settings,
     include_auto_labeled: bool = True,
     enable_lora: bool = True,
+    quantization_schemes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run the training preflight checks.
 
@@ -80,6 +102,9 @@ async def run_training_preflight(
     passes.
     """
     checks: list[dict[str, Any]] = []
+    effective_quantization_schemes = (
+        ["FP8_DYNAMIC"] if quantization_schemes is None else list(quantization_schemes)
+    )
 
     # 1. TAO reachability — global check, no per-model scope.
     probe = await probe_tao_connection(settings)
@@ -244,9 +269,11 @@ async def run_training_preflight(
             }
         )
 
-    # 7. Per-model student_base role. Query in a single short session.
+    # 7. Per-model student_base role and training-mode compatibility. Query in
+    #    a single short session; model identity remains backend-authoritative.
     engine = get_project_engine(project_id, settings.WORKSPACE_ROOT)
     role_results: dict[str, dict[str, Any]] = {}
+    model_names: dict[str, str] = {}
     resolved_presets: dict[str, dict[str, Any]] = {}
     if engine is not None:
         with Session(engine) as session:
@@ -257,6 +284,7 @@ async def run_training_preflight(
                 .all()
             )
             for row in rows:
+                model_names[row.model_config_id] = row.model_name
                 # Server-resolved training-preset patches for
                 # the Advanced expander — the backend resolver is the ONE
                 # source; the UI renders these instead of recomputing (a
@@ -311,23 +339,63 @@ async def run_training_preflight(
                 }
             )
 
-    # 8. Training data availability. Training exports select Verified
-    #    labels under the ACTIVE guidance outside the Test Pool
-    #    (dataset_export_service) — an empty selection means a
-    #    training suite cannot start, so surface that here instead of
-    #    letting the SME discover it on the Training screen. The Scale-Up
-    #    screen branches on this check to show "No Verified training
-    #    examples yet. Continue labeling." rather than a TAO-setup CTA.
-    checks.append(
-        _check_verified_train_examples(
-            project_id=project_id, workspace_root=settings.WORKSPACE_ROOT
+    for mcid in student_base_model_config_ids:
+        model_name = model_names.get(mcid)
+        if model_name is None:
+            continue
+        lora_incompatible = (
+            enable_lora
+            and model_name == COSMOS3_SUPER_REASONER
+            and settings.COSMOS_RL_CONTAINER_TAG
+            in _COSMOS3_SUPER_LORA_INCOMPATIBLE_TAGS
+        )
+        checks.append(
+            {
+                "check_name": "training_mode_compatible",
+                "passed": not lora_incompatible,
+                "message": (
+                    "Cosmos 3 Super cannot use LoRA with the qualified "
+                    f"Cosmos-RL runtime {settings.COSMOS_RL_CONTAINER_TAG}: "
+                    "its required tensor-parallel training rejects the "
+                    "LoRA-wrapped parameter names before the first training "
+                    "step. Select Full-weight training and rerun readiness."
+                    if lora_incompatible
+                    else (
+                        f"The selected {'LoRA' if enable_lora else 'Full-weight'} "
+                        f"training mode is compatible with {model_name!r}."
+                    )
+                ),
+                "model_config_id": mcid,
+                "remediation": (
+                    "Choose Full-weight under Training Method, then rerun the "
+                    "readiness check."
+                    if lora_incompatible
+                    else None
+                ),
+            }
+        )
+
+    # 8. Per-model quantization compatibility. The selection is part of the
+    # exact suite contract, so readiness must evaluate it rather than treating
+    # quantization as a later best-effort stage.
+    checks.extend(
+        check_quantization_compatibility(
+            model_names=model_names,
+            student_base_model_config_ids=student_base_model_config_ids,
+            quantization_schemes=effective_quantization_schemes,
         )
     )
-    data_summary = _get_training_data_summary(
+
+    # 9. Dataset readiness. A suite needs both a non-empty Verified Training
+    #    Pool and a held-out Test Pool large enough for every automatic
+    #    baseline/quantized evaluation in the chain. These are data blockers,
+    #    not Teacher-quality gates and not TAO infrastructure failures.
+    data_checks, data_summary = check_training_data_readiness(
         project_id=project_id,
         workspace_root=settings.WORKSPACE_ROOT,
         include_auto_labeled=include_auto_labeled,
     )
+    checks.extend(data_checks)
 
     overall = "passed" if all(c["passed"] for c in checks) else "failed"
     logger.info(
@@ -342,6 +410,64 @@ async def run_training_preflight(
         "data_summary": data_summary,
         "resolved_presets": resolved_presets,
     }
+
+
+def check_quantization_compatibility(
+    *,
+    model_names: dict[str, str],
+    student_base_model_config_ids: list[str],
+    quantization_schemes: list[str],
+) -> list[dict[str, Any]]:
+    """Return per-model checks for the exact requested quantization matrix.
+
+    The helper is shared by read-only readiness and final suite
+    materialization so neither a direct API caller nor a long provisioning
+    interval can bypass the supported Student matrix.
+    """
+    requested = list(dict.fromkeys(quantization_schemes))
+    results: list[dict[str, Any]] = []
+    for model_config_id in student_base_model_config_ids:
+        model_name = model_names.get(model_config_id)
+        if model_name is None:
+            # ``student_base_role`` already reports the missing row.
+            continue
+        baseline_only = model_name in _QUANTIZATION_UNSUPPORTED_MODELS
+        unsupported = bool(requested) and baseline_only
+        if unsupported:
+            message = (
+                "Cosmos 3 Super quantization is not currently supported. "
+                "Deselect all quantization schemes to train and deploy "
+                "the full-precision Super baseline."
+            )
+        elif baseline_only:
+            message = (
+                "Cosmos 3 Super quantization is not currently supported. "
+                "Baseline-only training remains available and deploys "
+                "the full-precision Super Student through NIM."
+            )
+        elif requested:
+            message = (
+                f"The requested quantization selection is compatible with "
+                f"{model_name!r}."
+            )
+        else:
+            message = f"Baseline-only training is compatible with {model_name!r}."
+        results.append(
+            {
+                "check_name": "quantization_compatible",
+                "passed": not unsupported,
+                "message": message,
+                "model_config_id": model_config_id,
+                "remediation": (
+                    "Clear every Quantization checkbox, or deselect Cosmos 3 "
+                    "Super and run it separately as a baseline-only suite."
+                    if unsupported
+                    else None
+                ),
+                "restriction": "baseline_only" if baseline_only else None,
+            }
+        )
+    return results
 
 
 def _get_training_data_summary(
@@ -359,12 +485,20 @@ def _get_training_data_summary(
     """
     verified_training_count = 0
     test_pool_count = 0
+    required_test_pool_count = 1
     auto_labeled_eligible_count = 0
     engine = get_project_engine(project_id, workspace_root)
     if engine is not None:
         with Session(engine) as session:
             project = session.get(Project, project_id)
             active_gid = project.active_guidance_id if project else None
+            if project is not None:
+                # An empty evaluation export cannot satisfy the suite's
+                # automatic evaluation contract even when an operator has
+                # explicitly set the Batch gate's pool threshold to zero.
+                required_test_pool_count = max(
+                    1, int(project.scaleup_min_test_pool_size)
+                )
             if active_gid:
                 verified_training_count = (
                     session.query(func.count(func.distinct(Label.example_key)))
@@ -411,6 +545,7 @@ def _get_training_data_summary(
     return {
         "verified_training_count": verified_training_count,
         "test_pool_count": test_pool_count,
+        "required_test_pool_count": required_test_pool_count,
         "auto_labeled_eligible_count": auto_labeled_eligible_count,
         "auto_labeled_included_count": auto_labeled_included_count,
         "excluded_test_pool_count": test_pool_count,
@@ -421,6 +556,34 @@ def _get_training_data_summary(
             verified_training_count + auto_labeled_included_count
         ),
     }
+
+
+def check_training_data_readiness(
+    *,
+    project_id: str,
+    workspace_root: str,
+    include_auto_labeled: bool,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Return the canonical Student-training data checks and count summary.
+
+    ``launch_training_suite`` and the final suite materialization path use the
+    same helper as the read-only preflight so neither an API caller nor a long
+    base-provisioning interval can bypass the dataset requirements.
+    """
+    data_summary = _get_training_data_summary(
+        project_id=project_id,
+        workspace_root=workspace_root,
+        include_auto_labeled=include_auto_labeled,
+    )
+    return (
+        [
+            _check_verified_train_examples(
+                project_id=project_id, workspace_root=workspace_root
+            ),
+            _check_min_test_pool_size(data_summary),
+        ],
+        data_summary,
+    )
 
 
 def _check_verified_train_examples(
@@ -459,6 +622,27 @@ def _check_verified_train_examples(
             f"{'s' if count != 1 else ''} available (Test Pool excluded)."
             if passed
             else "No Verified training examples yet. Continue labeling."
+        ),
+        "model_config_id": None,
+    }
+
+
+def _check_min_test_pool_size(data_summary: dict[str, int]) -> dict[str, Any]:
+    """Require the configured held-out population for Student evaluation."""
+    count = data_summary["test_pool_count"]
+    required = data_summary["required_test_pool_count"]
+    passed = count >= required
+    return {
+        "check_name": "min_test_pool_size",
+        "passed": passed,
+        "message": (
+            f"Test Pool has {count} held-out evaluation example"
+            f"{'s' if count != 1 else ''} (need {required})."
+            if passed
+            else (
+                f"Test Pool has {count} of {required} required held-out "
+                "evaluation examples. Continue labeling to grow the pool."
+            )
         ),
         "model_config_id": None,
     }

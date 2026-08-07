@@ -54,7 +54,7 @@ from vlm_feedback_loop.services import (
 )
 from vlm_feedback_loop.services.hashing import sha256_file
 from vlm_feedback_loop.services.project_service import (
-    clear_engine_cache,
+    close_project_resources,
 )
 
 # In-process e2e over the real proposal/save/eval pipeline: fast standalone,
@@ -71,7 +71,7 @@ GID = "g-integration"
 @pytest.fixture(autouse=True)
 def _cleanup():
     yield
-    clear_engine_cache()
+    close_project_resources()
 
 
 def _settings(workspace: Path):

@@ -95,7 +95,7 @@ def first_matching_pattern(error_text: str | None) -> str | None:
     return next((p for p in MODEL_LOADER_FAILURE_PATTERNS if p in error_text), None)
 
 
-def collect_failure_evidence(tao_job: TAOJob, *, max_chars: int = 32_768) -> str:
+def collect_failure_evidence(tao_job: TAOJob, *, max_chars: int = 65_536) -> str:
     """Concatenate every available failure-text field for signature matching.
 
     Returns a single string joining (in order): ``error_ref``,
@@ -106,9 +106,11 @@ def collect_failure_evidence(tao_job: TAOJob, *, max_chars: int = 32_768) -> str
 
     Truncation keeps the **tail** of oversized log parts (and of the final
     join): container logs put the terminal traceback at the end, so a
-    head-keeping cut discards exactly the text the signatures live in —
-    observed live on the GT-nano evaluate (59 KB log, ``ValueError`` at
-    byte 45 618, silently dropped by the old head cut).
+    head-keeping cut discards exactly the text the signatures live in. The
+    default covers the complete 64 KB TAO log payload that the polling service
+    persists. A smaller 32 KB window missed the Qwen3-VL architecture marker
+    at byte 32 175 of a live 65 536-byte FP8 evaluate log even though NIM
+    loaded and evaluated the same checkpoint cleanly.
     """
     parts: list[str] = []
 
@@ -142,10 +144,15 @@ def find_failed_evaluate_job_for_student(
     session: Session,
     *,
     project_id: str,
-    student_train_tao_job_id: str,
+    student_artifact_tao_job_id: str,
 ) -> TAOJob | None:
-    """Return the most recent failed ``evaluate`` TAOJob whose parent is the
-    student's train job, or ``None`` if no such job exists.
+    """Return the most recent failed ``evaluate`` TAOJob whose parent produced
+    the Student artifact, or ``None`` if no such job exists.
+
+    Baseline Students point at their ``train`` job. Quantized Students point at
+    their ``quantize`` job, whose paired evaluate is not parented by ``train``.
+    Following the artifact parent keeps classification scoped to the exact
+    checkpoint that NIM served.
 
     Used by the NIM-eval-as-quality-fallback gate to decide
     whether the prior TAO failure was a known upstream-loader gap.
@@ -154,7 +161,7 @@ def find_failed_evaluate_job_for_student(
         session.query(TAOJob)
         .filter(
             TAOJob.project_id == project_id,
-            TAOJob.parent_tao_job_id == student_train_tao_job_id,
+            TAOJob.parent_tao_job_id == student_artifact_tao_job_id,
             TAOJob.action == "evaluate",
             TAOJob.status.in_(("failed", "canceled")),
         )
@@ -167,7 +174,7 @@ def matches_known_loader_gap(
     session: Session,
     *,
     project_id: str,
-    student_train_tao_job_id: str,
+    student_artifact_tao_job_id: str,
 ) -> tuple[bool, str | None]:
     """High-level helper: ``(matched, summary)`` describing whether the prior
     TAO eval failure for this Student matches a known upstream loader gap.
@@ -179,7 +186,7 @@ def matches_known_loader_gap(
     failed = find_failed_evaluate_job_for_student(
         session,
         project_id=project_id,
-        student_train_tao_job_id=student_train_tao_job_id,
+        student_artifact_tao_job_id=student_artifact_tao_job_id,
     )
     if failed is None:
         return False, None

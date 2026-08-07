@@ -112,7 +112,7 @@ async def test_response_format_400_falls_back_through_real_invoke_teacher(
     (token-budget, ICL pruning, image prep, prompt rendering, fallback
     dispatch) runs end-to-end.
     """
-    project_service.clear_engine_cache()
+    project_service.close_project_resources()
     workspace = tmp_path / "workspace"
     engine, pid = _seed_project(workspace)
 
@@ -194,4 +194,4 @@ async def test_response_format_400_falls_back_through_real_invoke_teacher(
                 )
     finally:
         app.dependency_overrides.pop(get_current_settings, None)
-        project_service.clear_engine_cache()
+        project_service.close_project_resources()

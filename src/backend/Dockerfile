@@ -5,24 +5,26 @@
 #
 # Multi-stage build:
 #   builder  → installs Python deps into /app/.venv with uv (locked)
-#   runtime  → minimal python:3.12-slim image with the venv, source, and the
-#              isolated TAO base-provisioning helper
+#   runtime  → minimal python:3.12-alpine3.24 image with the venv, source,
+#              and the isolated TAO base-provisioning helper
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 1: builder — resolve and install dependencies with uv
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS builder
+FROM python:3.12-alpine3.24 AS builder
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
-# No compiler toolchain needed: every locked runtime dependency ships a
-# manylinux wheel (verified with `uv sync --frozen --no-dev --no-build
-# --no-install-project`), and the project itself is a pure-Python hatchling
-# build. Pin uv so image builds don't drift with upstream releases.
-RUN pip install --no-cache-dir uv==0.11.6
+# AIPerf's locked psutil and sentencepiece versions do not ship musllinux
+# wheels. Compile those two dependencies here; this entire toolchain remains
+# in the discarded builder stage. The project itself is pure Python. Pin uv
+# so image builds don't drift with upstream releases.
+RUN apk add --no-cache build-base linux-headers cmake git
+
+RUN pip install --no-cache-dir uv==0.12.1
 
 WORKDIR /app
 
@@ -44,26 +46,22 @@ RUN uv sync --frozen --no-dev
 # ─────────────────────────────────────────────────────────────────────────────
 # Stage 2: runtime — minimal image that runs uvicorn as a non-root user
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
+FROM python:3.12-alpine3.24 AS runtime
+
+# sentencepiece links libstdc++; keep only its runtime library, never the
+# compiler toolchain from the builder stage.
+RUN apk add --no-cache libstdc++
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH" \
     HOME="/home/appuser"
 
-# curl is needed by the HEALTHCHECK below; every locked Python runtime
-# dependency ships self-contained manylinux wheels, so no other system
-# libraries are required.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
-
 # Non-root user with a stable HOME — the config loader resolves
 # ~/.vlm_feedback_loop relative to appuser's home directory.
-RUN groupadd --system --gid 1001 appuser \
-    && useradd --system --uid 1001 --gid appuser \
-        --home-dir /home/appuser --create-home \
-        --shell /usr/sbin/nologin appuser
+RUN addgroup -S -g 1001 appuser \
+    && adduser -S -D -u 1001 -G appuser \
+        -h /home/appuser -s /sbin/nologin appuser
 
 # Seed a minimal default config.yaml so the backend boots without a host
 # mount. Every value here is overridable via process env vars (highest
@@ -84,12 +82,11 @@ WORKDIR /app
 COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
 COPY --from=builder --chown=appuser:appuser /app/src /app/src
 # First-use Student-base provisioning runs TAO's packaging stack in an
-# isolated uv environment. Keep uv and only the two required helper files in
-# the runtime image; the large packaging dependency set is downloaded into
-# appuser's cache on first use and never enters the FastAPI venv.
+# isolated uv environment. The helper and requirements are package resources
+# copied with /app/src above; keep the uv executable in the runtime image.
+# The large packaging dependency set is downloaded into appuser's cache on
+# first use and never enters the FastAPI venv.
 COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
-COPY --chown=appuser:appuser scripts/pull_base_experiments.py /app/scripts/pull_base_experiments.py
-COPY --chown=appuser:appuser scripts/pull_base_experiments_requirements.txt /app/scripts/pull_base_experiments_requirements.txt
 
 USER appuser
 
@@ -106,8 +103,9 @@ ENV BIND_HOST=0.0.0.0 \
     BIND_PORT=8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -fsS "http://localhost:${BIND_PORT}/health" || exit 1
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.environ['BIND_PORT'] + '/health', timeout=5).read()"
 
-# Shell form so ${BIND_HOST}/${BIND_PORT} expand; keeps the actual bind and
-# the app's BIND_HOST setting a single source of truth.
-CMD uvicorn vlm_feedback_loop.main:app --host "${BIND_HOST}" --port "${BIND_PORT}"
+# Keep runtime expansion so the actual bind and the app's BIND_HOST setting
+# remain a single source of truth. ``exec`` replaces the tiny expansion shell,
+# making Uvicorn PID 1 so Docker SIGTERM reaches the application directly.
+CMD ["sh", "-c", "exec uvicorn vlm_feedback_loop.main:app --host \"${BIND_HOST}\" --port \"${BIND_PORT}\""]

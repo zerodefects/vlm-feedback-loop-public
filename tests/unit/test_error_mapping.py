@@ -75,6 +75,10 @@ class TestMachineTokens:
             ("conflict: student_nim_not_deployed:sm-1", 409),
             ("conflict: tao_eval_already_in_suite:run-1", 409),
             ("conflict: student_nim_serving_run_missing:sm-1", 409),
+            (
+                "tao_dataset_upload_failed: retry training-suite creation",
+                409,
+            ),
         ],
     )
     def test_token_statuses(self, token_string: str, expected: int):
@@ -84,6 +88,14 @@ class TestMachineTokens:
 class TestUpstreamContract:
     """503/504/502 for upstream TAO failures — the documented contract
     (docs/API.md error table) that previously had no implementation."""
+
+    def test_nim_unreachable_is_503(self):
+        assert (
+            map_service_error(
+                "nim_unreachable: selected Teacher endpoint is disabled"
+            ).status_code
+            == 503
+        )
 
     def test_tao_unreachable_is_503(self):
         assert (

@@ -8,8 +8,8 @@
 #   chmod +x scripts/setup-dev.sh
 #   ./scripts/setup-dev.sh
 #
-# GPU-aware: detects NVIDIA GPU automatically and installs Docker, NVIDIA
-# Container Toolkit, and pre-pulls NIM container images when a GPU is found.
+# GPU-aware: detects NVIDIA GPU automatically and installs Docker plus the
+# NVIDIA Container Toolkit when a GPU is found.
 # On CPU-only machines, skips all GPU components.
 #
 # What it always installs:
@@ -26,19 +26,19 @@
 #   - NVIDIA Container Toolkit 1.19.0+
 #   - Docker runtime configured for nvidia GPU passthrough
 #   - NIM cache directory (~/.cache/nim)
-#   - NGC entitlement check (login + manifest inspect — no image pulls)
+#   - NGC image-access check (login + manifest inspect — no image pulls)
 #   NIM images are pulled by the Blueprint on first deploy, not by this script.
 #
 # GPU path hard requirements (enforced):
 #   - Ubuntu 22.04+ (glibc >= 2.35)
-#   - NVIDIA driver >= 535.104.05 (per NVIDIA VLM NIM docs; R580+ only needed for TAO)
+#   - NVIDIA driver >= 580.65.06 (R580; required by the CUDA 13 VLM NIM images)
 #   - Compute capability >= 7.0 (>= 8.0 for BF16, >= 8.9 for FP8)
 #
 # Prerequisites:
 #   - Ubuntu 22.04+ (x86_64)
 #   - sudo access
 #   - Internet connectivity
-#   - NVIDIA driver 535.104.05+ already installed (if GPU — driver install is outside scope)
+#   - NVIDIA driver 580.65.06+ already installed (if GPU — driver install is outside scope)
 
 # Note: pipefail intentionally omitted. Many pipelines use `| head -1` which
 # causes SIGPIPE on the upstream command when head closes early — a race
@@ -60,12 +60,8 @@ section() { echo -e "\n${CYAN}━━━ $* ━━━${NC}"; }
 # shellcheck source=scripts/setup-common.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/setup-common.sh"
 
-# Version comparison: returns 0 (true) if $1 >= $2
-version_gte() {
-    printf '%s\n%s' "$2" "$1" | sort -V -C
-}
-
 HAS_GPU=false
+GPU_RUNTIME_READY=false
 GPU_COUNT=0
 GPU_MEM_GB=0
 GPU_COMPUTE_CAP="0.0"
@@ -108,19 +104,12 @@ if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
     fi
 
     # ── Enforce minimum driver version ──────────────────────────────────
-    # NIM VLM containers require >= 535.104.05 (per NVIDIA VLM NIM docs).
-    # The R580 (>= 580.65.06) requirement applies to TAO 6.26.3 containers
-    # which use CUDA 13.0 — that is the TAO server, not this NIM dev machine.
     if [ "$HAS_GPU" = true ]; then
         DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
-        if version_gte "$DRIVER_VERSION" "535.104.05"; then
-            info "Driver $DRIVER_VERSION — meets >= 535.104.05 requirement (NIM VLM)"
-            if ! version_gte "$DRIVER_VERSION" "580.65.06"; then
-                warn "Driver $DRIVER_VERSION is below 580.65.06 (R580). TAO containers require R580+."
-                warn "This is fine for local NIM deployment. TAO runs on a separate machine."
-            fi
+        if vfl_driver_meets_nim_minimum "$DRIVER_VERSION"; then
+            info "Driver $DRIVER_VERSION — meets >= $VFL_NIM_MIN_DRIVER_VERSION requirement (NIM VLM)"
         else
-            error "Driver $DRIVER_VERSION is below minimum 535.104.05 for NIM VLM containers."
+            error "Driver $DRIVER_VERSION is below minimum $VFL_NIM_MIN_DRIVER_VERSION for NIM VLM containers."
             error "Skipping GPU setup. Update driver for local NIM deployment."
             HAS_GPU=false
         fi
@@ -232,9 +221,8 @@ if command -v pnpm &>/dev/null; then
 else
     info "Installing pnpm via Corepack..."
     sudo corepack enable 2>/dev/null
-    # Pin pnpm@10 — pnpm@latest (v11+) requires Node ≥22.13, but this script
-    # installs Node 20 LTS. pnpm@10 is the latest line compatible with Node 20.
-    corepack prepare pnpm@10 --activate 2>/dev/null
+    # Match package.json; newer pnpm majors can require a newer Node release.
+    corepack prepare pnpm@10.33.0 --activate 2>/dev/null
     info "Installed: $(pnpm --version)"
 fi
 
@@ -261,144 +249,174 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 
 if [ "$HAS_GPU" = true ]; then
+    GPU_RUNTIME_READY=true
 
     # ── Docker Engine ─────────────────────────────────────────────────────────
 
     section "Docker Engine (GPU detected)"
 
-    if command -v docker &>/dev/null; then
-        DOCKER_VERSION=$(docker --version 2>/dev/null)
-        info "Docker already installed: $DOCKER_VERSION"
-    else
+    if ! command -v docker &>/dev/null; then
         vfl_install_docker_engine
-        info "Installed: $(docker --version)"
     fi
 
     # Add current user to docker group if not already
     vfl_ensure_docker_group
 
+    if DOCKER_VERSION=$(vfl_docker_server_version); then
+        if vfl_docker_meets_nim_minimum "$DOCKER_VERSION"; then
+            info "Docker Engine $DOCKER_VERSION — meets >= $VFL_NIM_MIN_DOCKER_VERSION requirement"
+        else
+            error "Docker Engine $DOCKER_VERSION is below the $VFL_NIM_MIN_DOCKER_VERSION minimum for local NIM."
+            error "Upgrade Docker through this host's package-management policy, then rerun setup-dev.sh."
+            GPU_RUNTIME_READY=false
+        fi
+    else
+        error "Could not read the Docker Engine server version. Ensure the daemon is running and accessible."
+        GPU_RUNTIME_READY=false
+    fi
+
     # ── NVIDIA Container Toolkit ──────────────────────────────────────────────
 
     section "NVIDIA Container Toolkit (GPU detected)"
 
-    if dpkg-query -W -f='${Status}' nvidia-container-toolkit 2>/dev/null | grep -q "install ok installed"; then
-        info "NVIDIA Container Toolkit already installed"
-    else
+    if ! command -v nvidia-ctk &>/dev/null; then
         vfl_install_nvidia_container_toolkit
-        info "Installed NVIDIA Container Toolkit"
     fi
 
-    # Configure Docker runtime for NVIDIA
-    info "Configuring Docker runtime for NVIDIA GPU passthrough..."
-    vfl_configure_docker_nvidia_runtime tolerate-restart-failure
-
-    # Verify GPU passthrough
-    # Use sudo if docker group not active in this shell (fresh install).
-    DOCKER_TEST_CMD="docker"
-    docker info > /dev/null 2>&1 || DOCKER_TEST_CMD="sudo docker"
-
-    info "Verifying GPU passthrough in Docker..."
-    if $DOCKER_TEST_CMD run --rm --runtime=nvidia --gpus all "$VFL_CUDA_TEST_IMAGE" nvidia-smi > /dev/null 2>&1; then
-        info "GPU passthrough verified — containers can access GPU"
+    if CTK_VERSION=$(vfl_nvidia_ctk_version); then
+        if vfl_ctk_meets_nim_minimum "$CTK_VERSION"; then
+            info "NVIDIA Container Toolkit $CTK_VERSION — meets >= $VFL_NIM_MIN_CTK_VERSION requirement"
+        else
+            error "NVIDIA Container Toolkit $CTK_VERSION is below the $VFL_NIM_MIN_CTK_VERSION minimum for local NIM."
+            error "Upgrade it through this host's package-management policy, then rerun setup-dev.sh."
+            GPU_RUNTIME_READY=false
+        fi
     else
-        warn "GPU passthrough test failed. You may need to:"
-        warn "  1. Reboot the machine"
-        warn "  2. Check that nvidia-ctk configured the Docker runtime correctly"
+        error "Could not read the NVIDIA Container Toolkit version from 'nvidia-ctk --version'."
+        GPU_RUNTIME_READY=false
     fi
 
-    # ── NIM cache directory ───────────────────────────────────────────────────
+    if [ "$GPU_RUNTIME_READY" = true ]; then
+        # Configure Docker runtime for NVIDIA
+        info "Configuring Docker runtime for NVIDIA GPU passthrough..."
+        vfl_configure_docker_nvidia_runtime tolerate-restart-failure
 
-    section "NIM Cache"
+        # Verify GPU passthrough. Use sudo if docker group membership is not
+        # active in this shell after a fresh install.
+        DOCKER_TEST_CMD="docker"
+        docker info > /dev/null 2>&1 || DOCKER_TEST_CMD="sudo docker"
 
-    vfl_create_nim_cache
-    info "NIM cache directory ready at ~/.cache/nim"
-
-    # ── LoRA checkpoint merge runtime ────────────────────────────────────────
-    #
-    # TAO train emits an adapter-only checkpoint when LoRA is enabled. The
-    # Blueprint merges that adapter with the gated base locally before the
-    # full-precision baseline is evaluated through the Student NIM. Keep the
-    # heavyweight ML stack isolated from the backend venv and shared across
-    # workspaces on this Profile C host.
-
-    section "LoRA Merge Runtime"
-
-    MERGE_VENV="$HOME/.local/share/vlm-feedback-loop/merge-lora-venv"
-    UV_CMD="$(command -v uv || true)"
-    if [ -z "$UV_CMD" ]; then
-        UV_CMD="$HOME/.local/bin/uv"
-    fi
-    if [ ! -x "$MERGE_VENV/bin/python" ]; then
-        "$UV_CMD" venv --python python3.12 "$MERGE_VENV"
-    fi
-    "$UV_CMD" pip install --python "$MERGE_VENV/bin/python" \
-        -r scripts/merge_lora_requirements.txt
-    info "LoRA merge runtime ready at $MERGE_VENV"
-
-    # ── NGC entitlement preflight (no image pulls) ─────────────────────
-    #
-    # Image pulls are handled by the Blueprint application at runtime
-    # (local NIM deploy preflight). This script only verifies that the
-    # NGC key can authenticate and access entitled NIM images.
-
-    section "NGC Entitlement Check"
-
-    DOCKER_CMD="docker"
-    if ! docker info > /dev/null 2>&1; then
-        DOCKER_CMD="sudo docker"
-        warn "Docker group not active in this shell (expected after fresh install)."
-        warn "Using 'sudo docker' for entitlement check. After re-login, bare 'docker' will work."
+        info "Verifying GPU passthrough in Docker..."
+        if $DOCKER_TEST_CMD run --rm --runtime=nvidia --gpus all "$VFL_CUDA_TEST_IMAGE" nvidia-smi > /dev/null 2>&1; then
+            info "GPU passthrough verified — containers can access GPU"
+        else
+            warn "GPU passthrough test failed. You may need to:"
+            warn "  1. Reboot the machine"
+            warn "  2. Check that nvidia-ctk configured the Docker runtime correctly"
+            GPU_RUNTIME_READY=false
+        fi
     fi
 
-    if [ -z "${NGC_API_KEY:-}" ]; then
-        warn "NGC_API_KEY is not set."
-        warn "Self-hosted NIM requires an NGC key with NVAIE-backed access to entitled images."
-        warn "Get one at: https://org.ngc.nvidia.com/setup/api-key"
-        echo ""
-        # Only prompt interactively if stdin is a terminal. Silent read and a
-        # masked hint: the key must never land in scrollback or session logs.
-        if [ -t 0 ]; then
-            read -rsp "$(echo -e "${CYAN}Paste your NGC API Key (or press Enter to skip):${NC} ")" NGC_INPUT || true
+    if [ "$GPU_RUNTIME_READY" = true ]; then
+        # ── NIM cache directory ───────────────────────────────────────────────
+
+        section "NIM Cache"
+
+        vfl_create_nim_cache
+        info "NIM cache directory ready at ~/.cache/nim"
+
+        # ── LoRA checkpoint merge runtime ────────────────────────────────────
+        #
+        # TAO train emits an adapter-only checkpoint when LoRA is enabled. The
+        # Blueprint merges that adapter with the gated base locally before the
+        # full-precision baseline is evaluated through the Student NIM. Keep the
+        # heavyweight ML stack isolated from the backend venv and shared across
+        # workspaces on this Profile C host.
+
+        section "LoRA Merge Runtime"
+
+        MERGE_VENV="$HOME/.local/share/vlm-feedback-loop/merge-lora-venv"
+        UV_CMD="$(command -v uv || true)"
+        if [ -z "$UV_CMD" ]; then
+            UV_CMD="$HOME/.local/bin/uv"
+        fi
+        if [ ! -x "$MERGE_VENV/bin/python" ]; then
+            "$UV_CMD" venv --python python3.12 "$MERGE_VENV"
+        fi
+        "$UV_CMD" pip install --python "$MERGE_VENV/bin/python" \
+            -r scripts/merge_lora_requirements.txt
+        info "LoRA merge runtime ready at $MERGE_VENV"
+
+        # ── NGC entitlement preflight (no image pulls) ────────────────────────
+        #
+        # Image pulls are handled by the Blueprint application at runtime
+        # (local NIM deploy preflight). This script only verifies that the
+        # NGC key can authenticate and access the pinned NIM image.
+
+        section "NGC Image Access Check"
+
+        DOCKER_CMD="docker"
+        if ! docker info > /dev/null 2>&1; then
+            DOCKER_CMD="sudo docker"
+            warn "Docker group not active in this shell (expected after fresh install)."
+            warn "Using 'sudo docker' for the image-access check. After re-login, bare 'docker' will work."
+        fi
+
+        if [ -z "${NGC_API_KEY:-}" ]; then
+            warn "NGC_API_KEY is not set."
+            warn "Self-hosted NIM requires an NGC key whose account can access the pinned image."
+            warn "Developer Program terms cover development/testing on up to 16 GPUs; production terms differ."
+            warn "Get one at: https://org.ngc.nvidia.com/setup/api-key"
             echo ""
-            if [ -n "${NGC_INPUT:-}" ]; then
-                export NGC_API_KEY="$NGC_INPUT"
-                info "NGC_API_KEY set for this session."
-                info "To persist, add to ~/.vlm_feedback_loop/.env:"
-                echo "  NGC_API_KEY=<the key you just pasted>"
+            # Only prompt interactively if stdin is a terminal. Silent read and
+            # a masked hint keep the key out of scrollback and session logs.
+            if [ -t 0 ]; then
+                read -rsp "$(echo -e "${CYAN}Paste your NGC API Key (or press Enter to skip):${NC} ")" NGC_INPUT || true
+                echo ""
+                if [ -n "${NGC_INPUT:-}" ]; then
+                    export NGC_API_KEY="$NGC_INPUT"
+                    info "NGC_API_KEY set for this session."
+                    info "To persist, add to ~/.vlm_feedback_loop/.env:"
+                    echo "  NGC_API_KEY=<the key you just pasted>"
+                else
+                    warn "Skipped. Set NGC_API_KEY before running the Blueprint."
+                fi
             else
-                warn "Skipped. Set NGC_API_KEY before running the Blueprint."
+                warn "Non-interactive shell — cannot prompt for NGC_API_KEY."
+                warn "Set NGC_API_KEY in the environment and re-run, or add to ~/.vlm_feedback_loop/.env"
             fi
-        else
-            warn "Non-interactive shell — cannot prompt for NGC_API_KEY."
-            warn "Set NGC_API_KEY in the environment and re-run, or add to ~/.vlm_feedback_loop/.env"
         fi
-    fi
 
-    if [ -n "${NGC_API_KEY:-}" ]; then
-        info "NGC_API_KEY is set — checking registry access..."
+        if [ -n "${NGC_API_KEY:-}" ]; then
+            info "NGC_API_KEY is set — checking registry access..."
 
-        if vfl_ngc_docker_login "$DOCKER_CMD"; then
-            info "NGC registry login succeeded"
+            if vfl_ngc_docker_login "$DOCKER_CMD"; then
+                info "NGC registry login succeeded"
 
-            # Lightweight entitlement check — no full pull, just manifest inspect
-            ENTITLEMENT_TEST_IMAGE="nvcr.io/nim/nvidia/cosmos-reason2-2b:1.6.0"
-            info "Checking entitlement to NIM image: $ENTITLEMENT_TEST_IMAGE"
+                # Lightweight access check — no full pull, just manifest inspect
+                ACCESS_TEST_IMAGE="nvcr.io/nim/nvidia/cosmos-reason2-2b:1.6.0"
+                info "Checking access to NIM image: $ACCESS_TEST_IMAGE"
 
-            if $DOCKER_CMD manifest inspect "$ENTITLEMENT_TEST_IMAGE" > /dev/null 2>&1; then
-                info "Entitlement check passed — image is accessible"
-                info "NIM images will be pulled by the Blueprint on first deploy."
+                if $DOCKER_CMD manifest inspect "$ACCESS_TEST_IMAGE" > /dev/null 2>&1; then
+                    info "Image-access check passed"
+                    info "NIM images will be pulled by the Blueprint on first deploy."
+                else
+                    error "Cannot access $ACCESS_TEST_IMAGE"
+                    error "Possible causes:"
+                    error "  - NGC key missing NGC Catalog permission"
+                    error "  - User/account cannot access this pinned NIM image"
+                    error "  - Wrong org/account context"
+                    warn "Fix the key or account access before running the Blueprint."
+                fi
             else
-                error "Cannot access $ENTITLEMENT_TEST_IMAGE"
-                error "Possible causes:"
-                error "  - NGC key missing NGC Catalog permission"
-                error "  - User/account lacks self-hosting entitlement (NVAIE) for this NIM image"
-                error "  - Wrong org/account context"
-                warn "Fix the key/entitlement before running the Blueprint."
+                error "NGC registry login failed."
+                error "Check that NGC_API_KEY is valid and has NGC Catalog access."
             fi
-        else
-            error "NGC registry login failed."
-            error "Check that NGC_API_KEY is valid and has NGC Catalog access."
         fi
+    else
+        section "Local NIM Runtime"
+        warn "GPU development remains available, but local NIM setup was skipped."
+        warn "Local NIM requires Docker Engine >= $VFL_NIM_MIN_DOCKER_VERSION and NVIDIA Container Toolkit >= $VFL_NIM_MIN_CTK_VERSION."
     fi
 
 fi  # end GPU-only section
@@ -422,11 +440,16 @@ if [ "$HAS_GPU" = true ]; then
     echo "  Max VRAM    : ${GPU_MEM_GB} GB (single GPU)"
     echo "  Compute cap : $GPU_COMPUTE_CAP"
     echo "  Driver      : $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
-    echo "  Docker      : $(docker --version 2>&1)"
-    echo "  Toolkit     : $(dpkg -l nvidia-container-toolkit 2>/dev/null | grep ^ii | awk '{print $3}' || echo 'not found')"
-    echo "  NIM cache   : ~/.cache/nim"
-    echo "  LoRA merge  : ~/.local/share/vlm-feedback-loop/merge-lora-venv"
-    echo "  NGC entitled: $([ -n "${NGC_API_KEY:-}" ] && echo 'checked' || echo 'key not set')"
+    echo "  Docker      : $(docker --version 2>&1 || echo 'not installed')"
+    echo "  Toolkit     : $(nvidia-ctk --version 2>&1 || echo 'not installed')"
+    if [ "$GPU_RUNTIME_READY" = true ]; then
+        echo "  Local NIM   : ready"
+        echo "  NIM cache   : ~/.cache/nim"
+        echo "  LoRA merge  : ~/.local/share/vlm-feedback-loop/merge-lora-venv"
+        echo "  NGC entitled: $([ -n "${NGC_API_KEY:-}" ] && echo 'checked' || echo 'key not set')"
+    else
+        echo "  Local NIM   : blocked (requires Docker >= $VFL_NIM_MIN_DOCKER_VERSION and Toolkit >= $VFL_NIM_MIN_CTK_VERSION)"
+    fi
 else
     echo ""
     echo "  GPU         : none detected (Profile A/B mode)"
@@ -456,7 +479,7 @@ echo "  4. Bootstrap config:   uv run vlm-feedback-loop init"
 echo "  5. Add secrets:        Edit ~/.vlm_feedback_loop/.env"
 echo "     NGC_API_KEY and NVIDIA_API_KEY can be the same NGC Personal API Key"
 echo "     if it has both NGC Catalog and Public API Endpoints scopes."
-if [ "$HAS_GPU" = true ]; then
+if [ "$GPU_RUNTIME_READY" = true ]; then
     echo "     - NGC_API_KEY=<your NGC key>      (for NIM container pulls + TAO login)"
     echo "     - NVIDIA_API_KEY=<same NGC key>    (for hosted NIM inference)"
 else

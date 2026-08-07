@@ -56,7 +56,7 @@ function projectResponse() {
     test_pool_fraction: 0.4,
     scaleup_exact_match_threshold: 0.8,
     scaleup_per_field_match_threshold: 0.8,
-    scaleup_min_per_value_f1_threshold: 0.8,
+    scaleup_min_per_value_f1_threshold: 0.6,
     scaleup_accept_rate_threshold: 0.8,
     scaleup_accept_rate_window: 50,
     scaleup_min_test_pool_size: 60,
@@ -150,7 +150,7 @@ async function installFtueApi(page: Page) {
         embedding_deployment: {
           model_name: "nvidia/llama-nemotron-embed-vl-1b-v2",
           nim_container_image: "",
-          gpu_memory_minimum_gb: 10,
+          gpu_memory_minimum_gb: 24,
           fits: false,
           provider: "hosted_nvclip",
         },
@@ -393,7 +393,9 @@ test("SME creates a project, ingests the bundled sample, activates RPS Guidance,
   await page.getByRole("button", { name: "Create Project", exact: true }).click();
 
   await expect(page).toHaveURL(new RegExp(`/projects/${projectId}/ready$`));
-  await page.getByTestId("use-bundled-sample").click();
+  // Local-source mode starts beside the sample so its root remains a normal,
+  // selectable directory; Compose opens directly inside /data/images.
+  await page.getByText("images/").click();
   await expect(page.getByText("rock/")).toBeVisible();
 
   for (const checkbox of await page.getByRole("checkbox").all()) {

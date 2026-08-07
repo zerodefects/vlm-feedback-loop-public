@@ -23,6 +23,61 @@ fi
 # CUDA base image used to verify GPU passthrough through Docker.
 VFL_CUDA_TEST_IMAGE="nvidia/cuda:12.6.3-base-ubuntu24.04"
 
+# The shipped VLM NIM images use CUDA 13. NVIDIA's Linux compatibility floor
+# for that runtime is the R580 branch at 580.65.06.
+VFL_NIM_MIN_DRIVER_VERSION="580.65.06"
+VFL_NIM_MIN_DOCKER_VERSION="29.4.0"
+VFL_NIM_MIN_CTK_VERSION="1.19.0"
+
+# Print the first complete X.Y.Z release in a command's version output.
+# Package suffixes such as +azure-1 and -1 do not affect compatibility.
+vfl_extract_version() {
+    local version
+    version=$(printf '%s\n' "${1:-}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sed -n '1p') || true
+    [ -n "$version" ] || return 1
+    printf '%s\n' "$version"
+}
+
+# Return success when the installed release ($1) meets the minimum ($2).
+vfl_version_meets_minimum() {
+    local installed minimum
+    installed=$(vfl_extract_version "${1:-}") || return 1
+    minimum=$(vfl_extract_version "${2:-}") || return 1
+    printf '%s\n%s\n' "$minimum" "$installed" | LC_ALL=C sort -V -C
+}
+
+# Return success when the installed driver ($1) meets the local-NIM floor.
+vfl_driver_meets_nim_minimum() {
+    vfl_version_meets_minimum "$1" "$VFL_NIM_MIN_DRIVER_VERSION"
+}
+
+vfl_docker_meets_nim_minimum() {
+    vfl_version_meets_minimum "$1" "$VFL_NIM_MIN_DOCKER_VERSION"
+}
+
+vfl_ctk_meets_nim_minimum() {
+    vfl_version_meets_minimum "$1" "$VFL_NIM_MIN_CTK_VERSION"
+}
+
+# Query the Docker Engine daemon, using sudo when a newly added docker-group
+# membership is not active in the current shell.
+vfl_docker_server_version() {
+    local output
+    if output=$(docker version --format '{{.Server.Version}}' 2>/dev/null); then
+        vfl_extract_version "$output"
+    elif output=$(sudo docker version --format '{{.Server.Version}}' 2>/dev/null); then
+        vfl_extract_version "$output"
+    else
+        return 1
+    fi
+}
+
+vfl_nvidia_ctk_version() {
+    local output
+    output=$(nvidia-ctk --version 2>/dev/null) || return 1
+    vfl_extract_version "$output"
+}
+
 # Install Docker Engine from Docker's official apt repository (current
 # documented method: keyring at /etc/apt/keyrings/docker.asc). Removes the
 # distro/conflicting packages first. Callers check `command -v docker` and

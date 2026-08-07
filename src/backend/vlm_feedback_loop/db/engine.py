@@ -12,10 +12,11 @@ import logging
 import os
 import sqlite3
 import tempfile
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Never
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
@@ -56,6 +57,13 @@ _LEGACY_EMBEDDING_NIM_IMAGES = {
 }
 
 _MIGRATIONS_DIR = Path(__file__).parent.parent / "migrations"
+_CANONICAL_ALEMBIC_VERSION_DDL = (
+    "CREATE TABLE alembic_version ( version_num VARCHAR(32) NOT NULL, "
+    "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num) )"
+)
+
+_deployment_engine_cache: dict[Path, Engine] = {}
+_deployment_engine_cache_lock = threading.Lock()
 
 
 # ── Exceptions ───────────────────────────────────────────────────────────────
@@ -111,10 +119,20 @@ def _set_sqlite_pragmas(
     otherwise-healthy endpoint.
     """
     cursor = dbapi_conn.cursor()
-    cursor.execute("PRAGMA busy_timeout=30000")
-    cursor.execute("PRAGMA synchronous=NORMAL")
-    cursor.execute("PRAGMA wal_autocheckpoint=1000")
-    cursor.close()
+    try:
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA wal_autocheckpoint=1000")
+    except BaseException:
+        # SQLAlchemy does not yet own a DBAPI connection when a ``connect``
+        # listener fails, so it cannot return or close that connection.
+        with contextlib.suppress(Exception):
+            cursor.close()
+        with contextlib.suppress(Exception):
+            dbapi_conn.close()
+        raise
+    else:
+        cursor.close()
 
 
 def _enable_sqlite_foreign_keys(
@@ -130,7 +148,14 @@ def _enable_sqlite_foreign_keys(
             raise sqlite3.DatabaseError(
                 "SQLite refused to enable foreign-key enforcement"
             )
-    finally:
+    except BaseException:
+        # As above, a raising ``connect`` listener still owns the connection.
+        with contextlib.suppress(Exception):
+            cursor.close()
+        with contextlib.suppress(Exception):
+            dbapi_conn.close()
+        raise
+    else:
         cursor.close()
 
 
@@ -299,9 +324,69 @@ def _get_alembic_config(connection: Connection) -> AlembicConfig:
     return cfg
 
 
+def _refuse_unknown_revision_database(db_path: Path) -> Never:
+    """Back up and refuse a database whose migration provenance is unknown."""
+    backup_path = _backup_database(db_path)
+    raise DatabaseMigrationError(
+        "Refusing to migrate database with missing or invalid Alembic revision "
+        f"state at {db_path}. Backup at {backup_path}. "
+        "No migrations were applied. "
+        "Determine the correct database revision before retrying."
+    )
+
+
+def _validate_migration_revision_state(
+    connection: Connection,
+    db_path: Path,
+) -> None:
+    """Allow only a known revision or a provably fresh SQLite schema.
+
+    WAL initialization makes even a new SQLite file nonempty, so file size is
+    not evidence of prior application state. An empty database and Alembic's
+    canonical empty version table are the only retryable fresh states.
+    """
+    user_objects = {
+        (row[0], row[1])
+        for row in connection.exec_driver_sql(
+            "SELECT type, name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'"
+        )
+    }
+    if not user_objects:
+        return
+
+    version_table = ("table", "alembic_version")
+    if version_table not in user_objects:
+        _refuse_unknown_revision_database(db_path)
+
+    schema_sql = connection.exec_driver_sql(
+        "SELECT sql FROM sqlite_schema "
+        "WHERE type = 'table' AND name = 'alembic_version'"
+    ).scalar_one_or_none()
+    canonical_version_table = (
+        isinstance(schema_sql, str)
+        and " ".join(schema_sql.split()) == _CANONICAL_ALEMBIC_VERSION_DDL
+    )
+    if not canonical_version_table:
+        _refuse_unknown_revision_database(db_path)
+
+    revisions = connection.exec_driver_sql(
+        "SELECT version_num FROM alembic_version LIMIT 2"
+    ).fetchall()
+    if len(revisions) > 1:
+        _refuse_unknown_revision_database(db_path)
+    if not revisions:
+        if user_objects != {version_table}:
+            _refuse_unknown_revision_database(db_path)
+        return
+    if not isinstance(revisions[0][0], str) or not revisions[0][0]:
+        _refuse_unknown_revision_database(db_path)
+
+
 def _run_migrations(engine: Engine, db_path: Path) -> None:
     """Detect and apply pending Alembic migrations with backup."""
     with engine.connect() as conn:
+        _validate_migration_revision_state(conn, db_path)
+
         ctx = MigrationContext.configure(conn)
         current_rev = ctx.get_current_revision()
 
@@ -323,7 +408,7 @@ def _run_migrations(engine: Engine, db_path: Path) -> None:
                     "Create a fresh workspace and project."
                 ) from exc
 
-        # Backup before migration (only if the db file already has content)
+        # Backup before migration (only if the database has a known revision).
         backup_path = _backup_database(db_path) if current_rev is not None else None
 
         try:
@@ -416,93 +501,128 @@ def init_deployment_db(workspace_root: str | Path) -> Engine:
     evolve, give it its own Alembic branch rather than adding columns to these
     models.
     """
-    workspace_root = Path(workspace_root)
-    workspace_root.mkdir(parents=True, exist_ok=True)
-    db_path = workspace_root / "deployment.db"
+    workspace_path = Path(workspace_root).expanduser().resolve()
+    workspace_path.mkdir(parents=True, exist_ok=True)
+    db_path = workspace_path / "deployment.db"
 
-    engine = _create_engine(db_path)
-    _ensure_wal_mode(engine)
-    DeploymentBase.metadata.create_all(engine)
+    # Deployment state is process-scoped and shared by several services.
+    # Serialize first-open plus the idempotent self-heal pass so concurrent
+    # startup/request callers cannot create duplicate singleton rows.
+    with _deployment_engine_cache_lock:
+        engine = _deployment_engine_cache.get(workspace_path)
+        created_engine = engine is None
+        if engine is None:
+            engine = _create_engine(db_path)
 
-    # Seed singletons if empty
-    with Session(engine) as session:
-        existing = session.query(EmbeddingDeploymentConfig).first()
-        if existing is None:
-            config = EmbeddingDeploymentConfig(
-                embedding_deployment_config_id=generate_uuid4(),
-                provider="none",
-                model_name=EMBEDDING_MODEL_ID,
-                embedding_dim=EMBEDDING_DIM,
-                endpoint_url=None,
-                nim_container_image=EMBEDDING_NIM_IMAGE,
-                preferred_host_port=8001,
-                # NIM 2.0.0 support matrix: 10 GB non-optimized
-                # compatibility floor; optimized profiles are smaller.
-                gpu_memory_minimum_gb=EMBEDDING_NIM_GPU_MIN_GB,
-                gpu_assignment=None,
-            )
-            session.add(config)
-            session.commit()
-            logger.info("Seeded EmbeddingDeploymentConfig in %s", db_path)
-        elif existing.model_name in ("nvidia/nvclip", "nvidia/nvclip-vit-h-14"):
-            # One-time idempotent migration from legacy NV-CLIP defaults
-            # to the new NeMo Retriever VL embedding NIM.  The hosted
-            # NV-CLIP function id has been DEGRADED upstream and NeMo
-            # Retriever VL 1B v2 is the supported Blueprint replacement.
-            # The legacy identifiers remain here only so existing deployment
-            # databases self-heal; they are not a deployable alternate.
-            previous_name = existing.model_name
-            existing.model_name = EMBEDDING_MODEL_ID
-            existing.embedding_dim = EMBEDDING_DIM
-            existing.nim_container_image = EMBEDDING_NIM_IMAGE
-            existing.gpu_memory_minimum_gb = EMBEDDING_NIM_GPU_MIN_GB
-            session.commit()
-            logger.info(
-                "Migrated legacy EmbeddingDeploymentConfig.model_name "
-                "'%s' -> '%s' in %s",
-                previous_name,
-                EMBEDDING_MODEL_ID,
-                db_path,
-            )
-        elif (
-            existing.model_name == EMBEDDING_MODEL_ID
-            and existing.nim_container_image in _LEGACY_EMBEDDING_NIM_IMAGES
-        ):
-            # Idempotent data migration from the shipped 1.x runtime (and the
-            # historical bad 1.13 tag) to 2.0.0. The model and OpenAI-compatible
-            # API are unchanged; 2.0.0 adds architecture-aware kernels and
-            # lowers the documented compatibility floor to 10 GB.
-            previous_image = existing.nim_container_image
-            existing.nim_container_image = EMBEDDING_NIM_IMAGE
-            existing.gpu_memory_minimum_gb = EMBEDDING_NIM_GPU_MIN_GB
-            session.commit()
-            logger.info(
-                "Patched EmbeddingDeploymentConfig.nim_container_image "
-                "%s -> %s and GPU floor -> %s GB in %s",
-                previous_image,
-                EMBEDDING_NIM_IMAGE,
-                EMBEDDING_NIM_GPU_MIN_GB,
-                db_path,
-            )
+        try:
+            if created_engine:
+                _ensure_wal_mode(engine)
+            DeploymentBase.metadata.create_all(engine)
 
-        existing_tao = session.query(TAODeploymentConfig).first()
-        if existing_tao is None:
-            tao_config = TAODeploymentConfig(
-                tao_deployment_config_id=generate_uuid4(),
-                tao_workspace_id=None,
-                tao_workspace_name=None,
-                tao_workspace_cloud_type=None,
-                tao_workspace_bucket=None,
-                tao_workspace_s3_endpoint_url_internal=None,
-                tao_workspace_s3_endpoint_url_external=None,
-                tao_workspace_s3_access_key_ref=None,
-                tao_workspace_s3_secret_key_ref=None,
-                bootstrap_status="not_bootstrapped",
-                bootstrap_last_run_at=None,
-                bootstrap_error_ref=None,
-            )
-            session.add(tao_config)
-            session.commit()
-            logger.info("Seeded TAODeploymentConfig in %s", db_path)
+            # Seed singletons if empty.
+            with Session(engine) as session:
+                existing = session.query(EmbeddingDeploymentConfig).first()
+                if existing is None:
+                    config = EmbeddingDeploymentConfig(
+                        embedding_deployment_config_id=generate_uuid4(),
+                        provider="none",
+                        model_name=EMBEDDING_MODEL_ID,
+                        embedding_dim=EMBEDDING_DIM,
+                        endpoint_url=None,
+                        nim_container_image=EMBEDDING_NIM_IMAGE,
+                        preferred_host_port=8001,
+                        # The smallest GPU SKUs validated for this model by
+                        # the NIM 2.0.0 support matrix have 24 GB.
+                        gpu_memory_minimum_gb=EMBEDDING_NIM_GPU_MIN_GB,
+                        gpu_assignment=None,
+                    )
+                    session.add(config)
+                    session.commit()
+                    logger.info("Seeded EmbeddingDeploymentConfig in %s", db_path)
+                elif existing.model_name in (
+                    "nvidia/nvclip",
+                    "nvidia/nvclip-vit-h-14",
+                ):
+                    # One-time idempotent migration from legacy NV-CLIP defaults.
+                    previous_name = existing.model_name
+                    existing.model_name = EMBEDDING_MODEL_ID
+                    existing.embedding_dim = EMBEDDING_DIM
+                    existing.nim_container_image = EMBEDDING_NIM_IMAGE
+                    existing.gpu_memory_minimum_gb = EMBEDDING_NIM_GPU_MIN_GB
+                    session.commit()
+                    logger.info(
+                        "Migrated legacy EmbeddingDeploymentConfig.model_name "
+                        "'%s' -> '%s' in %s",
+                        previous_name,
+                        EMBEDDING_MODEL_ID,
+                        db_path,
+                    )
+                elif (
+                    existing.model_name == EMBEDDING_MODEL_ID
+                    and existing.nim_container_image in _LEGACY_EMBEDDING_NIM_IMAGES
+                ):
+                    # Idempotent data migration from the shipped 1.x runtime.
+                    previous_image = existing.nim_container_image
+                    existing.nim_container_image = EMBEDDING_NIM_IMAGE
+                    existing.gpu_memory_minimum_gb = EMBEDDING_NIM_GPU_MIN_GB
+                    session.commit()
+                    logger.info(
+                        "Patched EmbeddingDeploymentConfig.nim_container_image "
+                        "%s -> %s and GPU floor -> %s GB in %s",
+                        previous_image,
+                        EMBEDDING_NIM_IMAGE,
+                        EMBEDDING_NIM_GPU_MIN_GB,
+                        db_path,
+                    )
+                elif (
+                    existing.model_name == EMBEDDING_MODEL_ID
+                    and existing.nim_container_image == EMBEDDING_NIM_IMAGE
+                    and existing.gpu_memory_minimum_gb < EMBEDDING_NIM_GPU_MIN_GB
+                ):
+                    previous_floor = existing.gpu_memory_minimum_gb
+                    existing.gpu_memory_minimum_gb = EMBEDDING_NIM_GPU_MIN_GB
+                    session.commit()
+                    logger.info(
+                        "Raised EmbeddingDeploymentConfig GPU floor %s -> %s GB in %s",
+                        previous_floor,
+                        EMBEDDING_NIM_GPU_MIN_GB,
+                        db_path,
+                    )
 
-    return engine
+                existing_tao = session.query(TAODeploymentConfig).first()
+                if existing_tao is None:
+                    tao_config = TAODeploymentConfig(
+                        tao_deployment_config_id=generate_uuid4(),
+                        tao_workspace_id=None,
+                        tao_workspace_name=None,
+                        tao_workspace_cloud_type=None,
+                        tao_workspace_bucket=None,
+                        tao_workspace_s3_endpoint_url_internal=None,
+                        tao_workspace_s3_endpoint_url_external=None,
+                        tao_workspace_s3_access_key_ref=None,
+                        tao_workspace_s3_secret_key_ref=None,
+                        bootstrap_status="not_bootstrapped",
+                        bootstrap_last_run_at=None,
+                        bootstrap_error_ref=None,
+                    )
+                    session.add(tao_config)
+                    session.commit()
+                    logger.info("Seeded TAODeploymentConfig in %s", db_path)
+        except BaseException:
+            if created_engine:
+                engine.dispose()
+            raise
+
+        if created_engine:
+            _deployment_engine_cache[workspace_path] = engine
+        return engine
+
+
+def close_deployment_db_resources() -> None:
+    """Dispose every process-scoped deployment database engine."""
+    with _deployment_engine_cache_lock:
+        engines = list(_deployment_engine_cache.values())
+        _deployment_engine_cache.clear()
+
+    for engine in engines:
+        engine.dispose()

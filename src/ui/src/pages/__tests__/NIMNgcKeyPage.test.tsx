@@ -77,7 +77,7 @@ function makeEnv(overrides: Partial<EnvironmentResponse> = {}): EnvironmentRespo
     embedding_deployment: {
       model_name: "nvidia/llama-nemotron-embed-vl-1b-v2",
       nim_container_image: "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0",
-      gpu_memory_minimum_gb: 10,
+      gpu_memory_minimum_gb: 24,
       fits: true,
       provider: "none",
     },
@@ -170,7 +170,11 @@ describe("NIMNgcKeyPage", () => {
 
   it("auto-skips when local_deploy_available is false (no GPU/Docker — NGC not useful)", async () => {
     mockFetchEnvironment.mockResolvedValue(
-      makeEnv({ local_deploy_available: false, ngc_api_key_configured: false }),
+      makeEnv({
+        local_deploy_available: false,
+        ngc_api_key_configured: false,
+        recommended_embedding_mode: "hosted",
+      }),
     );
     const { Wrapper } = createWrapper("/projects/test-pid/setup/ngc", {
       cameFromAutoSkip: true,
@@ -189,6 +193,10 @@ describe("NIMNgcKeyPage", () => {
     await waitFor(() => {
       expect(screen.getByText(/Want faster local embeddings/i)).toBeInTheDocument();
     });
+    expect(screen.getByTestId("ngc-setup-card")).toHaveClass(
+      "glass-card",
+      "glass-card--elevated",
+    );
     expect(screen.getByPlaceholderText(/Paste your NGC API key/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Use my GPU/i })).toBeDisabled();
     // [Back] is the escape affordance — visible alongside the primary
@@ -251,12 +259,9 @@ describe("NIMNgcKeyPage", () => {
   });
 
   // ── Chain-state forwarding + embedding-deploy queueing ──────────────
-  // Local embeddings are the DEFAULT provider whenever the host GPU
-  // fits the embedding NIM (hosted is the fallback). This screen is
-  // where hosted-Teacher chains pick that deploy up: both exits append
-  // the embedding NIM to localDeployQueued when
-  // ``local_deploy_available && embedding_deployment.fits``; activePath
-  // and cameFromAutoSkip are forwarded unchanged.
+  // This screen applies the backend-owned embedding recommendation. Both
+  // exits append the NIM only for ``recommended_embedding_mode=local``;
+  // activePath and cameFromAutoSkip are forwarded unchanged.
 
   it("[Use my GPU] queues the local embedding deploy for the hosted-path chain", async () => {
     // The screen promises "we'll run NeMo Retriever VL on {gpu}" —
@@ -342,7 +347,7 @@ describe("NIMNgcKeyPage", () => {
         embedding_deployment: {
           model_name: EMBEDDING_MODEL,
           nim_container_image: "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0",
-          gpu_memory_minimum_gb: 10,
+          gpu_memory_minimum_gb: 24,
           fits: false,
           provider: "none",
         },
@@ -359,6 +364,32 @@ describe("NIMNgcKeyPage", () => {
     const done = await screen.findByTestId("done-page");
     expect(done.getAttribute("data-came-from-auto-skip")).toBe("false");
     expect(done.getAttribute("data-local-deploy-queued")).toBe("");
+    expect(mockSetSecret).not.toHaveBeenCalled();
+  });
+
+  it("honors an explicit pHash-only embedding recommendation", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      makeEnv({
+        recommended_embedding_mode: "none",
+        embedding_deployment: {
+          model_name: EMBEDDING_MODEL,
+          nim_container_image: "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0",
+          gpu_memory_minimum_gb: 24,
+          fits: true,
+          provider: "none",
+        },
+      }),
+    );
+    const { Wrapper } = createWrapper("/projects/test-pid/setup/ngc", {
+      activePath: "hosted",
+      cameFromAutoSkip: false,
+      localDeployQueued: [],
+    });
+    render(<div />, { wrapper: Wrapper });
+
+    const done = await screen.findByTestId("done-page");
+    expect(done.getAttribute("data-local-deploy-queued")).toBe("");
+    expect(screen.queryByPlaceholderText(/Paste your NGC API key/i)).toBeNull();
     expect(mockSetSecret).not.toHaveBeenCalled();
   });
 });

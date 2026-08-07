@@ -5,19 +5,18 @@
 # docs/Engineering_Spec.md Appendix B "CI / pre-commit pipeline"
 # for acceptance items.
 #
-# Jobs run in parallel: six core jobs (lint + tests + typecheck for
-# the backend; lint + tests + build for the frontend — mirrored
-# locally by scripts/ci-local.sh), plus dependency-audit (pip-audit +
-# pnpm audit backstop) and compose-smoke (containerized-mode build +
-# health check — the delivery mode the core jobs never exercise).
+# Jobs run in parallel: six core jobs (lint + tests + typecheck for the
+# backend; lint + tests + build for the frontend), serial integration tests,
+# public-export/wheel validation, dependency-audit (pip-audit + pnpm audit
+# backstop), and compose-smoke (containerized-mode functional smoke).
 # Total wall-clock target: under 10 minutes; compose-smoke may run
 # longer on a cold image cache (its own timeout caps it). Mirrors the
 # Retail Blueprint CI shape
 # (Retail-Agentic-Commerce/.github/workflows/ci.yml).
 #
-# Integration tests are intentionally not in this CI scope: they require live
-# services, credentials, or Docker and are run by the separately scheduled
-# live-validation harness.
+# Opt-in live integration tests remain skipped without their explicit
+# credentials/flags; the local server, proxy, SSE, and mock-NIM contracts run
+# serially in the integration-tests job.
 
 name: CI
 
@@ -160,6 +159,14 @@ jobs:
         run: pnpm test
         working-directory: src/ui
 
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+        working-directory: src/ui
+
+      - name: Run first-time workflow browser test
+        run: pnpm test:e2e
+        working-directory: src/ui
+
   frontend-build:
     name: Frontend build
     runs-on: ubuntu-latest
@@ -211,6 +218,74 @@ jobs:
       - name: Run pyright
         run: uv run pyright src/backend/
 
+  integration-tests:
+    name: Local integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync backend dependencies
+        run: uv sync --frozen
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: src/ui/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: src/ui
+
+      - name: Run local integration contracts serially
+        run: uv run pytest tests/integration/ -q -n 0
+
+  public-artifact:
+    name: Public export and built distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync export tooling
+        run: uv sync --frozen
+
+      - name: Export and validate the default public snapshot
+        run: |
+          uv run python scripts/export_public_snapshot.py /tmp/vlm-public-snapshot
+          uv run python scripts/validate_public_release.py /tmp/vlm-public-snapshot
+
+      - name: Sync the public snapshot
+        run: uv sync --frozen
+        working-directory: /tmp/vlm-public-snapshot
+
+      - name: Build sdist and smoke its installed wheel
+        run: uv run pytest tests/integration/test_wheel_install.py -q -n 0
+        working-directory: /tmp/vlm-public-snapshot
+
   dependency-audit:
     # Advisory backstop for public forks/mirrors: the org-level SonarQube
     # scan (sonarqube.yml) only runs inside the NVIDIA-AI-Blueprints org,
@@ -234,7 +309,10 @@ jobs:
         run: |
           uv export --frozen --no-hashes --no-emit-project \
             --format requirements-txt > /tmp/requirements-audit.txt
-          uvx pip-audit -r /tmp/requirements-audit.txt --no-deps
+          # uv has already produced the complete pinned set, including its
+          # audited AIPerf overrides. Do not ask pip to re-resolve and reject
+          # those intentional replacements before auditing can begin.
+          uvx pip-audit -r /tmp/requirements-audit.txt --no-deps --disable-pip
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -247,6 +325,10 @@ jobs:
           node-version: 22
 
       - name: pnpm audit (production dependencies, high severity and up)
+        # package.json narrowly ignores GHSA-qwww-vcr4-c8h2: it affects only
+        # unstable React Server Components APIs, while this UI is a client-only
+        # Vite SPA. Remove the exception when the Node 22+/React 19.2+ Router 8
+        # baseline is adopted.
         run: pnpm audit --prod --audit-level high
         working-directory: src/ui
 
@@ -268,16 +350,23 @@ jobs:
       - name: Bring up the stack
         run: docker compose up -d --no-build
 
-      - name: Wait for a healthy edge
+      - name: Wait for a functional stack
         run: |
+          set -o pipefail
           for i in $(seq 1 60); do
-            if curl -fsS http://localhost:3000/health >/dev/null 2>&1; then
-              echo "edge healthy after ${i} polls"
+            if [ -n "$(docker compose ps --status exited --quiet)" ]; then
+              break
+            fi
+            if curl -fsS http://localhost:3000/health | grep -Fq '"status":"ok"' \
+              && curl -fsS http://localhost:3000/ | grep -Fq '<div id="root">' \
+              && curl -fsS http://localhost:3000/v1/projects | grep -Fq '"items":'; then
+              test "$(docker compose ps --status running --quiet | wc -l)" -eq 3
+              echo "functional stack ready after ${i} polls"
               exit 0
             fi
             sleep 2
           done
-          echo "edge never became healthy; container state:"
+          echo "stack never became functional; container state:"
           docker compose ps
           docker compose logs --tail 100
           exit 1

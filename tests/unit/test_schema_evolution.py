@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import contextmanager
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy.orm import Session
@@ -605,6 +606,28 @@ class TestEditDescriptionOptional:
                 "field_id": old_fid,
             },
         ]
+
+    def test_successful_edit_checks_backend_auto_evaluate_triggers(
+        self, test_app_client: TestClient
+    ):
+        """A new active Guidance version feeds backend Auto-Evaluate."""
+        pid = _create_project(test_app_client)
+        guidance = _create_guidance_via_api(test_app_client, pid)
+        _set_active_guidance(test_app_client, pid, guidance["guidance_id"])
+
+        with patch(
+            "vlm_feedback_loop.services.evaluation_service.maybe_start_auto_evaluation",
+            new_callable=AsyncMock,
+        ) as maybe_start:
+            data, status = _edit_guidance(
+                test_app_client,
+                pid,
+                self._same_schema(guidance),
+            )
+
+        assert status == 200, data
+        maybe_start.assert_awaited_once()
+        assert maybe_start.await_args.args[0] == pid
 
     def test_in_place_rename_cancels_active_batch_run(
         self, test_app_client: TestClient

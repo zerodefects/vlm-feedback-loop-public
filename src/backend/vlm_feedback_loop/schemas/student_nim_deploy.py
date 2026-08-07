@@ -31,6 +31,7 @@ class DeployNimRequest(BaseModel):
     nim_release_version: str | None = None
     gpu_assignment: str | None = None
     auth_mode: Literal["none", "bearer"] = "none"
+    benchmark_kv_cache_reuse: Literal["disabled"] | None = None
 
 
 class DeployNimResponse(BaseModel):

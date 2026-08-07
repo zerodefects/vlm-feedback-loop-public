@@ -19,6 +19,9 @@ class StudentModel(ProjectBase):
 
     student_model_id: Mapped[str] = uuid_pk()
     project_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    # Immutable parent "Start Training" action. Null only for legacy/ad-hoc
+    # TAO jobs that were not created through a TrainingSuite.
+    training_suite_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     student_base_model_config_id: Mapped[str] = mapped_column(
         String(36), nullable=False
     )

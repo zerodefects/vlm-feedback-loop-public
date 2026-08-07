@@ -13,12 +13,14 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from conftest import (
+    EID,
     GID,
     MCID,
     PID,
     add_endpoint_and_model_rows,
     add_example_row,
     add_fixture_guidance_row,
+    add_model_config_row,
     add_standard_project_row,
     make_stub_settings,
     setup_project_db,
@@ -447,6 +449,41 @@ class TestGateLogic:
         )
         assert em["current_value"] >= 0.8
 
+    def test_gate_attributes_score_to_evaluated_teacher_after_config_change(
+        self, tmp_path
+    ):
+        """A persisted score remains attributed to its run's Teacher when the
+        project selects another Teacher; the readiness UI must not imply that
+        the current Teacher produced historical quality evidence."""
+        engine, pdir, settings = _setup_gate_ready(tmp_path)
+        with Session(engine) as s:
+            add_model_config_row(
+                s,
+                PID,
+                "mc-current",
+                EID,
+                model_name="current-teacher",
+            )
+            project = s.query(Project).filter_by(project_id=PID).one()
+            project.teacher_model_config_id = "mc-current"
+            s.commit()
+
+        result = compute_scaleup_gate(PID, settings=settings)
+        assert not isinstance(result, str)
+        em = next(
+            c
+            for c in result["criteria"]
+            if c["criterion_name"] == "overall_exact_match"
+        )
+        assert em["passed"] is True
+        assert em["details"] == {
+            "evaluation_run_id": "eval-1",
+            "evaluated_model_config_id": MCID,
+            "evaluated_model_name": "test-model",
+            "current_configuration_differs": True,
+            "changed_fields": ["teacher_model"],
+        }
+
     def test_no_eval_fails_overall(self, tmp_path):
         """No completed evaluation → overall_exact_match fails."""
         engine, pdir = setup_project_db(tmp_path)
@@ -551,7 +588,7 @@ class TestGateLogic:
         engine, pdir, settings = _setup_gate_ready(tmp_path)
         _mutate_eval_metrics(
             engine,
-            lambda o: o["per_value_metrics"]["severity"]["low"].update({"f1": 0.60}),
+            lambda o: o["per_value_metrics"]["severity"]["low"].update({"f1": 0.59}),
         )
         result = compute_scaleup_gate(PID, settings=settings)
         pv = next(
@@ -561,7 +598,22 @@ class TestGateLogic:
         assert len(pv["details"]["failing_values"]) >= 1
         failing = pv["details"]["failing_values"][0]
         assert failing["value"] == "low"
-        assert failing["f1"] == 0.6
+        assert failing["f1"] == 0.59
+
+    def test_per_value_f1_exactly_at_default_threshold_passes(self, tmp_path):
+        """The 60% default is inclusive: an F1 of exactly 0.60 passes."""
+        engine, pdir, settings = _setup_gate_ready(tmp_path)
+        _mutate_eval_metrics(
+            engine,
+            lambda o: o["per_value_metrics"]["severity"]["low"].update({"f1": 0.60}),
+        )
+        result = compute_scaleup_gate(PID, settings=settings)
+        pv = next(
+            c for c in result["criteria"] if c["criterion_name"] == "min_per_value_f1"
+        )
+        assert pv["passed"] is True
+        assert pv["current_value"] == 0.6
+        assert pv["threshold"] == 0.6
 
     def test_per_field_empty_metrics_fails(self, tmp_path):
         """per_field_match must FAIL when the evaluation reports no per-field

@@ -11,7 +11,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button, Text, Select, Modal } from "@kui/react";
 import { Info } from "lucide-react";
 
-import { useSetupContext } from "@/pages/ProjectSetupLayout";
+import { useSetupContext } from "@/pages/setup-context";
 import { scrollToFirstError } from "@/lib/scroll-to-first-error";
 import { createGuidance } from "@/api/guidance";
 import { updateProject } from "@/api/model-configs";
@@ -34,6 +34,7 @@ import {
 } from "@/components/guidance";
 import { GuidanceEditorLayout } from "@/components/guidance/GuidanceEditorLayout";
 import { makeFieldHandlers } from "@/components/guidance/field-handlers";
+import { KeyPortalLink } from "@/components/KeyPortalLink";
 
 export function CreateGuidancePage() {
   const { projectId, project } = useSetupContext();
@@ -57,6 +58,7 @@ export function CreateGuidancePage() {
   const [pendingTemplate, setPendingTemplate] = useState<TemplateName | null>(null);
   const [hasUserEdited, setHasUserEdited] = useState(false);
   const [saveToast, setSaveToast] = useState<string | null>(null);
+  const appliedTemplateDefinition = getTemplateByName(appliedTemplate);
 
   // Shared form hook
   const form = useGuidanceForm({
@@ -74,7 +76,7 @@ export function CreateGuidancePage() {
     descriptionRef.current?.focus();
   }, []);
 
-  // Apply a template's description + fields to the form. Applying a template
+  // Apply a template's complete Guidance to the form. Applying a template
   // is NOT a user edit — the form is effectively reset to a "template-fresh"
   // state, so hasUserEdited is cleared. The state change itself re-arms the
   // debounced backend validation for the new content.
@@ -82,6 +84,7 @@ export function CreateGuidancePage() {
     const template = getTemplateByName(name);
     form.setDescription(template.description);
     form.setFields(stampClientIds(template.fields));
+    form.setRules(template.rules);
     setHasUserEdited(false);
     setAppliedTemplate(name);
   }
@@ -196,7 +199,7 @@ export function CreateGuidancePage() {
               if (!open) handleCancelReplace();
             }}
             dismissible
-            slotHeading={<span>Replace your work?</span>}
+            slotHeading={<Text kind="title/sm">Replace your work?</Text>}
             slotFooter={
               <div className="flex justify-end gap-3">
                 <Button
@@ -223,7 +226,7 @@ export function CreateGuidancePage() {
               data-testid="confirm-template-replace-body"
             >
               Switching to the {getTemplateByName(pendingTemplate).label} template will
-              replace your current description and fields.
+              replace your current description, schema, and rules.
             </Text>
           </Modal>
         )
@@ -250,6 +253,7 @@ export function CreateGuidancePage() {
           Blank to build from scratch.
         </Text>
         <Select
+          aria-label="Guidance starter"
           items={GUIDANCE_TEMPLATES.map((t) => ({
             value: t.name,
             children: t.label,
@@ -258,6 +262,33 @@ export function CreateGuidancePage() {
           onValueChange={(val) => handleTemplateChange(val as TemplateName)}
           data-testid="template-selector"
         />
+        <div className="mt-3" data-testid="template-summary">
+          <Text
+            kind="body/regular/sm"
+            style={{ color: "var(--text-secondary)", display: "block" }}
+          >
+            {appliedTemplateDefinition.summary}
+          </Text>
+          {appliedTemplateDefinition.dataset && (
+            <div
+              className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1"
+              data-testid="template-dataset-metadata"
+            >
+              <Text kind="label/regular/xs" style={{ color: "var(--text-muted)" }}>
+                {appliedTemplateDefinition.dataset.name} ·{" "}
+                {appliedTemplateDefinition.dataset.detail} ·{" "}
+                {appliedTemplateDefinition.dataset.license}
+              </Text>
+              {appliedTemplateDefinition.dataset.sourceUrl && (
+                <KeyPortalLink
+                  href={appliedTemplateDefinition.dataset.sourceUrl}
+                  label="View dataset source"
+                  dense
+                />
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       <DescriptionCard

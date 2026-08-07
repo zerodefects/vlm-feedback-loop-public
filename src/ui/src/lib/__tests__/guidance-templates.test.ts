@@ -14,14 +14,13 @@ import {
 } from "@/lib/guidance-templates";
 
 /**
- * What is deliberately NOT tested here: template count, name list, and
- * per-template field literals — those tests were byte-for-byte re-encodings
- * of the GUIDANCE_TEMPLATES literal and failed only when someone edited the
- * catalog on purpose. The behavioral half (selecting a template populates
- * the builder form, all templates appear in the selector, Blank is the
- * default) lives in pages/__tests__/CreateGuidancePage.test.tsx. This file
- * keeps only the cross-template invariants and the lookup-function
- * behavior.
+ * What is deliberately NOT tested here: the exact template count, complete
+ * name list, and every field literal — those tests were byte-for-byte
+ * re-encodings of GUIDANCE_TEMPLATES and failed only when someone edited the
+ * catalog on purpose. Selector behavior and the absence of retired choices
+ * live in pages/__tests__/CreateGuidancePage.test.tsx. This file keeps only
+ * cross-template invariants, the dataset-backed contracts, and
+ * lookup-function behavior.
  */
 describe("guidance-templates", () => {
   it("templates leave rationale notes disabled by default", () => {
@@ -31,10 +30,20 @@ describe("guidance-templates", () => {
     }
   });
 
+  it("non-blank templates model edge-case handling with starter rules", () => {
+    for (const template of GUIDANCE_TEMPLATES) {
+      if (template.name === "blank") continue;
+      expect(template.rules.trim(), `${template.name} has no starter rules`).not.toBe(
+        "",
+      );
+    }
+  });
+
   it("the default template is a usable blank slate with no predefined fields", () => {
     const blank = getTemplateByName(DEFAULT_TEMPLATE_NAME);
     expect(blank.description).toBe("");
     expect(blank.fields).toHaveLength(0);
+    expect(blank.rules).toBe("");
   });
 
   it("getTemplateByName returns correct template", () => {
@@ -54,6 +63,75 @@ describe("guidance-templates", () => {
         allowed_values: ["rock", "paper", "scissors"],
       }),
     ]);
+    expect(template.rules).toMatch(/closed fist/i);
+    expect(template.dataset).toEqual(expect.objectContaining({ license: "CC BY 2.0" }));
+  });
+
+  it("the presence-and-count template models a consistent boolean and integer pair", () => {
+    const template = getTemplateByName("presence_count");
+    expect(template.fields).toEqual([
+      expect.objectContaining({
+        field_name: "target_present",
+        type: "boolean",
+        role: "core",
+      }),
+      expect.objectContaining({
+        field_name: "target_count",
+        type: "integer",
+        role: "core",
+        minimum: 0,
+      }),
+    ]);
+    expect(template.rules).toMatch(/target_count to 0/i);
+  });
+
+  it("the packaging audit uses the tested controlled-language and panel contract", () => {
+    const template = getTemplateByName("packaging_audit");
+    expect(template.fields).toEqual([
+      expect.objectContaining({
+        field_name: "language_on_packaging",
+        type: "enum",
+        role: "core",
+        allowed_values: ["fr", "en", "es", "de", "it", "nl", "other"],
+      }),
+      expect.objectContaining({
+        field_name: "contains_nutrition_table",
+        type: "boolean",
+        role: "core",
+      }),
+    ]);
+    expect(template.dataset).toEqual(
+      expect.objectContaining({
+        name: "Open Food Facts images",
+        license: "CC BY-SA (images)",
+      }),
+    );
+  });
+
+  it("the VisA template keeps only the two reliable evaluated fields", () => {
+    const template = getTemplateByName("industrial_anomaly");
+    expect(template.fields).toEqual([
+      expect.objectContaining({
+        field_name: "object_category",
+        type: "enum",
+        role: "core",
+      }),
+      expect.objectContaining({
+        field_name: "has_anomaly",
+        type: "enum",
+        role: "core",
+        allowed_values: ["no", "yes"],
+      }),
+    ]);
+    expect(template.fields.every((field) => field.role === "core")).toBe(true);
+    expect(template.rules).toMatch(/Do not treat pose, lighting/i);
+    expect(template.dataset).toEqual(
+      expect.objectContaining({
+        name: "Visual Anomaly (VisA)",
+        license: "CC BY 4.0",
+        sourceUrl: "https://github.com/amazon-science/spot-diff",
+      }),
+    );
   });
 
   it("getTemplateByName throws for unknown name", () => {

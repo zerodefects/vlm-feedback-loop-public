@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -117,19 +117,27 @@ def tmp_project_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def project_engine(tmp_project_dir: Path) -> Engine:
+def project_engine(tmp_project_dir: Path) -> Iterator[Engine]:
     """Open a fresh project database and return the engine."""
     from vlm_feedback_loop.db.engine import open_project_db
 
-    return open_project_db(tmp_project_dir)
+    engine = open_project_db(tmp_project_dir)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture()
-def deployment_engine(tmp_workspace: Path) -> Engine:
+def deployment_engine(tmp_workspace: Path) -> Iterator[Engine]:
     """Create a deployment database and return the engine."""
     from vlm_feedback_loop.db.engine import init_deployment_db
 
-    return init_deployment_db(tmp_workspace)
+    engine = init_deployment_db(tmp_workspace)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
 
 
 # ── App client fixtures ──────────────────────────────────────────────────────
@@ -140,7 +148,7 @@ def test_app_client(tmp_path: Path) -> TestClient:
     """TestClient with a temp workspace, bypassing config.yaml.
 
     Settings are constructed directly and injected via dependency override.
-    The engine cache is cleared on teardown.
+    Cached project engines and locks are closed on teardown.
     """
     from vlm_feedback_loop.config import Settings
     from vlm_feedback_loop.main import app
@@ -153,13 +161,13 @@ def test_app_client(tmp_path: Path) -> TestClient:
     settings = Settings(WORKSPACE_ROOT=str(workspace), **non_secret)
 
     app.dependency_overrides[get_current_settings] = lambda: settings
-    project_service.clear_engine_cache()
+    project_service.close_project_resources()
 
     client = TestClient(app, raise_server_exceptions=False)
     yield client
 
     app.dependency_overrides.clear()
-    project_service.clear_engine_cache()
+    project_service.close_project_resources()
 
 
 # ── SSE and background test fixtures ─────────────────────────────────────────

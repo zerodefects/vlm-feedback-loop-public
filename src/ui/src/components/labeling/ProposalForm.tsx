@@ -14,7 +14,8 @@ import { Text } from "@kui/react";
 
 import { fieldValuesEqual } from "@/lib/field-values";
 import { RATIONALE_NOTE_FIELD_NAME } from "@/lib/guidance-templates";
-import { PriorLabelFieldHint, isPriorValueSchemaValid } from "./PriorLabelHints";
+import { PriorLabelFieldHint } from "./PriorLabelHints";
+import { isPriorValueSchemaValid } from "@/lib/prior-label-validation";
 import type { SchemaFieldResponse } from "@/types/guidance";
 import type { PriorLabelSnapshot } from "@/types/labeling";
 
@@ -181,22 +182,30 @@ interface FieldEditorProps {
 }
 
 function FieldEditor({ field, value, onChange, disabled }: FieldEditorProps) {
-  const label = (
-    <Text
-      kind="label/regular/sm"
-      style={{ color: "var(--text-secondary)" }}
-      className="mb-1 block"
-    >
-      {field.field_name}
-    </Text>
+  const controlId = `proposal-field-input-${field.field_id}`;
+  const groupLabelId = `proposal-field-label-${field.field_id}`;
+  const controlLabel = (
+    <label id={groupLabelId} htmlFor={controlId} className="mb-1 block">
+      <Text kind="label/regular/sm" style={{ color: "var(--text-secondary)" }}>
+        {field.field_name}
+      </Text>
+    </label>
+  );
+  const groupLabel = (
+    <div id={groupLabelId} className="mb-1">
+      <Text kind="label/regular/sm" style={{ color: "var(--text-secondary)" }}>
+        {field.field_name}
+      </Text>
+    </div>
   );
 
   switch (field.type) {
     case "enum":
       return (
         <div data-testid={`field-${field.field_name}`}>
-          {label}
+          {controlLabel}
           <select
+            id={controlId}
             className="glass-input w-full px-3 py-2 text-sm"
             value={String(value ?? "")}
             onChange={(e) => onChange(e.target.value)}
@@ -219,8 +228,12 @@ function FieldEditor({ field, value, onChange, disabled }: FieldEditorProps) {
       const selected = Array.isArray(value) ? (value as string[]) : [];
       return (
         <div data-testid={`field-${field.field_name}`}>
-          {label}
-          <div className="flex flex-wrap gap-2">
+          {groupLabel}
+          <div
+            className="flex flex-wrap gap-2"
+            role="group"
+            aria-labelledby={groupLabelId}
+          >
             {(field.allowed_values ?? []).map((v) => {
               const checked = selected.includes(v);
               return (
@@ -241,7 +254,7 @@ function FieldEditor({ field, value, onChange, disabled }: FieldEditorProps) {
                     }}
                     disabled={disabled}
                   />
-                  <span className="text-xs">{v}</span>
+                  <Text kind="body/regular/xs">{v}</Text>
                 </label>
               );
             })}
@@ -253,12 +266,15 @@ function FieldEditor({ field, value, onChange, disabled }: FieldEditorProps) {
     case "boolean":
       return (
         <div data-testid={`field-${field.field_name}`}>
-          {label}
+          {controlLabel}
           <label
+            htmlFor={controlId}
             className="flex items-center gap-2 cursor-pointer"
             style={disabled ? { opacity: 0.5, pointerEvents: "none" } : undefined}
           >
             <input
+              id={controlId}
+              aria-labelledby={groupLabelId}
               type="checkbox"
               checked={value === true}
               onChange={(e) => onChange(e.target.checked)}
@@ -276,8 +292,9 @@ function FieldEditor({ field, value, onChange, disabled }: FieldEditorProps) {
     case "integer":
       return (
         <div data-testid={`field-${field.field_name}`}>
-          {label}
+          {controlLabel}
           <input
+            id={controlId}
             type="number"
             className="glass-input w-full px-3 py-2 text-sm"
             value={value != null ? String(value) : ""}
@@ -297,8 +314,9 @@ function FieldEditor({ field, value, onChange, disabled }: FieldEditorProps) {
     default:
       return (
         <div data-testid={`field-${field.field_name}`}>
-          {label}
+          {controlLabel}
           <input
+            id={controlId}
             type="text"
             className="glass-input w-full px-3 py-2 text-sm"
             value={String(value ?? "")}

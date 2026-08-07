@@ -443,7 +443,11 @@ async def deploy(
                 for c in preflight.checks
             ],
             docker_run_command=preflight.docker_run_command,
-            resolved_port=params["preferred_port"],
+            # deploy_local_nim() may reserve a different free host port when
+            # the preferred port is occupied.  Return the authoritative
+            # reservation rather than the caller's preference so this field
+            # agrees with deployment.host_port and the docker command.
+            resolved_port=deployment.host_port,
             gpu_assignment=gpu,
         ),
         disposition="queued",

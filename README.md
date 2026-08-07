@@ -1,200 +1,151 @@
 # NVIDIA AI Blueprint: Interactive VLM Feedback Loop
 
-Turn expert corrections into a better vision-labeling loop, measure the
-result, fine-tune a smaller Student with NVIDIA TAO, and prepare a validated
-deployment handoff.
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11--3.13-3776AB.svg)](https://www.python.org/)
+[![React](https://img.shields.io/badge/React-19-61DAFB.svg)](https://react.dev/)
 
-![Rock-paper-scissors Guidance in the VLM Feedback Loop](docs/images/ftue-rps-guidance.png)
+Build an image-labeling workflow in which expert corrections improve the next
+Vision Language Model (VLM) request immediately, then measure when the workflow
+is ready for batch labeling and optional Student-model training.
 
-The core loop is intentionally simple:
+![Interactive VLM Feedback Loop labeling workflow](docs/images/ftue-rps-guidance.png)
 
-1. A Teacher VLM proposes a structured label for an image.
-2. A Subject Matter Expert (SME) accepts it, corrects it, or skips the image.
-3. Accepted and corrected labels become Verified ground truth.
-4. Corrected examples can guide later Teacher requests through In-Context
-   Learning (ICL).
-5. Held-out evaluation measures progress and a readiness gate controls Batch
-   Labeling.
-6. Optional NVIDIA TAO jobs fine-tune, evaluate, and quantize Student models;
-   NVIDIA NIM then supports serving validation and benchmarking.
-
-ICL changes the examples placed in later prompts; it does **not** change the
-Teacher's weights. Student fine-tuning is the weight-updating stage.
+This repository is an open reference application that integrates NVIDIA NIM,
+NVIDIA NeMo Retriever, and NVIDIA TAO. It includes a working web UI, API,
+evaluation and readiness logic, a bundled sample dataset, and both container
+and source deployment paths.
 
 > [!WARNING]
-> This is a single-user reference application with **no authentication,
-> authorization, or multi-user isolation**. It binds to `127.0.0.1` by
-> default. Do not expose it directly to the public internet. Remote access
-> requires a trusted network and an operator-managed authenticated proxy or
-> equivalent access-control layer.
+> This is a single-user reference application with no authentication,
+> authorization, or multi-user isolation. It binds to `127.0.0.1` by default.
+> Do not expose it directly to the public internet. Remote access requires a
+> trusted network and an operator-managed authenticated proxy or equivalent
+> access-control layer.
 
-## Choose your path
+## Table of contents
 
-| You are… | Start here |
-|---|---|
-| An SME evaluating the labeling loop | [10-minute hosted quick start](#10-minute-hosted-quick-start) |
-| A developer changing the Blueprint | [Local source mode](#local-source-mode) |
-| A GPU/NIM operator | [Deployment guide](docs/deployment.md) and [local NIM setup](docs/local_nim_dev_setup.md) |
-| A TAO infrastructure operator | [TAO FTMS operator guide](docs/tao-ftms-install.md) |
+- [Overview](#overview)
+- [Why this Blueprint](#why-this-blueprint)
+- [How it works](#how-it-works)
+- [Key features](#key-features)
+- [Architecture](#architecture)
+- [Software components](#software-components)
+- [Target audience](#target-audience)
+- [Requirements](#requirements)
+- [Data handling, cost, and limitations](#data-handling-cost-and-limitations)
+- [Get started](#get-started)
+- [Deployment options](#deployment-options)
+- [Configuration and data](#configuration-and-data)
+- [API and development](#api-and-development)
+- [Documentation](#documentation)
+- [Contributing and security](#contributing-and-security)
+- [License](#license)
 
-## 10-minute hosted quick start
+## Overview
 
-This is the recommended first experience. It uses Docker Compose, a hosted
-NVIDIA API endpoint, and the bundled 15-image rock/paper/scissors sample. No
-local GPU is required.
+Most vision projects are slowed down by the cost of producing reliable labels
+and the delay between finding a model error and improving the workflow. The
+Interactive VLM Feedback Loop puts a Subject Matter Expert (SME) directly in
+that loop:
 
-### Supported systems
+1. A Teacher VLM proposes a structured label for an image.
+2. The SME accepts it, corrects it, skips the image, or retries with different
+   Guidance or a different Teacher.
+3. Accepted and corrected labels become Verified ground truth.
+4. Verified corrections can be selected as In-Context Learning (ICL) examples
+   for later Teacher requests.
+5. Held-out evaluation measures quality while the SME continues labeling.
+6. A five-criterion Scale-Up Readiness Gate controls Batch Labeling.
+7. Optional NVIDIA TAO jobs fine-tune, evaluate, and quantize Student models
+   that can be validated behind NVIDIA NIM and compared with the Teacher.
 
-- **Containerized mode:** Linux with Docker Engine + Compose v2, or Docker
-  Desktop on macOS/Windows, using hosted NVIDIA endpoints.
-- **Local source mode:** validated on Ubuntu 22.04 LTS with Python 3.11–3.13,
-  Node.js 20+, `uv`, and `pnpm` 9+.
-- **System-managed local NIM:** Linux only, with Docker Engine, NVIDIA
-  Container Toolkit, an NGC key, and a supported NVIDIA GPU.
+ICL changes the examples sent in later prompts; it does not update the
+Teacher's weights. Student fine-tuning is the weight-updating stage. See the
+[product overview](docs/Overview.md) for the complete workflow and terminology.
 
-### 1. Launch
+## Why this Blueprint
 
-Get an API key from
-[build.nvidia.com](https://build.nvidia.com/settings/api-keys), then:
+- **Shorten the correction loop.** An SME correction is immediately eligible
+  to guide relevant future proposals.
+- **Protect evaluation integrity.** Verified Test Pool examples are held out
+  from ICL and synthetic labels never become ground truth automatically.
+- **Spend expert time efficiently.** pHash and image embeddings prioritize
+  diverse images instead of presenting near-duplicates in sequence.
+- **Make scale-up explicit.** Batch Labeling stays locked until the backend's
+  readiness criteria pass.
+- **Require benchmarkable training data.** Student Training remains independent
+  of Teacher-quality metrics but stays locked until both its Verified training
+  split and configured held-out Test Pool minimum are available.
+- **Keep model decisions inspectable.** Guidance, prompts, labels, evaluation
+  snapshots, exports, training jobs, and deployment evidence retain lineage.
+- **Support a practical Student path.** The same application prepares
+  Cosmos-RL datasets, submits TAO workflows, validates quality, and benchmarks
+  serving performance with real held-out images and the production prompt.
 
-```bash
-git clone https://github.com/zerodefects/vlm-feedback-loop-public.git
-cd vlm-feedback-loop-public
-export NVIDIA_API_KEY=nvapi-...
-docker compose up --build
+## How it works
+
+```text
+Ingest images + define Guidance
+                |
+                v
+Teacher VLM proposes a structured label
+                |
+                v
+ SME saves, edits, skips, or retries
+        |                    |
+        v                    v
+ Verified ground truth   Omitted image
+        |
+        +--> corrected examples become eligible for ICL
+        |
+        +--> held-out evaluation --> Scale-Up Readiness Gate --> Batch Labeling
+        |                             (Teacher quality)          (Auto-Labeled)
+        |
+        +--> training + Test Pool minimum --> Student Training
+             + TAO readiness                 (TAO / Cosmos-RL)
+                                                    |
+                                                    v
+                                         NIM serving validation
+                                         + Teacher comparison
 ```
 
-Open <http://localhost:3000>. The nginx edge is published only on
-`127.0.0.1` unless an operator deliberately changes `EDGE_BIND_HOST`.
+The backend is authoritative for schema derivation, validation, prompt
+construction, ICL selection, evaluation, readiness, pool routing, and job state.
+The React UI consumes those contracts through REST; Server-Sent Events (SSE)
+provide progress hints, followed by REST reconciliation.
 
-### 2. Create a project
+## Key features
 
-Select **Create Project**, give the project a name, and follow the setup
-screens. Keep the recommended hosted Teacher and hosted embedding provider for
-this walkthrough. A key pasted in the Compose UI applies only for the current
-backend process; put a persistent key in the repository-root `.env` or your
-deployment secret manager.
+- Guided project setup, image ingestion, and versioned task Guidance.
+- Structured Core and Aux label fields with backend validation and schema
+  evolution rules.
+- Hosted or self-hosted Teacher VLM inference through OpenAI-compatible NVIDIA
+  NIM endpoints.
+- Relevance-ranked ICL from Verified Edits, with token and image-budget
+  enforcement.
+- Diversity-first review order using a CPU pHash baseline and NVIDIA NeMo
+  Retriever VL image embeddings.
+- Background held-out evaluation with Exact Match, per-field metrics, pool
+  coverage, and regression-aware Returning/New reporting.
+- A backend-authoritative five-criterion Scale-Up Readiness Gate.
+- Recoverable Batch Labeling, versioned dataset exports, and explicit
+  Auto-Labeled lineage.
+- Cosmos-RL / NVIDIA TAO Student training, baseline and quantized evaluation,
+  Student registration, temporary NIM serving validation, and Teacher/Student
+  comparison, followed by a portable NIM deployment bundle with
+  checksums, the serving-evaluated structured request template, and
+  ready-to-run launch/real-image verification helpers.
+- A 15-image rock/paper/scissors sample for the first-run walkthrough.
 
-### 3. Ingest the bundled sample
+## Architecture
 
-On **Ingest Images**, select **Use bundled sample**. Container mode opens
-`/data/images`; source mode opens the checkout's
-`deploy/example-images/` directory. Select all 15 images and choose
-**Ingest Selected**.
+![Interactive VLM Feedback Loop architecture](docs/images/architecture.png)
 
-This sample is a walkthrough/smoke dataset. It is intentionally too small to
-pass the default Scale-Up gate.
+The Blueprint is a single-repository application with two first-class delivery
+modes: local source and Docker Compose. Both use the same FastAPI services and
+per-project SQLite model.
 
-### 4. Apply rock-paper-scissors Guidance
-
-Open **Guidance**, select the **Rock, paper, scissors** preset, and apply it.
-The preset asks the Teacher to classify the visible hand gesture and defines
-one Core enum:
-
-```json
-{
-  "category": "rock | paper | scissors"
-}
-```
-
-Activate the saved Guidance version, then open **Labeling**.
-
-### 5. Create Verified labels
-
-For each proposal:
-
-- If the category is correct, choose **Save**. The result is a Verified
-  Accept.
-- If the category is genuinely wrong, change it to the category visible in
-  the image and choose **Save**. The result is a Verified Edit.
-- If the image cannot be judged, choose **Skip**.
-
-Never manufacture an incorrect label just to exercise Edit. When a real
-correction occurs, that Verified Edit becomes eligible for later ICL requests
-unless it is reserved for the Test Pool. The next proposal may therefore
-receive the corrected image and Core label as an example.
-
-### 6. Understand the scale boundary
-
-The sample demonstrates the product loop but cannot establish meaningful model
-quality. For the default 40% Test Pool allocation to reach its 60-image
-minimum, ingest and review **at least 150 images**, and all 150 must become
-Verified. Real model-quality requirements depend on the domain, class balance,
-error cost, and image variability; they may be much higher.
-
-Continue with your own dataset, run evaluation, and use **Scale Up** to see the
-five readiness criteria. Batch Labeling remains disabled until the gate passes.
-Student Training uses its own authoritative TAO and data preflight.
-
-### Stop, restart, and reset
-
-Stop while preserving project data:
-
-```bash
-docker compose down
-```
-
-Resume later with `docker compose up --build`. Projects persist in the Docker
-named volume `vlm-feedback-loop-workspace`; images are referenced from the
-configured image mount and are not copied into the project.
-
-> [!CAUTION]
-> The following reset permanently deletes **all Compose-mode projects,
-> databases, exports, artifacts, and logs** in the named workspace volume.
-> Stop the stack and verify the exact volume name first.
-
-```bash
-docker compose down
-docker volume rm vlm-feedback-loop-workspace
-```
-
-See the [deployment guide](docs/deployment.md) for bind-mounted workspaces,
-trusted-network binding, logs, and narrower source-mode reset instructions.
-
-## Local source mode
-
-Use this path for development or for system-managed local NIM containers.
-
-```bash
-git clone https://github.com/zerodefects/vlm-feedback-loop-public.git
-cd vlm-feedback-loop-public
-uv sync
-cd src/ui && pnpm install && cd ../..
-uv run vlm-feedback-loop init --workspace-root ~/vlm-workspace
-# Add NVIDIA_API_KEY to ~/.vlm_feedback_loop/.env for hosted endpoints.
-./scripts/dev.sh
-```
-
-Open <http://localhost:5173>. The backend runs at
-<http://localhost:8000>; Vite proxies REST and SSE requests.
-
-The **Use bundled sample** action opens
-`deploy/example-images/` directly—there is no need to navigate from `/`.
-Source-mode project data persists under
-`{WORKSPACE_ROOT}/projects/{project_id}/`. Stop with `Ctrl+C` and rerun
-`./scripts/dev.sh` to resume.
-
-For a non-loopback source bind, set one absolute `IMAGE_ROOT` and place an
-authenticated access-control layer in front of the application. Filesystem
-operations fail closed when a non-loopback backend has no image root.
-
-## What the Blueprint includes
-
-- React 19 + TypeScript + Vite UI using KUI Foundations and Tailwind 4.
-- Python + FastAPI backend as the authority for validation, prompt
-  construction, ICL selection, evaluation, readiness, and run state.
-- One SQLite database per project, in WAL mode, with automatic Alembic
-  migrations.
-- Inline pHash plus hosted or local NeMo Retriever VL embeddings for diverse
-  review order and relevance-ranked ICL.
-- Hosted or local NVIDIA NIM Teacher inference.
-- Background evaluation, Batch Labeling, dataset export, TAO training chains,
-  Student registration, serving validation, and comparison.
-- In-process asyncio jobs; no external task queue.
-
-![Architecture diagram](docs/images/architecture.png)
-
-Runtime data is outside the repository:
+Runtime data stays outside the source tree:
 
 ```text
 {WORKSPACE_ROOT}/
@@ -206,103 +157,266 @@ Runtime data is outside the repository:
       logs/
 ```
 
-Images remain at their source paths and are stored by reference.
+Images are stored by filesystem reference and are not copied into a project.
+SQLite runs in WAL mode, Alembic migrations apply automatically when a project
+opens, and background jobs run in-process with `asyncio`; there is no external
+task queue. A nonempty database with missing or malformed Alembic revision state
+is backed up and refused instead of being guessed to be a fresh project.
 
-## Scale-Up and training safety
+## Software components
 
-The **Scale-Up Readiness Gate** controls Batch Labeling from evaluation
-quality, per-value F1, recent Accept rate, and Test Pool coverage. Auto-Labeled
-outputs are synthetic and are never represented as Verified ground truth.
+| Component | Technology | Role |
+| --- | --- | --- |
+| Web application | React 19, TypeScript, Vite, KUI Foundations, Tailwind 4 | Guided setup, labeling, evaluation, Scale-Up, training, and comparison UI |
+| Application API | Python, FastAPI, Pydantic, SQLAlchemy | Authoritative product logic and versioned `/v1` REST API |
+| Project storage | SQLite WAL, Alembic | One durable database per project |
+| Edge proxy | nginx | Container-mode static serving, REST proxying, and SSE-safe passthrough |
+| Teacher and Student inference | NVIDIA NIM | OpenAI-compatible hosted or self-hosted VLM inference |
+| Image embeddings | NVIDIA NeMo Retriever VL 1B v2 NIM | Semantic diversity and ICL relevance |
+| Student training | NVIDIA TAO FTMS with Cosmos-RL | Fine-tuning, evaluation, and quantization |
+| Background work | In-process `asyncio` | Embeddings, evaluation, exports, batch runs, and job monitoring |
 
-Student Training is separately preflighted. The first-run
-**Validate training setup** workflow selects:
+## Target audience
 
-- one recommended small Student base;
-- the Quick preset;
-- the full-precision baseline plus `FP8_DYNAMIC`; and
-- exactly four TAO jobs: train, baseline evaluate, quantize, and FP8 evaluate.
+| Audience | Start here |
+| --- | --- |
+| Subject Matter Experts evaluating the labeling loop | [Hosted quick start](#hosted-quick-start) |
+| Application developers extending the Blueprint | [Local source quick start](#local-source-quick-start) |
+| GPU and NIM operators | [Local NIM setup](docs/local_nim_dev_setup.md) |
+| TAO infrastructure operators | [TAO FTMS operator guide](docs/tao-ftms-install.md) |
+| API consumers | [API reference](docs/API.md) |
 
-Before submission, the UI shows backend-authoritative Verified training,
-held-out Test Pool, eligible Auto-Labeled, excluded, and final usable counts.
-It then requires confirmation of the models, resolved preset, variants, exact
-job count, dataset counts, and remote-infrastructure warning.
+## Requirements
 
-Use the explicit **Compare candidate variants** workflow only when the
-additional model and quantization cost is intended. A successful tiny-data
-validation confirms the TAO wiring; it is not a production-quality model.
+### Deployment requirements
 
-TAO setup is deployment-level infrastructure. SMEs can copy a structured
-**Request TAO setup** Action Request; operators use the
-[TAO FTMS guide](docs/tao-ftms-install.md) to install, validate, and bootstrap
-the shared workspace.
+| Profile | Software and credentials | GPU |
+| --- | --- | --- |
+| Hosted, containerized | Docker Engine with Compose v2; `NVIDIA_API_KEY` | None |
+| Hosted, local source | Ubuntu 22.04 LTS (validated); Python 3.11-3.13; Node.js 20+; `uv`; `pnpm` 9+; `NVIDIA_API_KEY` | None |
+| Self-hosted local NIM | Local-source requirements plus Docker, NVIDIA Container Toolkit, compatible NVIDIA driver, NGC access, and `NGC_API_KEY` | Model-dependent; see below |
+| Student training | Reachable TAO FTMS deployment, TAO credentials, workspace object-store credentials, and `HF_TOKEN` when a gated base requires it | Managed by the TAO deployment |
 
-## Serving validation and production handoff
+Docker Compose with hosted endpoints is supported on Linux and through Docker
+Desktop on macOS or Windows. System-managed local NIM deployment is Linux-only
+and requires local-source mode because the containerized backend intentionally
+has no Docker CLI or Docker socket.
 
-The Blueprint distinguishes three stages:
+### Hardware requirements
 
-- **Quality validation:** TAO predictions are re-scored over the frozen,
-  Verified-only Test Pool with the Blueprint's canonical Core-field evaluator.
-- **Serving validation:** a Student runs temporarily behind NIM to measure
-  latency, throughput, runtime health, and serving configuration.
-- **Production deployment:** an external infrastructure team owns the
-  permanent service, access controls, scaling, monitoring, and operations.
+Hosted Teacher inference and hosted embeddings require no local GPU. For local
+NIMs, the seeded deployment policy uses these memory floors:
 
-The Blueprint does not own a permanent production service. When a Student has
-both quality and serving validation, **Request production deployment**
-generates a handoff containing:
+| GPU memory | Supported local path |
+| --- | --- |
+| `>= 24 GB` | NeMo Retriever VL 1B v2 embeddings with a hosted Teacher, on a GPU listed in the NIM 2.0.0 support matrix |
+| `>= 36 GB` | Cosmos Reason2 2B Teacher |
+| `>= 56 GB` | Cosmos 3 Nano recommended Teacher; Cosmos Reason2 8B also selectable |
+| `>= 80 GB` and compute capability `>= 9.0` | Nemotron 3 Nano Omni recommended Teacher |
+| `>= 88 GB` | Cosmos 3 Super selectable; seeded deploys clamp the serving context to 65,536 tokens so its 62.6 GiB BF16 checkpoint leaves sufficient KV cache on a 96 GB GPU |
 
-- checkpoint and checksum references;
-- base model, quantization, NIM release/profile, tensor parallelism, and
-  required environment configuration;
-- evaluation metrics, Test Pool snapshot, Guidance, and ICL mode;
-- latency/throughput evidence; and
-- training, quantization, dataset, and provenance lineage.
+The 24 GB value is an eligibility floor, not a generic compatibility claim:
+NVIDIA validates specific GPU SKUs for this embedding model. Automatic setup
+recommends local embeddings only when the detected GPU name exactly matches
+that pinned matrix and the memory floor fits; unrecognized hardware stays on
+hosted embeddings or pHash unless an operator deliberately tests the NIM
+fallback path. GPU architecture, precision, driver, NIM release, access terms,
+RAM, and disk requirements also apply. Use the
+[local NIM hardware matrix](docs/local_nim_dev_setup.md#1-hardware-requirements)
+before choosing a GPU host.
 
-If local serving validation cannot start, **Deploy for serving validation**
-generates a separate temporary-infrastructure request. It is not a production
-handoff.
+The application warms one deployment-scoped environment assessment and reuses
+its Docker, NVIDIA Container Toolkit, and GPU inventory snapshot across
+projects for the lifetime of the backend process. Credential and active-NIM
+state is still read fresh, and every deployment preflight performs live safety
+checks. Operators who change host prerequisites without restarting can force a
+new snapshot with `GET /v1/environment?refresh_hardware=true`.
 
-## Configuration
+### One NIM per GPU
+
+The Blueprint permits at most one local NIM container per GPU, regardless of
+what a simple VRAM sum suggests. On multi-GPU systems, placement uses the
+lowest compatible free GPU. On a single-GPU system, use one of these profiles:
+
+- local Teacher with pHash diversity;
+- local Teacher with hosted embeddings;
+- local embeddings with a hosted Teacher; or
+- temporary Student benchmarking that displaces and then restores the Teacher.
+
+Replacing a resident NIM requires explicit confirmation. The detailed
+placement, reuse, recovery, and replacement contract is in the
+[deployment guide](docs/deployment.md#gpu--local-nim-runtime-behavior).
+
+## Data handling, cost, and limitations
+
+Project databases store image filesystem references rather than copies, but
+that does not mean every processing path stays on the same machine:
+
+| Workflow | Data sent outside the Blueprint host |
+| --- | --- |
+| Hosted image embeddings | Each ingested image selected for embedding is encoded and sent to the configured NVIDIA endpoint. |
+| Hosted Teacher inference | The current image, selected ICL images and Verified labels, Guidance-derived prompt, and output schema are sent to the configured NVIDIA endpoint. |
+| TAO Student training | Selected training and held-out images plus annotations are uploaded to the configured TAO workspace object store before remote jobs run. |
+
+A persisted `storage_ref` is not a permanent filesystem grant. Every image
+read is re-authorized against the current `IMAGE_ROOT`, must resolve to a
+regular file, and is consumed through the descriptor opened during that check.
+Changing a path or symlink after ingestion therefore cannot redirect serving,
+inference, embedding, pHash, benchmarking, or export reads outside the current
+deployment policy.
+
+Self-hosted endpoint URLs may also refer to another machine, so the operator
+controls that data boundary. Before using sensitive or regulated data, review
+the endpoint and object-store operators' access, retention, privacy, and model
+terms. Hosted API calls can consume quota or incur service charges; local NIMs
+consume GPU resources; TAO workflows can incur compute, storage, and egress
+costs. The Blueprint does not estimate those charges.
+
+This is a single-user reference stack, not a high-availability service. It has
+no built-in authentication or multi-user isolation, runs background work in
+the backend process without an external task queue, and permits one backend
+process per project database. Compose cannot orchestrate system-managed local
+NIMs because its backend intentionally has no Docker socket. The bundled
+15-image sample demonstrates the interaction loop but cannot satisfy the
+default Scale-Up or Student Training data gates.
+
+## Get started
+
+### Hosted quick start
+
+This is the recommended first experience. It uses Docker Compose, hosted
+NVIDIA endpoints, and the bundled rock/paper/scissors sample. No local GPU is
+required.
+
+1. Get an API key from
+   [build.nvidia.com](https://build.nvidia.com/settings/api-keys).
+
+2. Clone and launch the Blueprint:
+
+   ```bash
+   git clone https://github.com/zerodefects/vlm-feedback-loop-public.git
+   cd vlm-feedback-loop-public
+   export NVIDIA_API_KEY=nvapi-...
+   docker compose up --build
+   ```
+
+3. Open <http://localhost:3000> and select **Create Project**. With the API key
+   present, the Blueprint selects the recommended hosted Teacher and hosted
+   embedding provider automatically; confirm the defaults if that screen is
+   shown. Fresh projects preseed only models whose published model terms permit
+   commercial use; the default hosted Teacher is Step 3.7 Flash. The free
+   NVIDIA API Catalog endpoint is still for development and evaluation. Before
+   a Batch Labeling run uses it, the Blueprint requires a confirmation and
+   links the API Trial Terms. For production, configure a subscribed provider
+   endpoint or deploy NIM under the appropriate NVIDIA AI Enterprise
+   entitlement.
+
+4. **Ingest Images** normally opens the bundled `/data/images` sample. Check
+   the `rock`, `paper`, and `scissors` folders, then choose **Ingest Selected**.
+
+5. On **Guidance**, choose the **Rock, paper, scissors** preset, then select
+   **Save Guidance**. Saving activates the guidance and opens **Labeling**.
+
+6. Save correct labels, edit genuinely incorrect labels before saving, and
+   skip images that cannot be judged. A real Verified Edit becomes eligible
+   for a later ICL request unless it is reserved for the Test Pool.
+
+The bundled sample demonstrates the loop but is intentionally too small for
+Batch Labeling or Student Training under the default data-readiness settings.
+With the default 40% Test Pool allocation, at least 150 ingested and Verified
+images are needed to reach the 60-image pool minimum; real applications may
+require substantially more.
+
+Stop the stack without deleting project data:
+
+```bash
+docker compose down
+```
+
+Projects persist in the `vlm-feedback-loop-workspace` Docker volume. See the
+[deployment guide](docs/deployment.md#stop-restart-resume-and-reset) for
+restart, bind-mount, and reset procedures.
+
+### Local source quick start
+
+Use source mode for development and for system-managed local NIMs:
+
+```bash
+git clone https://github.com/zerodefects/vlm-feedback-loop-public.git
+cd vlm-feedback-loop-public
+
+uv sync
+cd src/ui && pnpm install && cd ../..
+
+uv run vlm-feedback-loop init --workspace-root ~/vlm-workspace
+# Add NVIDIA_API_KEY to ~/.vlm_feedback_loop/.env for hosted endpoints.
+
+./scripts/dev.sh
+```
+
+Open <http://localhost:5173>. The backend runs at
+<http://localhost:8000>, and Vite proxies REST and SSE requests. Stop with
+`Ctrl+C`; rerun `./scripts/dev.sh` to resume from the configured workspace.
+
+## Deployment options
+
+| Mode | Best for | Entry point |
+| --- | --- | --- |
+| Docker Compose + hosted endpoints | Fast evaluation with no local toolchain or GPU | `docker compose up --build` |
+| Local source + hosted endpoints | Development and debugging | `./scripts/dev.sh` |
+| Local source + local NIM | GPU-backed Teacher, embeddings, or temporary Student validation | In-app setup after `./scripts/dev.sh` |
+| Hybrid | A local Teacher on one GPU with hosted embeddings | In-app setup with both API keys |
+| TAO-enabled | Student fine-tuning and quantization | TAO deployment plus `uv run vlm-feedback-loop tao-bootstrap` |
+
+The Compose stack contains nginx, backend, and UI services only. NIM
+containers are started at runtime by the source-mode backend with `docker run`;
+they are not Compose services. Do not add the Docker socket to the shipped
+backend container.
+
+For networking, persistence, GPU behavior, and troubleshooting, use the
+[deployment guide](docs/deployment.md).
+
+## Configuration and data
 
 Configuration has three scopes:
 
-1. `~/.vlm_feedback_loop/config.yaml` — non-secret settings such as
-   `WORKSPACE_ROOT`, `IMAGE_ROOT`, ports, log level, model defaults, embedding
-   settings, and `ALLOW_UI_SECRET_PERSIST`.
-2. `~/.vlm_feedback_loop/.env` — source-mode deployment secrets.
-3. Shell or repository-root `.env` — Compose interpolation and secrets.
+1. `~/.vlm_feedback_loop/config.yaml` contains non-secret application settings
+   for source mode.
+2. `~/.vlm_feedback_loop/.env` contains source-mode secrets.
+3. The shell environment or repository-root `.env` supplies Compose
+   interpolation and container secrets.
 
-See [`config.yaml.example`](config.yaml.example) and
-[`.env.example`](.env.example). Important credentials:
+Configuration precedence is process environment, explicit env file,
+`~/.vlm_feedback_loop/.env`, `~/.vlm_feedback_loop/config.yaml`, then built-in
+defaults.
 
-| Variable | Used for |
-|---|---|
+| Setting or variable | Purpose |
+| --- | --- |
+| `WORKSPACE_ROOT` | Absolute project-data root; required in source mode |
+| `IMAGE_ROOT` | Optional absolute image-browsing boundary |
+| `BIND_HOST`, `BIND_PORT` | Source-mode backend binding |
+| `EDGE_BIND_HOST`, `EDGE_PORT` | Compose edge binding; defaults to `127.0.0.1:3000` |
+| `VLM_FEEDBACK_LOOP_BUILD_SHA` | Exact source revision for containerized Student benchmark provenance; source mode resolves Git automatically |
 | `NVIDIA_API_KEY` | Hosted Teacher and hosted image embeddings |
-| `NGC_API_KEY` | Local NIM image pulls and weight access |
+| `NGC_API_KEY` | Local NIM image pulls and model access |
 | `HF_TOKEN` | Gated Student-base access when required |
-| `TAO_API_BASE_URL`, `TAO_ORG_NAME`, `TAO_API_KEY` | TAO FTMS |
+| `TAO_API_BASE_URL`, `TAO_ORG_NAME`, `TAO_API_KEY` | TAO FTMS connection |
 | `TAO_WORKSPACE_S3_ACCESS_KEY`, `TAO_WORKSPACE_S3_SECRET_KEY` | TAO workspace transfer |
+| `ALLOW_UI_SECRET_PERSIST` | Whether the UI may persist pasted keys; Compose defaults this to `false` |
 
-Compose binds nginx with
-`${EDGE_BIND_HOST:-127.0.0.1}:${EDGE_PORT:-3000}` and mounts the bundled
-sample when `IMAGE_ROOT` is unset. It deliberately has no Docker socket, so
-system-managed local NIM orchestration requires local-source mode.
+Use [`config.yaml.example`](config.yaml.example) and
+[`.env.example`](.env.example) as the annotated references. Images remain at
+their source paths. Project databases, exports, artifacts, and logs live under
+`WORKSPACE_ROOT`; in Compose mode, the named workspace volume provides that
+storage.
 
-## Local GPU and NIM operators
+## API and development
 
-The backend can launch local Teacher, embedding, and temporary Student NIM
-containers in source mode. One NIM container is permitted per GPU. Placement,
-replacement confirmation, cache persistence, supported models, GPU floors,
-registry authentication, served-model verification, and prompt image limits
-are documented in:
+The backend exposes a versioned `/v1` REST API and an SSE hint channel. See the
+[curated API reference](docs/API.md); a running source-mode backend also serves
+the complete OpenAPI interface at <http://localhost:8000/docs>.
 
-- [Deployment guide: GPU and local NIM behavior](docs/deployment.md#gpu--local-nim-runtime-behavior)
-- [Local NIM development setup](docs/local_nim_dev_setup.md)
-
-Do not add the Docker socket to the Compose backend; that is outside the
-shipped security boundary.
-
-## Development and validation
+Run the backend checks:
 
 ```bash
 uv run pytest tests/unit/ -q
@@ -310,55 +424,111 @@ uv run pytest tests/integration/ -q -n 0
 uv run ruff check .
 uv run ruff format --check .
 uv run pyright src/backend/
+```
 
+Run the frontend checks:
+
+```bash
 cd src/ui
 pnpm test
+pnpm exec playwright install --with-deps chromium  # one-time browser install
+pnpm test:e2e
 pnpm typecheck
 pnpm lint
 pnpm build
 ```
 
-Integration tests are serial because they launch services on fixed ports.
-See [`docs/AdvancedTests.md`](docs/AdvancedTests.md) for live validation and
-test infrastructure.
+Integration tests must run serially because they launch live services on fixed
+ports.
 
-## Documentation
+### Follow one labeling turn through the code
 
-| Document | Purpose |
-|---|---|
-| [`docs/Overview.md`](docs/Overview.md) | Product concepts and workflows |
-| [`docs/API.md`](docs/API.md) | Curated consumer API |
-| [`docs/deployment.md`](docs/deployment.md) | Container, source, persistence, networking, and GPU operation |
-| [`docs/tao-ftms-install.md`](docs/tao-ftms-install.md) | TAO operator install, health validation, and Blueprint bootstrap |
-| [`docs/local_nim_dev_setup.md`](docs/local_nim_dev_setup.md) | Local NIM operator setup |
-| [`docs/public-release-validation.md`](docs/public-release-validation.md) | Exact public snapshot, anonymous acquisition, and two-mode validation evidence |
-| [`docs/Engineering_Spec_Brief.md`](docs/Engineering_Spec_Brief.md) | Cross-cutting normative-contract map |
-| [`docs/Engineering_Spec.md`](docs/Engineering_Spec.md) | Authoritative implementation contract |
-| [`docs/changelog.md`](docs/changelog.md) | Public release history |
+First-run setup follows the same thin-UI, authoritative-backend shape:
+[CreateProjectDialog](src/ui/src/components/CreateProjectDialog.tsx) calls the
+[projects API client](src/ui/src/api/projects.ts),
+[ImageIngestPage](src/ui/src/pages/ImageIngestPage.tsx) calls the
+[filesystem API client](src/ui/src/api/filesystem.ts), and
+[CreateGuidancePage](src/ui/src/pages/CreateGuidancePage.tsx) calls the
+[Guidance API client](src/ui/src/api/guidance.ts). Their FastAPI routers
+delegate project creation, ingestion, Guidance creation, and SchemaCore
+validation to the corresponding backend services.
 
-## Repository layout
+For the main interactive loop:
+
+1. [LabelingPage](src/ui/src/pages/LabelingPage.tsx) uses the thin
+   [labeling API client](src/ui/src/api/labeling.ts).
+2. The [review-selector router](src/backend/vlm_feedback_loop/routers/review_selector.py)
+   asks `review_selector_service.select_next` for the next diverse image.
+3. The [proposal router](src/backend/vlm_feedback_loop/routers/proposals.py)
+   delegates the request to `proposal_service.create_proposal`.
+4. The [proposal service](src/backend/vlm_feedback_loop/services/proposal_service.py)
+   loads eligible Verified Edits through `icl_service`, then calls
+   `prompt_service.invoke_teacher`. That service applies token and image
+   budgets, renders the
+   [Teacher prompt](src/backend/vlm_feedback_loop/prompts/teacher_interactive_proposal.txt),
+   and invokes NIM; the proposal service validates and records the result.
+5. The [labels router](src/backend/vlm_feedback_loop/routers/labels.py) delegates
+   Save to `label_service.save_label`, which normalizes the submitted values,
+   classifies Accept versus Edit, marks the example Verified, and performs
+   backend-authoritative pool routing. The router then checks whether an
+   automatic evaluation should start.
+
+### Safe customization points
+
+| Change | Canonical owner | Keep in mind |
+| --- | --- | --- |
+| Add or revise a starter task | [Guidance templates](src/ui/src/lib/guidance-templates.ts) | SchemaCore validation remains in [schema_core.py](src/backend/vlm_feedback_loop/services/schema_core.py). |
+| Change the Teacher instruction | [Teacher prompt](src/backend/vlm_feedback_loop/prompts/teacher_interactive_proposal.txt) and [prompt_service.py](src/backend/vlm_feedback_loop/services/prompt_service.py) | Keep budgeting, structured output, and validation behavior aligned. |
+| Add a supported model or deployment profile | [model_catalog_constants.py](src/backend/vlm_feedback_loop/model_catalog_constants.py) and [`project_service.SEEDED_MODEL_CATALOG`](src/backend/vlm_feedback_loop/services/project_service.py) | Persisted model identities require an explicit migration; do not rename them in place. |
+| Change evaluation or readiness rules | [exact_match_evaluator.py](src/backend/vlm_feedback_loop/services/exact_match_evaluator.py) and [evaluation_service.py](src/backend/vlm_feedback_loop/services/evaluation_service.py) | Domain rules stay in the backend, not the React client. |
+
+The [Engineering Spec Brief](docs/Engineering_Spec_Brief.md) maps each of these
+areas to its normative contract and detailed implementation section.
+
+### Repository layout
 
 ```text
 vlm-feedback-loop/
   deploy/             Bundled sample images and data license
-  docs/               Public product and operator documentation
+  docs/               Product, API, architecture, and operator documentation
   scripts/            Setup, validation, and developer utilities
   src/backend/        FastAPI application
   src/ui/             React application
   tests/unit/         Backend unit tests
   tests/integration/  Serial live-service tests
-  docker-compose.yml  nginx + backend + UI
+  docker-compose.yml  nginx + backend + UI stack
+  nginx.conf          Edge proxy configuration
 ```
+
+## Documentation
+
+| Document | Purpose |
+| --- | --- |
+| [Product overview](docs/Overview.md) | Concepts, labeling loop, evaluation, Scale-Up, and Student workflows |
+| [API reference](docs/API.md) | Curated public API and runtime OpenAPI guidance |
+| [Deployment guide](docs/deployment.md) | Compose and source modes, networking, persistence, local NIMs, and troubleshooting |
+| [Local NIM setup](docs/local_nim_dev_setup.md) | GPU hardware, driver, NGC, cache, and container setup |
+| [TAO FTMS operator guide](docs/tao-ftms-install.md) | Student-training infrastructure and Blueprint bootstrap |
+| [Engineering Spec Brief](docs/Engineering_Spec_Brief.md) | Cross-cutting contracts and map to normative detail |
+| [Engineering Specification](docs/Engineering_Spec.md) | Authoritative data, API, algorithm, and state-machine contract |
+| [Changelog](docs/changelog.md) | Public release history |
+
+## Contributing and security
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+fork, sign-off, pull request, and validation requirements.
+
+Report security issues through the process in [SECURITY.md](SECURITY.md), not
+through a public GitHub issue.
 
 ## License
 
-Application source is governed by the [Apache License 2.0](LICENSE).
-Third-party software and model terms remain separate; review
-[`LICENSE-3rd-party.txt`](LICENSE-3rd-party.txt) before use.
+Application source is licensed under the [Apache License 2.0](LICENSE).
+This project downloads or connects to separately licensed software, models,
+and containers; review [`LICENSE-3rd-party.txt`](LICENSE-3rd-party.txt) and the
+applicable NVIDIA API Catalog, NGC, and third-party model terms before use.
 
-The bundled sample under [`deploy/example-images/`](deploy/example-images/) is
-CC BY 2.0 and includes its own
-[`LICENSE.DATA`](deploy/example-images/LICENSE.DATA).
-
-Hosted and local models are governed by their respective NVIDIA API Catalog,
-NGC, or third-party terms.
+The bundled images under
+[`deploy/example-images/`](deploy/example-images/) are licensed separately
+under CC BY 2.0; see
+[`deploy/example-images/LICENSE.DATA`](deploy/example-images/LICENSE.DATA).

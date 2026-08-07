@@ -1,11 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for ``services.tao_base_experiment_provisioning_service``.
-
-Twelve mocked service tests + one import-boundary subprocess test,
-numbered #1-#13 to match the section banners below.
-"""
+"""Tests for ``services.tao_base_experiment_provisioning_service``."""
 
 from __future__ import annotations
 
@@ -41,6 +37,7 @@ from vlm_feedback_loop.services.tao_base_experiment_provisioning_service import 
     PULL_SCRIPT_PATH,
     _default_subprocess_runner,
     _Target,
+    _upload_stage_tree_sync,
     _write_csv,
     provision_base_experiments,
 )
@@ -135,6 +132,8 @@ def _ok_subprocess_runner(
         captured["timeout_s"] = timeout_s
         idx = cmd.index("--shared-folder-path")
         stage = Path(cmd[idx + 1])
+        csv_idx = cmd.index("--csv")
+        captured["csv"] = Path(cmd[csv_idx + 1]).read_text(encoding="utf-8")
         stage.mkdir(parents=True, exist_ok=True)
         (stage / "ptm_metadatas.json").write_text(
             json.dumps({"Cosmos Reason2 2B": {}}), encoding="utf-8"
@@ -223,6 +222,28 @@ def _tao_transport(
     transport.list_calls = list_calls  # type: ignore[attr-defined]
     transport.la_calls = la_calls  # type: ignore[attr-defined]
     return transport
+
+
+# ── Workspace readiness ──────────────────────────────────────────────────────
+
+
+class TestWorkspaceReadiness:
+    @pytest.mark.asyncio
+    async def test_unbootstrapped_workspace_names_the_canonical_state_store(
+        self, tmp_workspace: Path
+    ):
+        """Recovery guidance points to deployment.db, not a retired env key."""
+        init_deployment_db(tmp_workspace)
+
+        result = await provision_base_experiments(_settings_for(tmp_workspace))
+
+        assert result.failed == [
+            (
+                "workspace",
+                "TAO workspace identity is not bootstrapped in deployment.db; "
+                "run `vlm-feedback-loop tao-bootstrap` first.",
+            )
+        ]
 
 
 # ── #1: CSV writer ───────────────────────────────────────────────────────────
@@ -314,6 +335,24 @@ class TestSubprocessInvocationShape:
         del result
 
     @pytest.mark.asyncio
+    async def test_target_model_names_limits_the_download_roster(self, workspace: Path):
+        """A single-base validation run must not pull unrelated optional bases."""
+        settings = _settings_for(workspace, TAO_API_KEY="ngc-key")
+        runner = _ok_subprocess_runner()
+        result = await provision_base_experiments(
+            settings,
+            target_model_names=[COSMOS_REASON2_2B],
+            _transport=_tao_transport(),
+            _subprocess_runner=runner,
+            _dry_run=True,
+        )
+
+        assert result.failed == [(COSMOS_REASON2_2B, "dry_run: not uploaded")]
+        assert "Cosmos Reason2 2B" in runner.captured["csv"]  # type: ignore[attr-defined]
+        assert "Cosmos Reason2 8B" not in runner.captured["csv"]  # type: ignore[attr-defined]
+        assert "Cosmos3" not in runner.captured["csv"]  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
     async def test_default_runner_redacts_spawn_exception(
         self, monkeypatch: pytest.MonkeyPatch
     ):
@@ -338,6 +377,40 @@ class TestSubprocessInvocationShape:
         assert result["returncode"] == -1
         assert "[REDACTED]" in result["stderr"]
         assert sentinel not in result["stderr"]
+
+    @pytest.mark.asyncio
+    async def test_default_runner_cancellation_uses_shared_cleanup_and_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from vlm_feedback_loop.services import (
+            tao_base_experiment_provisioning_service as provisioning,
+        )
+
+        class FakeProcess:
+            returncode = None
+
+        async def fake_exec(*_args, **_kwargs):
+            return FakeProcess()
+
+        communication = AsyncMock(side_effect=asyncio.CancelledError)
+        monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(
+            provisioning,
+            "communicate_with_timeout",
+            communication,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await provisioning._default_subprocess_runner(
+                ["python", "pull_base_experiments.py"],
+                env={},
+                timeout_s=1.0,
+            )
+
+        communication.assert_awaited_once()
 
 
 # ── #3: subprocess stdout parsing propagation ────────────────────────────────
@@ -424,6 +497,35 @@ class TestSubprocessNonzeroExit:
 
 
 class TestS3UploadTree:
+    def test_upload_remains_bound_to_opened_file_after_path_replacement(
+        self, tmp_path: Path
+    ):
+        stage_dir = tmp_path / "stage"
+        stage_dir.mkdir()
+        staged_path = stage_dir / "weights.bin"
+        original_bytes = b"original checkpoint bytes"
+        replacement_bytes = b"replacement checkpoint bytes"
+        staged_path.write_bytes(original_bytes)
+
+        class ReplacingHeadClient(FakeS3Client):
+            def head_object(
+                self,
+                *,
+                Bucket: str,
+                Key: str,  # noqa: N803
+            ) -> dict[str, Any]:
+                replacement = stage_dir / "replacement.bin"
+                replacement.write_bytes(replacement_bytes)
+                os.replace(replacement, staged_path)
+                return super().head_object(Bucket=Bucket, Key=Key)
+
+        s3 = ReplacingHeadClient()
+        _upload_stage_tree_sync(s3, bucket="bucket", stage_dir=stage_dir)
+
+        uploaded = s3.objects[("bucket", "shared-storage/models/weights.bin")]
+        assert uploaded["Body"] == original_bytes
+        assert staged_path.read_bytes() == replacement_bytes
+
     @pytest.mark.asyncio
     async def test_s3_upload_walks_tree_threshold_and_idempotent(self, workspace: Path):
         settings = _settings_for(
@@ -455,6 +557,7 @@ class TestS3UploadTree:
                 ("Cosmos-Reason2-2B/small.bin", small_payload),
                 ("Cosmos-Reason2-2B/large.bin", large_payload),
                 ("Already/skip.bin", already_payload),
+                ("_hf_cache/hub/blobs/cache.bin", b"cache-only"),
             ]
         )
         transport = _tao_transport(
@@ -483,6 +586,7 @@ class TestS3UploadTree:
         # already-uploaded file is NOT re-uploaded.
         assert not any(k.endswith("Already/skip.bin") for k in put_keys)
         assert not any(k.endswith("Already/skip.bin") for k in mp_keys)
+        assert not any("_hf_cache" in kwargs.get("Key", "") for _, kwargs in s3.calls)
 
 
 # ── #6: load_airgapped request shape ────────────────────────────────────────
@@ -689,6 +793,12 @@ class TestDefaultEnumeration:
         rows = captured_csv["rows"]
         # Header + 4 rows (CR2 2B/8B + Cosmos 3 nano/super reasoner).
         assert rows[0] == ["displayName", "ngc_path", "network_arch", "is_backbone"]
+        assert sorted(row[0] for row in rows[1:]) == [
+            "Cosmos 3 Nano (Reasoner)",
+            "Cosmos 3 Super (Reasoner)",
+            "Cosmos Reason2 2B",
+            "Cosmos Reason2 8B",
+        ]
         ngc_paths = [r[1] for r in rows[1:]]
         assert sorted(ngc_paths) == [
             "hf_model://nvidia/Cosmos-Reason2-2B",

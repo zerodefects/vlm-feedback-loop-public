@@ -10,8 +10,9 @@ and environment assessment response.
 from __future__ import annotations
 
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 from vlm_feedback_loop.schemas.local_nim import ActiveNimResidentResponse
 
@@ -19,6 +20,7 @@ from vlm_feedback_loop.schemas.local_nim import ActiveNimResidentResponse
 EndpointMode = Literal["hosted", "self_hosted", "local_system_managed"]
 AuthMode = Literal["bearer", "none"]
 SourceKind = Literal["seeded_hosted", "user_configured", "auto_registered_local"]
+EndpointUsagePolicy = Literal["evaluation_only", "operator_managed"]
 ProbeKind = Literal["models", "embeddings"]
 RecommendedMode = Literal["hosted", "local", "none"]
 EmbeddingProvider = Literal[
@@ -95,11 +97,49 @@ class NimEndpointResponse(BaseModel):
     created_at: str
     updated_at: str
 
+    @computed_field
+    @property
+    def usage_policy(self) -> EndpointUsagePolicy:
+        """Classify whether the Blueprint knows this endpoint is trial-only.
+
+        NVIDIA's API Catalog host is governed by the API Trial Terms. Other
+        endpoints are supplied or licensed by the operator, so
+        the Blueprint deliberately makes no production-entitlement claim.
+        """
+
+        try:
+            hostname = (urlsplit(self.base_url).hostname or "").rstrip(".").lower()
+        except ValueError:
+            hostname = ""
+        if self.endpoint_mode == "hosted" and hostname == "integrate.api.nvidia.com":
+            return "evaluation_only"
+        return "operator_managed"
+
 
 class NimEndpointListResponse(BaseModel):
     """List of NimEndpoint records."""
 
     items: list[NimEndpointResponse]
+
+
+class SelfHostedTeacherConfigureRequest(BaseModel):
+    """Apply one verified self-hosted endpoint to a cataloged Teacher."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str
+    model_config_id: str
+
+
+class SelfHostedTeacherConfigureResponse(BaseModel):
+    """Durable result of configuring a self-hosted Teacher endpoint."""
+
+    endpoint: NimEndpointResponse
+    model_config_id: str
+    model_name: str
+    structured_generation_support: str
+    thinking_toggle_support: str
+    visual_budget_support: str
 
 
 # ── Transient connection test ───────────────────────────────────────────────
@@ -161,6 +201,14 @@ class EmbeddingDeploymentConfigUpdate(BaseModel):
     provider: EmbeddingProvider | None = None
     endpoint_url: str | None = None
     gpu_assignment: str | None = None
+
+
+class SelfHostedEmbeddingConfigureRequest(BaseModel):
+    """Live-verify and apply one external embedding NIM endpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_url: str
 
 
 class EmbeddingDeploymentConfigResponse(BaseModel):

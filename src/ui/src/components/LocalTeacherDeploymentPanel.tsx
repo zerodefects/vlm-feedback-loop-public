@@ -265,7 +265,13 @@ export function LocalTeacherDeploymentPanel({
 
   const modalOpen =
     replacementConflict?.can_replace === true && replacementConflict.resident !== null;
-  const isStarting = trackedDeployment?.status === "starting";
+  // The durable POST response can arrive before the first deployment-list
+  // refetch contains its row. Keep the action disabled throughout that
+  // reconciliation interval so rapid clicks cannot enqueue the same Teacher
+  // deployment twice.
+  const isStarting =
+    trackedDeployment?.status === "starting" ||
+    (trackedDeploymentId !== null && trackedDeployment === undefined);
   const isRunning = trackedDeployment?.status === "running";
   const isFailed = trackedDeployment?.status === "failed";
   const buttonLabel = activeAndRunning
@@ -291,6 +297,7 @@ export function LocalTeacherDeploymentPanel({
       </div>
 
       <Select
+        aria-label="Local Teacher model"
         items={compatibleModels.map((model) => {
           const running = (environment.active_local_nim_residents ?? []).some(
             (resident) =>

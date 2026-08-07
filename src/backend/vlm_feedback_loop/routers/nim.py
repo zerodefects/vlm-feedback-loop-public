@@ -15,7 +15,7 @@ import base64
 from typing import Any
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from vlm_feedback_loop.config import Settings
 from vlm_feedback_loop.model_catalog_constants import (
@@ -33,18 +33,27 @@ from vlm_feedback_loop.schemas.nim import (
     NimEndpointListResponse,
     NimEndpointResponse,
     NimEndpointUpdate,
+    SelfHostedEmbeddingConfigureRequest,
+    SelfHostedTeacherConfigureRequest,
+    SelfHostedTeacherConfigureResponse,
 )
 from vlm_feedback_loop.services import local_nim_service, nim_client
-from vlm_feedback_loop.services.environment import assess_environment
+from vlm_feedback_loop.services.environment import (
+    get_cached_environment,
+    invalidate_machine_assessment_cache,
+)
 from vlm_feedback_loop.services.http_client import resilient_request
 from vlm_feedback_loop.services.nim_client import (
     NIM_DEFAULT_HEADERS,
     build_auth_headers,
 )
 from vlm_feedback_loop.services.nim_endpoint_service import (
+    NimEndpointConfigurationError,
+    configure_self_hosted_teacher,
     create_nim_endpoint,
     get_nim_endpoint,
     list_nim_endpoints,
+    normalize_self_hosted_base_url,
     update_nim_endpoint,
 )
 from vlm_feedback_loop.services.runtime_secrets import get_effective_secret
@@ -56,14 +65,24 @@ nim_router = APIRouter(tags=["nim"])
 
 @nim_router.get("/environment", response_model=EnvironmentResponse)
 async def get_environment(
+    refresh_hardware: bool = Query(
+        default=False,
+        description=(
+            "Re-probe Docker, NVIDIA Container Toolkit, and GPU inventory before "
+            "returning the deployment-scoped assessment."
+        ),
+    ),
     settings: Settings = Depends(get_current_settings),
 ) -> EnvironmentResponse:
-    """Probe local environment and return deployment recommendations.
+    """Return deployment recommendations over the cached machine assessment.
 
-    Deployment-scoped (no project_id).  No secrets in response.
-    Recomputed on each call.
+    Deployment-scoped (no project_id). No secrets in response. Stable hardware
+    capabilities are cached for the backend process lifetime; credentials,
+    embedding configuration, and active NIM residents are composed fresh.
     """
-    result = await assess_environment(settings)
+    if refresh_hardware:
+        invalidate_machine_assessment_cache()
+    result = await get_cached_environment(settings)
     return EnvironmentResponse(**result)
 
 
@@ -85,23 +104,27 @@ async def test_connection(
     except ValueError as exc:
         return ConnectionTestResponse(success=False, error=str(exc))
 
+    probe_base_url = body.base_url
+    if body.auth_mode == "none":
+        try:
+            probe_base_url = normalize_self_hosted_base_url(body.base_url)
+        except NimEndpointConfigurationError as exc:
+            return ConnectionTestResponse(success=False, error=exc.message)
+
     if body.probe_kind == "embeddings":
-        result = await nim_client.create_embeddings(
-            base_url=body.base_url,
-            auth_headers=auth_headers,
-            model="test",
-            input_items=["test"],
-            deadline_s=settings.HTTP_DEADLINE_INTERACTIVE_S,
-            max_retries=1,
-        )
-        return ConnectionTestResponse(
-            success=result.success,
-            error=result.error,
-        )
+        try:
+            await local_nim_service.probe_embedding_endpoint(
+                probe_base_url,
+                auth_headers,
+                settings,
+            )
+        except NimEndpointConfigurationError as exc:
+            return ConnectionTestResponse(success=False, error=exc.message)
+        return ConnectionTestResponse(success=True)
 
     # Default: probe_kind == "models"
     result_models = await nim_client.list_models(
-        base_url=body.base_url,
+        base_url=probe_base_url,
         auth_headers=auth_headers,
         deadline_s=settings.HTTP_DEADLINE_INTERACTIVE_S,
         max_retries=1,
@@ -380,12 +403,67 @@ def update_embedding_config(
     return EmbeddingDeploymentConfigResponse.model_validate(config)
 
 
+@nim_router.post(
+    "/embedding_deployment_config:configure_self_hosted",
+    response_model=EmbeddingDeploymentConfigResponse,
+)
+async def configure_self_hosted_embedding_endpoint(
+    body: SelfHostedEmbeddingConfigureRequest,
+    settings: Settings = Depends(get_current_settings),
+) -> EmbeddingDeploymentConfigResponse:
+    """Durably apply a live-verified external embedding NIM."""
+    try:
+        config = await local_nim_service.configure_self_hosted_embedding(
+            body.base_url,
+            settings,
+        )
+    except NimEndpointConfigurationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    return EmbeddingDeploymentConfigResponse.model_validate(config)
+
+
 # ── Project-scoped router ──────────────────────────────────────────────────
 
 nim_endpoints_router = APIRouter(
     prefix="/projects/{project_id}/nim_endpoints",
     tags=["nim_endpoints"],
 )
+
+
+@nim_endpoints_router.post(
+    ":configure_self_hosted_teacher",
+    response_model=SelfHostedTeacherConfigureResponse,
+)
+async def configure_self_hosted_teacher_endpoint(
+    project_id: str,
+    body: SelfHostedTeacherConfigureRequest,
+    settings: Settings = Depends(get_current_settings),
+) -> SelfHostedTeacherConfigureResponse:
+    """Durably apply a verified self-hosted endpoint to one Teacher."""
+    try:
+        endpoint, model_config = await configure_self_hosted_teacher(
+            project_id=project_id,
+            model_config_id=body.model_config_id,
+            base_url=body.base_url,
+            workspace_root=settings.WORKSPACE_ROOT,
+            settings=settings,
+        )
+    except NimEndpointConfigurationError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    return SelfHostedTeacherConfigureResponse(
+        endpoint=NimEndpointResponse.model_validate(endpoint),
+        model_config_id=model_config.model_config_id,
+        model_name=model_config.model_name,
+        structured_generation_support=model_config.structured_generation_support,
+        thinking_toggle_support=model_config.thinking_toggle_support,
+        visual_budget_support=model_config.visual_budget_support,
+    )
 
 
 @nim_endpoints_router.post("", status_code=201, response_model=NimEndpointResponse)

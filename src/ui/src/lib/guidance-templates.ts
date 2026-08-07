@@ -18,10 +18,9 @@ export type TemplateName =
   | "classification"
   | "rock_paper_scissors"
   | "multi_label"
-  | "attribute_extraction"
-  | "damage_severity"
-  | "recycling"
-  | "grocery";
+  | "presence_count"
+  | "packaging_audit"
+  | "industrial_anomaly";
 
 export const DEFAULT_TEMPLATE_NAME: TemplateName = "blank";
 
@@ -29,10 +28,21 @@ export interface GuidanceTemplate {
   name: TemplateName;
   /** Display label in the dropdown. */
   label: string;
+  /** One-line explanation shown below the selector after this template is applied. */
+  summary: string;
   /** Pre-fills the Description textarea. */
   description: string;
   /** Pre-fills the SchemaCore fields. */
   fields: SchemaFieldInput[];
+  /** Pre-fills Rules & Edge Cases so templates demonstrate a complete Guidance. */
+  rules: string;
+  /** Optional provenance for a template designed around a public or bundled dataset. */
+  dataset?: {
+    name: string;
+    detail: string;
+    license: string;
+    sourceUrl?: string;
+  };
 }
 
 // ── Templates ───────────────────────────────────────────────────────────────
@@ -41,26 +51,32 @@ export const GUIDANCE_TEMPLATES: readonly GuidanceTemplate[] = [
   {
     name: "blank",
     label: "Blank",
+    summary: "Build a task from an empty schema.",
     description: "",
     fields: [],
+    rules: "",
   },
   {
     name: "classification",
     label: "Classification",
+    summary: "Assign exactly one controlled category to each image.",
     description: "Classify each image into one category.",
     fields: [
       {
         field_name: "category",
         type: "enum",
         role: "core",
-        allowed_values: ["category_a", "category_b"],
+        allowed_values: ["replace_me_a", "replace_me_b"],
         display_order: 0,
       },
     ],
+    rules:
+      "Replace the starter category values with the task's real categories before saving. Assign exactly one category per image. If the image cannot be classified confidently, Skip it rather than inventing a category.",
   },
   {
     name: "rock_paper_scissors",
     label: "Rock, paper, scissors",
+    summary: "Classify the hand gestures in the bundled first-run walkthrough.",
     description: "Classify the hand gesture in each image as rock, paper, or scissors.",
     fields: [
       {
@@ -71,139 +87,130 @@ export const GUIDANCE_TEMPLATES: readonly GuidanceTemplate[] = [
         display_order: 0,
       },
     ],
+    rules:
+      "Use rock for a closed fist, paper for an open hand with the fingers extended, and scissors for two extended separated fingers. Judge the primary foreground hand. Skip images where the gesture is too occluded or ambiguous to identify.",
+    dataset: {
+      name: "Bundled rock-paper-scissors sample",
+      detail: "15 images for the first-run walkthrough",
+      license: "CC BY 2.0",
+    },
   },
   {
     name: "multi_label",
     label: "Multi-label classification",
+    summary: "Apply every controlled label that is visibly supported.",
     description: "Select all labels that apply to each image.",
     fields: [
       {
         field_name: "labels",
         type: "enum_set",
         role: "core",
-        allowed_values: ["label_a", "label_b"],
+        allowed_values: ["replace_me_a", "replace_me_b"],
         display_order: 0,
       },
     ],
+    rules:
+      "Replace the starter label values with the task's real labels before saving. Select every visibly supported label, use an empty set when none apply, and do not add near-synonym labels that mean the same thing.",
   },
   {
-    name: "attribute_extraction",
-    label: "Attribute extraction",
-    description: "Extract structured attributes from each image.",
+    name: "presence_count",
+    label: "Presence and count",
+    summary: "Record whether a chosen target is visible and how many instances appear.",
+    description:
+      "Determine whether the target object is visible in each image and count the visible instances.",
     fields: [
       {
-        field_name: "attribute_1",
-        type: "string",
-        role: "core",
-        display_order: 0,
-      },
-      {
-        field_name: "attribute_2",
+        field_name: "target_present",
         type: "boolean",
         role: "core",
-        display_order: 1,
-      },
-    ],
-  },
-  {
-    name: "damage_severity",
-    label: "Damage severity assessment",
-    description:
-      "Classify visible damage types, identify the primary damage, and rate overall severity.",
-    fields: [
-      {
-        field_name: "primary_damage_type",
-        type: "enum",
-        role: "core",
-        allowed_values: ["crush", "rip", "tear", "leak", "dent", "scratch"],
         display_order: 0,
       },
       {
-        field_name: "damage_types_present",
-        type: "enum_set",
-        role: "core",
-        allowed_values: ["crush", "rip", "tear", "leak", "dent", "scratch"],
-        display_order: 1,
-      },
-      {
-        field_name: "severity",
+        field_name: "target_count",
         type: "integer",
         role: "core",
         minimum: 0,
-        maximum: 4,
-        display_order: 2,
-      },
-      {
-        field_name: "fragile_content",
-        type: "boolean",
-        role: "aux",
-        display_order: 4,
-      },
-      {
-        field_name: "hazmat_indicators",
-        type: "boolean",
-        role: "aux",
-        display_order: 5,
+        display_order: 1,
       },
     ],
+    rules:
+      "Replace 'target object' in the Description with the exact object to count before saving. Set target_present to true if and only if at least one identifiable instance is visible, and set target_count to 0 whenever target_present is false. Count a partially visible instance only when enough remains to identify it. Skip images when overlap or framing prevents a reliable count.",
   },
   {
-    // Matches the TrashNet dataset (~/trashnet): six recyclable-material classes.
-    name: "recycling",
-    label: "Recycling classification",
+    name: "packaging_audit",
+    label: "Packaging information audit",
+    summary:
+      "Read visible package text and check whether a nutrition panel is present.",
     description:
-      "Classify each image of a discarded item into its recyclable material category.",
+      "Read each food-packaging photo, identify the dominant language of the visible text, and determine whether a nutrition-information panel is visible.",
     fields: [
       {
-        field_name: "material",
+        field_name: "language_on_packaging",
         type: "enum",
         role: "core",
-        allowed_values: ["cardboard", "glass", "metal", "paper", "plastic", "trash"],
+        allowed_values: ["fr", "en", "es", "de", "it", "nl", "other"],
         display_order: 0,
       },
+      {
+        field_name: "contains_nutrition_table",
+        type: "boolean",
+        role: "core",
+        display_order: 1,
+      },
     ],
+    rules:
+      "Choose language_on_packaging from the language used by most of the legible printed words; use other when it is not one of the listed languages. Set contains_nutrition_table to true only when a structured nutrition panel with energy and macronutrient rows is visibly identifiable. Skip the image when too little text is legible to determine its language.",
+    dataset: {
+      name: "Open Food Facts images",
+      detail: "open product-packaging photos with extracted text",
+      license: "CC BY-SA (images)",
+      sourceUrl:
+        "https://openfoodfacts.github.io/openfoodfacts-server/api/aws-images-dataset/",
+    },
   },
   {
-    // Matches the Freiburg Groceries dataset (~/freiburg_groceries_dataset): 25
-    // coarse product classes (class names verbatim from the dataset manifest).
-    name: "grocery",
-    label: "Coarse grocery classification",
-    description: "Classify each grocery product image into one product category.",
+    name: "industrial_anomaly",
+    label: "Industrial anomaly inspection",
+    summary: "Identify the VisA object and decide whether it has a visible anomaly.",
+    description:
+      "Inspect each product image from the VisA dataset, identify the object category, and determine whether a visible manufacturing anomaly is present.",
     fields: [
       {
-        field_name: "product_category",
+        field_name: "object_category",
         type: "enum",
         role: "core",
         allowed_values: [
-          "BEANS",
-          "CAKE",
-          "CANDY",
-          "CEREAL",
-          "CHIPS",
-          "CHOCOLATE",
-          "COFFEE",
-          "CORN",
-          "FISH",
-          "FLOUR",
-          "HONEY",
-          "JAM",
-          "JUICE",
-          "MILK",
-          "NUTS",
-          "OIL",
-          "PASTA",
-          "RICE",
-          "SODA",
-          "SPICES",
-          "SUGAR",
-          "TEA",
-          "TOMATO_SAUCE",
-          "VINEGAR",
-          "WATER",
+          "candle",
+          "capsules",
+          "cashew",
+          "chewinggum",
+          "fryum",
+          "macaroni1",
+          "macaroni2",
+          "pcb1",
+          "pcb2",
+          "pcb3",
+          "pcb4",
+          "pipe_fryum",
         ],
         display_order: 0,
       },
+      {
+        field_name: "has_anomaly",
+        type: "enum",
+        role: "core",
+        allowed_values: ["no", "yes"],
+        display_order: 1,
+      },
     ],
+    rules:
+      "Set has_anomaly to yes only when a visible surface or structural flaw is present, such as a scratch, dent, color spot, crack, breakage, or missing or misplaced part. Do not treat pose, lighting, or ordinary appearance differences as defects. Use no when the item has no visible anomaly, and Skip when the image does not provide enough evidence to decide.",
+    dataset: {
+      name: "Visual Anomaly (VisA)",
+      detail: "10,821 images across 12 object categories",
+      license: "CC BY 4.0",
+      sourceUrl: "https://github.com/amazon-science/spot-diff",
+    },
   },
 ] as const;
 

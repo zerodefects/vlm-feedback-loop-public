@@ -443,7 +443,7 @@ describe("EvaluationStrip", () => {
       expect(screen.getByTestId("delta-badge")).toBeInTheDocument();
     });
     expect(screen.getByTestId("delta-badge")).toHaveTextContent(
-      "(+7 pts vs previous on same images)",
+      "(+6.7 pts vs previous on same images)",
     );
   });
 
@@ -525,6 +525,29 @@ describe("EvaluationStrip", () => {
     expect(screen.getByTestId("eval-failed")).toHaveTextContent(
       "The model rejected json_schema output for this run. Prompt-only asks for JSON in the prompt instead of enforcing a schema.",
     );
+  });
+
+  it("explains that a backend restart interrupted the evaluation", async () => {
+    mockListRuns.mockResolvedValue({
+      items: [
+        makeRun({
+          status: "failed",
+          status_reason: "backend_restart_interrupted",
+        }),
+      ],
+      next_cursor: null,
+    });
+    renderStrip(5);
+    await waitFor(() => {
+      expect(screen.getByTestId("eval-failed")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("eval-failed")).toHaveTextContent(
+      "Evaluation stopped: backend restarted.",
+    );
+    expect(screen.getByTestId("eval-failed")).toHaveTextContent(
+      "This interrupted run is not an authoritative result. Start a new evaluation to measure the full Test Pool.",
+    );
+    expect(screen.queryByTestId("restart-prompt-only-btn")).not.toBeInTheDocument();
   });
 
   it("keeps the failure banner and surfaces the error when the prompt-only restart is rejected", async () => {

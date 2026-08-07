@@ -3,17 +3,18 @@
 
 """Training suite orchestration service.
 
-``POST /v1/projects/{project_id}/training_suites`` atomically creates:
+``POST /v1/projects/{project_id}/training_suites`` creates:
 
-  1. Training DatasetExport (Verified non-pool + optional Auto-Labeled).
-  2. Test-Pool evaluation DatasetExport.
-  3. Per selected student_base model: a TAOJob chain pre-created with
+  1. A durable ``preparing`` TrainingSuite request owner.
+  2. Linked training and Test-Pool evaluation DatasetExports.
+  3. The validated archive/sidecar pairs in workspace S3.
+  4. Per selected student_base model: a TAOJob chain pre-created with
      ``status="not_started"`` — ``train`` → ``evaluate`` baseline → for
      each quantization scheme: ``quantize`` → ``evaluate`` quantized.
      Chain linkage via ``chain_id``, ``chain_sequence``,
      ``parent_tao_job_id``.
-  4. A TrainingSuite record capturing suite-level lineage + the ordered
-     chain list.
+
+Chain creation and the suite transition to ``initialized`` are atomic.
 
 Then Phase 2 (outside the DB transaction) submits the first chain's
 ``train`` job via :func:`tao_job_service.submit_chain_job`, which runs the
@@ -22,8 +23,9 @@ standard 4-step submission protocol. The polling loop
 each success, chain halt on failure.
 
 Idempotency: ``(project_id, idempotency_key)`` is UNIQUE on TrainingSuite.
-A retry POST with the same key returns the existing suite's response
-without new writes, without re-kickoff.
+Active suites and suites with chains replay without writes or re-kickoff. A
+failed pre-chain workspace transfer can atomically reclaim the same frozen
+exports only for the identical request.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, cast
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from vlm_feedback_loop.config import Settings
@@ -43,6 +46,7 @@ from vlm_feedback_loop.db.engine import DatabaseMigrationError, open_project_db
 from vlm_feedback_loop.db.models.dataset_export import DatasetExport
 from vlm_feedback_loop.db.models.model_config import ModelConfig
 from vlm_feedback_loop.db.models.project import Project
+from vlm_feedback_loop.db.models.student_model import StudentModel
 from vlm_feedback_loop.db.models.tao_job import TAOJob
 from vlm_feedback_loop.db.models.training_suite import TrainingSuite
 from vlm_feedback_loop.model_catalog_constants import HF_MODEL_PATHS
@@ -53,7 +57,8 @@ from vlm_feedback_loop.services import (
 )
 from vlm_feedback_loop.services.background import background_manager
 from vlm_feedback_loop.services.dataset_export_service import (
-    create_dataset_export,
+    cleanup_dataset_export_artifacts,
+    persist_dataset_export_in_session,
 )
 from vlm_feedback_loop.services.pagination import (
     InvalidCursorError,
@@ -98,6 +103,8 @@ logger = logging.getLogger("vlm_feedback_loop.training_suite_service")
 VALID_QUANTIZATION_SCHEMES: frozenset[str] = frozenset(
     {"FP8_DYNAMIC", "W8A8", "W8A16", "W4A16"}
 )
+
+_DATASET_UPLOAD_FAILURE_TOKEN = "tao_dataset_upload_failed:"
 
 # The single training policy type v1 supports. Used both for the
 # persisted ``training_policy_type`` lineage fields (mirrors the
@@ -960,6 +967,10 @@ def _suite_to_response(
     suite: TrainingSuite,
     *,
     chains_data: list[dict[str, Any]],
+    training_example_count: int | None,
+    evaluation_example_count: int | None,
+    evaluation_dataset_checksum_sha256: str | None,
+    student_model_ids: list[str],
 ) -> dict[str, Any]:
     """Convert a TrainingSuite row + chain payloads into the public response dict."""
     return {
@@ -970,17 +981,23 @@ def _suite_to_response(
         "training_preset": suite.training_preset,
         "export_field_mode": suite.export_field_mode,
         "include_auto_labeled": suite.include_auto_labeled,
+        "enable_lora": suite.enable_lora,
         "quantization_schemes": list(suite.quantization_schemes or []),
         "training_dataset_export_id": suite.training_dataset_export_id,
         "evaluation_dataset_export_id": suite.evaluation_dataset_export_id,
+        "training_example_count": training_example_count,
+        "evaluation_example_count": evaluation_example_count,
+        "evaluation_dataset_checksum_sha256": evaluation_dataset_checksum_sha256,
         "selected_student_base_model_config_ids": list(
             suite.selected_student_base_model_config_ids or []
         ),
         "chain_ids_ordered": list(suite.chain_ids_ordered or []),
         "chains": chains_data,
+        "student_model_ids": student_model_ids,
         "provisioning_run_id": suite.provisioning_run_id,
         "provisioning_model_names": list(suite.provisioning_model_names or []),
         "setup_error_ref": suite.setup_error_ref,
+        "setup_retryable": _can_retry_dataset_upload_setup(suite),
         "status": suite.status,
         "created_at": suite.created_at,
         "started_at": suite.started_at,
@@ -1022,6 +1039,10 @@ def _build_chains_snapshot(
                         "status": job.status,
                         "tao_external_job_id": job.tao_external_job_id,
                         "chain_halted_reason": job.chain_halted_reason,
+                        "outputs_fetch_status": job.outputs_fetch_status,
+                        "outputs_fetch_error_ref": tao_job_service.sanitize_error(
+                            job.outputs_fetch_error_ref
+                        ),
                     }
                     for job in rows
                 ],
@@ -1056,7 +1077,115 @@ def _suite_snapshot_response(
         chain_ids_ordered=list(suite.chain_ids_ordered or []),
         models_by_id=models_by_id,
     )
-    return _suite_to_response(suite, chains_data=chains)
+    export_ids = [
+        export_id
+        for export_id in (
+            suite.training_dataset_export_id,
+            suite.evaluation_dataset_export_id,
+        )
+        if export_id is not None
+    ]
+    exports_by_id = {
+        row.dataset_export_id: row
+        for row in (
+            session.query(DatasetExport)
+            .filter(
+                DatasetExport.project_id == project_id,
+                DatasetExport.dataset_export_id.in_(export_ids),
+            )
+            .all()
+            if export_ids
+            else []
+        )
+    }
+    training_export = (
+        exports_by_id.get(suite.training_dataset_export_id)
+        if suite.training_dataset_export_id is not None
+        else None
+    )
+    evaluation_export = (
+        exports_by_id.get(suite.evaluation_dataset_export_id)
+        if suite.evaluation_dataset_export_id is not None
+        else None
+    )
+    evaluation_refs = evaluation_export.artifact_refs if evaluation_export else None
+    evaluation_checksum = (
+        evaluation_refs.get("checksum_sha256")
+        if isinstance(evaluation_refs, dict)
+        else None
+    )
+    student_model_ids = [
+        row[0]
+        for row in session.query(StudentModel.student_model_id)
+        .filter_by(
+            project_id=project_id,
+            training_suite_id=suite.training_suite_id,
+        )
+        .order_by(StudentModel.created_at.asc(), StudentModel.student_model_id.asc())
+        .all()
+    ]
+    return _suite_to_response(
+        suite,
+        chains_data=chains,
+        training_example_count=(
+            training_export.example_count if training_export is not None else None
+        ),
+        evaluation_example_count=(
+            evaluation_export.example_count if evaluation_export is not None else None
+        ),
+        evaluation_dataset_checksum_sha256=evaluation_checksum,
+        student_model_ids=student_model_ids,
+    )
+
+
+def _can_retry_dataset_upload_setup(suite: TrainingSuite) -> bool:
+    """Return whether a failed pre-chain suite can reuse its frozen exports."""
+    error = suite.setup_error_ref or ""
+    return (
+        suite.status == "failed"
+        and not suite.chain_ids_ordered
+        and suite.training_dataset_export_id is not None
+        and suite.evaluation_dataset_export_id is not None
+        and _DATASET_UPLOAD_FAILURE_TOKEN in error
+        and "Dataset export integrity check failed" not in error
+    )
+
+
+def _request_matches_suite(
+    suite: TrainingSuite,
+    *,
+    student_base_model_config_ids: list[str],
+    training_preset: str,
+    include_auto_labeled: bool,
+    export_field_mode: str,
+    quantization_schemes: list[str],
+    enable_lora: bool,
+) -> bool:
+    """Return whether a request body owns this idempotency key."""
+    return (
+        list(suite.selected_student_base_model_config_ids or [])
+        == student_base_model_config_ids
+        and suite.training_preset == training_preset
+        and suite.include_auto_labeled == include_auto_labeled
+        and suite.export_field_mode == export_field_mode
+        and list(suite.quantization_schemes or []) == quantization_schemes
+        and suite.enable_lora == enable_lora
+    )
+
+
+def _dataset_export_setup_data(record: DatasetExport) -> dict[str, Any]:
+    """Return the small export shape consumed by suite preparation."""
+    return {
+        "dataset_export_id": record.dataset_export_id,
+        "dataset_intent": record.dataset_intent,
+        "export_field_mode": record.export_field_mode,
+        "label_tier_filter": record.label_tier_filter,
+        "guidance_id": record.guidance_id,
+        "example_count": record.example_count,
+        "artifact_refs": record.artifact_refs,
+        "manifest_ref": record.manifest_ref,
+        "created_at": record.created_at,
+    }
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -1111,6 +1240,46 @@ def _set_suite_setup_status(
         suite.setup_error_ref = error[:4096] if error else None
         if status == "failed":
             suite.completed_at = utc_now()
+        session.commit()
+
+
+def _interrupted_setup_error(suite: TrainingSuite, *, reason: str) -> str:
+    """Classify an interrupted pre-chain setup from its durable lineage."""
+    if (
+        suite.status == "preparing"
+        and not suite.chain_ids_ordered
+        and suite.training_dataset_export_id is not None
+        and suite.evaluation_dataset_export_id is not None
+    ):
+        return (
+            f"{_DATASET_UPLOAD_FAILURE_TOKEN} {reason} interrupted dataset "
+            "staging. Retry the identical request with the same idempotency "
+            "key to verify and resume the frozen exports."
+        )
+    return (
+        f"{reason} interrupted Training Jobs setup before both exports were "
+        "frozen. Start a new suite with a new idempotency key."
+    )
+
+
+def _fail_interrupted_suite_setup(
+    project_id: str,
+    training_suite_id: str,
+    settings: Settings,
+    *,
+    reason: str,
+) -> None:
+    """Fail only an active setup, preserving SME cancellation and chains."""
+    engine = get_project_engine(project_id, settings.WORKSPACE_ROOT)
+    if engine is None:
+        return
+    with Session(engine) as session:
+        suite = session.get(TrainingSuite, training_suite_id)
+        if suite is None or suite.status not in {"provisioning", "preparing"}:
+            return
+        suite.setup_error_ref = _interrupted_setup_error(suite, reason=reason)[:4096]
+        suite.status = "failed"
+        suite.completed_at = utc_now()
         session.commit()
 
 
@@ -1202,24 +1371,29 @@ async def _complete_suite_after_provisioning(
             _provisioning_suite_id=training_suite_id,
         )
         if isinstance(result, str):
-            _set_suite_setup_status(
-                project_id,
-                training_suite_id,
-                settings,
-                status="failed",
-                error=f"Training job preparation failed: {result}",
-            )
+            # The materializer persists detailed transfer/integrity failures
+            # before returning them. Preserve that classification (including
+            # retry eligibility) instead of wrapping its machine token in a
+            # generic prefix. Early validation returns have no persisted
+            # failure, so the wrapper still records those here.
+            with Session(engine) as session:
+                current = session.get(TrainingSuite, training_suite_id)
+                failure_already_recorded = bool(
+                    current is not None
+                    and current.status == "failed"
+                    and current.setup_error_ref
+                )
+            if not failure_already_recorded:
+                _set_suite_setup_status(
+                    project_id,
+                    training_suite_id,
+                    settings,
+                    status="failed",
+                    error=f"Training job preparation failed: {result}",
+                )
     except asyncio.CancelledError:
-        _set_suite_setup_status(
-            project_id,
-            training_suite_id,
-            settings,
-            status="failed",
-            error=(
-                "Backend shutdown interrupted Training Jobs setup. "
-                "Return to Student Training and start a new suite."
-            ),
-        )
+        # The inner materializer classifies its durable state. Explicit SME
+        # cancellation already wrote ``canceled`` before canceling this task.
         raise
     except Exception as exc:
         logger.exception(
@@ -1264,14 +1438,30 @@ async def launch_training_suite(
     if error is not None:
         return error
 
+    retryable_existing_id: str | None = None
     with Session(engine) as session:
         existing = (
             session.query(TrainingSuite)
             .filter_by(project_id=project_id, idempotency_key=idempotency_key)
             .first()
         )
-        if existing is not None:
+        if existing is not None and not _request_matches_suite(
+            existing,
+            student_base_model_config_ids=list(student_base_model_config_ids),
+            training_preset=training_preset,
+            include_auto_labeled=include_auto_labeled,
+            export_field_mode=export_field_mode,
+            quantization_schemes=list(quantization_schemes),
+            enable_lora=enable_lora,
+        ):
+            return (
+                "conflict: this idempotency key belongs to a Training Suite "
+                "with a different request body"
+            )
+        if existing is not None and not _can_retry_dataset_upload_setup(existing):
             return _suite_snapshot_response(session, project_id, existing)
+        if existing is not None:
+            retryable_existing_id = existing.training_suite_id
 
     # This is intentionally server-side. The SME no longer sees or waits on a
     # separate Preflight section, but the safety contract still fails closed
@@ -1282,6 +1472,7 @@ async def launch_training_suite(
         settings=settings,
         include_auto_labeled=include_auto_labeled,
         enable_lora=enable_lora,
+        quantization_schemes=list(quantization_schemes),
     )
     failed_checks = [check for check in readiness["checks"] if not check["passed"]]
     if failed_checks:
@@ -1319,6 +1510,13 @@ async def launch_training_suite(
         ]
         active_guidance_id = project.active_guidance_id
 
+    if retryable_existing_id is not None and missing:
+        return (
+            "conflict: the failed Training Suite cannot resume its dataset "
+            "upload because a selected Student base is no longer ready; "
+            "restore the base, then retry with the same idempotency key"
+        )
+
     if not missing:
         return await create_training_suite(
             project_id,
@@ -1332,38 +1530,83 @@ async def launch_training_suite(
             settings=settings,
         )
 
+    # Claim the idempotency key before starting the deployment-scoped worker.
+    # Concurrent same-key requests can then replay or conflict without
+    # launching an unowned provisioning run.
+    suite_id = generate_uuid4()
+    now = utc_now()
+    try:
+        with Session(engine) as session:
+            suite = TrainingSuite(
+                training_suite_id=suite_id,
+                project_id=project_id,
+                idempotency_key=idempotency_key,
+                guidance_id=active_guidance_id,
+                training_preset=training_preset,
+                export_field_mode=export_field_mode,
+                include_auto_labeled=include_auto_labeled,
+                enable_lora=enable_lora,
+                training_dataset_export_id=None,
+                evaluation_dataset_export_id=None,
+                selected_student_base_model_config_ids=list(
+                    student_base_model_config_ids
+                ),
+                quantization_schemes=list(quantization_schemes),
+                chain_ids_ordered=[],
+                provisioning_run_id=None,
+                provisioning_model_names=[model.model_name for model in missing],
+                setup_error_ref=None,
+                status="provisioning",
+                created_at=now,
+                started_at=now,
+            )
+            session.add(suite)
+            session.commit()
+    except IntegrityError:
+        with Session(engine) as session:
+            winner = (
+                session.query(TrainingSuite)
+                .filter_by(project_id=project_id, idempotency_key=idempotency_key)
+                .one()
+            )
+            if not _request_matches_suite(
+                winner,
+                student_base_model_config_ids=list(student_base_model_config_ids),
+                training_preset=training_preset,
+                include_auto_labeled=include_auto_labeled,
+                export_field_mode=export_field_mode,
+                quantization_schemes=list(quantization_schemes),
+                enable_lora=enable_lora,
+            ):
+                return (
+                    "conflict: this idempotency key belongs to a Training "
+                    "Suite with a different request body"
+                )
+            return _suite_snapshot_response(session, project_id, winner)
+
     provisioning = start_provisioning_run(
         project_id,
         list(student_base_model_config_ids),
         settings,
     )
     if isinstance(provisioning, str):
+        with Session(engine) as session:
+            unstarted = session.get(TrainingSuite, suite_id)
+            if (
+                unstarted is not None
+                and unstarted.status == "provisioning"
+                and unstarted.provisioning_run_id is None
+            ):
+                session.delete(unstarted)
+                session.commit()
         return provisioning
 
-    suite_id = generate_uuid4()
-    now = utc_now()
     with Session(engine) as session:
-        suite = TrainingSuite(
-            training_suite_id=suite_id,
-            project_id=project_id,
-            idempotency_key=idempotency_key,
-            guidance_id=active_guidance_id,
-            training_preset=training_preset,
-            export_field_mode=export_field_mode,
-            include_auto_labeled=include_auto_labeled,
-            training_dataset_export_id=None,
-            evaluation_dataset_export_id=None,
-            selected_student_base_model_config_ids=list(student_base_model_config_ids),
-            quantization_schemes=list(quantization_schemes),
-            chain_ids_ordered=[],
-            provisioning_run_id=provisioning["provisioning_run_id"],
-            provisioning_model_names=list(provisioning["requested_model_names"]),
-            setup_error_ref=None,
-            status="provisioning",
-            created_at=now,
-            started_at=now,
-        )
-        session.add(suite)
+        suite = session.get(TrainingSuite, suite_id)
+        if suite is None:
+            return f"not found: TrainingSuite {suite_id}"
+        suite.provisioning_run_id = provisioning["provisioning_run_id"]
+        suite.provisioning_model_names = list(provisioning["requested_model_names"])
         session.commit()
         response = _suite_snapshot_response(session, project_id, suite)
 
@@ -1412,20 +1655,23 @@ async def create_training_suite(
     """Create a training suite end-to-end.
 
     Behavior:
-      * Replays idempotent retry: returns existing suite without re-writes.
+      * Replays completed/active suites without writes. A failed pre-chain
+        workspace upload can atomically resume the same frozen exports when
+        the caller repeats the same request and idempotency key.
       * Validates request (preset, field mode, quantization schemes).
       * Validates student_base role + project-scoping for every model.
       * Phase 1a — read-only validation (project, Guidance, models).
-      * Phase 1b — builds + commits the training and eval DatasetExports.
+      * Phase 1b — persists a ``preparing`` suite, then builds + links the
+        training and evaluation DatasetExports.
         The gzip-tar builds run in a worker thread, each with its own
-        short-lived session (SQLite write discipline). A later failure
-        leaves standalone DatasetExport rows — the same shape the exports
-        API produces — consistent with the archives already on disk.
+        short-lived session (SQLite write discipline). Each completed export
+        and its suite link commit together before transfer so an exact retry
+        can reuse its frozen object identity.
       * Phase 1c — uploads both archives to the TAO workspace S3 with no
         write transaction open; lineage commits per upload.
       * Phase 1d — single short write transaction: pre-creates every chain
-        job with ``status="not_started"`` and inserts the TrainingSuite
-        record (these stay all-or-nothing).
+        job with ``status="not_started"`` and advances the TrainingSuite
+        record (the jobs and suite transition stay all-or-nothing).
       * Phase 2 — outside any transaction: kicks off the first chain's
         first train job via :func:`tao_job_service.submit_chain_job`.
         If kickoff fails, the suite's first train job is persisted as
@@ -1436,6 +1682,9 @@ async def create_training_suite(
     Returns the full suite response dict (shaped for the Training Job
     Monitor pre-render) or an error string mapped to HTTP codes by the router.
     """
+    attempt_suite_id = _provisioning_suite_id
+    retrying_failed_upload = False
+    expected_guidance_id: str | None = None
     engine = get_project_engine(project_id, settings.WORKSPACE_ROOT)
     if engine is None:
         return f"not found: Project {project_id}"
@@ -1448,6 +1697,17 @@ async def create_training_suite(
     )
     if err is not None:
         return err
+    setup_request_checksum = compute_request_checksum(
+        {
+            "student_base_model_config_ids": list(student_base_model_config_ids),
+            "training_preset": training_preset,
+            "include_auto_labeled": include_auto_labeled,
+            "export_field_mode": export_field_mode,
+            "quantization_schemes": list(quantization_schemes),
+            "enable_lora": enable_lora,
+            "idempotency_key": idempotency_key,
+        }
+    )
 
     # ── Idempotency replay ─────────────────────────────────────────────
     with Session(engine) as session:
@@ -1456,12 +1716,69 @@ async def create_training_suite(
             .filter_by(project_id=project_id, idempotency_key=idempotency_key)
             .first()
         )
-        if existing is not None and not (
-            _provisioning_suite_id == existing.training_suite_id
-            and existing.status in {"provisioning", "preparing"}
-        ):
-            # Snapshot the response without any writes.
-            return _suite_snapshot_response(session, project_id, existing)
+        if existing is not None:
+            if not _request_matches_suite(
+                existing,
+                student_base_model_config_ids=list(student_base_model_config_ids),
+                training_preset=training_preset,
+                include_auto_labeled=include_auto_labeled,
+                export_field_mode=export_field_mode,
+                quantization_schemes=list(quantization_schemes),
+                enable_lora=enable_lora,
+            ):
+                return (
+                    "conflict: this idempotency key belongs to a Training "
+                    "Suite with a different request body"
+                )
+            continuing_provisioning = (
+                _provisioning_suite_id == existing.training_suite_id
+                and existing.status in {"provisioning", "preparing"}
+            )
+            if continuing_provisioning:
+                attempt_suite_id = existing.training_suite_id
+                expected_guidance_id = existing.guidance_id
+            elif _can_retry_dataset_upload_setup(existing):
+                training_export = session.get(
+                    DatasetExport,
+                    existing.training_dataset_export_id,
+                )
+                snapshot: dict[str, Any] | None = (
+                    training_export.selection_definition_snapshot
+                    if training_export is not None
+                    else None
+                )
+                filters_raw: Any = (
+                    snapshot.get("selection_filters")
+                    if isinstance(snapshot, dict)
+                    else None
+                )
+                filters = (
+                    cast("dict[str, Any]", filters_raw)
+                    if isinstance(filters_raw, dict)
+                    else None
+                )
+                stored_checksum_raw: Any = (
+                    filters.get("training_suite_request_checksum")
+                    if filters is not None
+                    else None
+                )
+                stored_request_checksum = (
+                    stored_checksum_raw
+                    if isinstance(stored_checksum_raw, str)
+                    else None
+                )
+                if stored_request_checksum != setup_request_checksum:
+                    return (
+                        "conflict: this idempotency key belongs to a failed "
+                        "Training Suite with a different request body"
+                    )
+                attempt_suite_id = existing.training_suite_id
+                expected_guidance_id = existing.guidance_id
+                retrying_failed_upload = True
+            else:
+                return _suite_snapshot_response(session, project_id, existing)
+        elif _provisioning_suite_id is not None:
+            return f"not found: TrainingSuite {_provisioning_suite_id}"
 
     # ── Phase 1a: validate inputs (read-only) ──────────────────────────
     suite_id: str
@@ -1474,13 +1791,52 @@ async def create_training_suite(
         if not project.active_guidance_id:
             return "No active Guidance configured"
         active_guidance_id = project.active_guidance_id
+        if (
+            expected_guidance_id is not None
+            and expected_guidance_id != active_guidance_id
+        ):
+            return (
+                "conflict: the active Guidance changed after this Training "
+                "Suite froze its datasets; start a new suite with a new "
+                "idempotency key"
+            )
 
         # Validate all selected models before the expensive export builds.
-        _models, err = _load_student_base_models(
+        models, err = _load_student_base_models(
             session, project_id, list(student_base_model_config_ids)
         )
         if err is not None:
             return err
+
+        quantization_checks = (
+            training_preflight_service.check_quantization_compatibility(
+                model_names={
+                    model.model_config_id: model.model_name for model in models
+                },
+                student_base_model_config_ids=list(student_base_model_config_ids),
+                quantization_schemes=list(quantization_schemes),
+            )
+        )
+        unsupported_quantization = next(
+            (check for check in quantization_checks if not check["passed"]), None
+        )
+        if unsupported_quantization is not None:
+            return f"validation: {unsupported_quantization['message']}"
+
+    # Repeat the backend-authoritative data checks here, including after a
+    # potentially long first-use base-provisioning stage. The read-only UI
+    # preflight is advisory; this is the final fail-closed launch boundary.
+    data_checks, data_summary = (
+        training_preflight_service.check_training_data_readiness(
+            project_id=project_id,
+            workspace_root=settings.WORKSPACE_ROOT,
+            include_auto_labeled=include_auto_labeled,
+        )
+    )
+    failed_data_checks = [check for check in data_checks if not check["passed"]]
+    if failed_data_checks:
+        return f"validation: {failed_data_checks[0]['message']}"
+    required_test_pool_count = data_summary["required_test_pool_count"]
 
     # TAO deployment preconditions are pure reads — check them before
     # minutes of archive building, not after.
@@ -1496,53 +1852,282 @@ async def create_training_suite(
             "`vlm-feedback-loop tao-bootstrap` first."
         )
 
+    # Persist the request owner before archive and S3 work. A failed transfer
+    # can then reuse these exact exports instead of creating new UUID-backed
+    # objects when the same request and idempotency key are retried.
+    linked_training_export_id: str | None = None
+    linked_evaluation_export_id: str | None = None
+    if attempt_suite_id is None:
+        suite_id = generate_uuid4()
+        now = utc_now()
+        try:
+            with Session(engine) as session:
+                session.add(
+                    TrainingSuite(
+                        training_suite_id=suite_id,
+                        project_id=project_id,
+                        idempotency_key=idempotency_key,
+                        guidance_id=active_guidance_id,
+                        training_preset=training_preset,
+                        export_field_mode=export_field_mode,
+                        include_auto_labeled=include_auto_labeled,
+                        enable_lora=enable_lora,
+                        training_dataset_export_id=None,
+                        evaluation_dataset_export_id=None,
+                        selected_student_base_model_config_ids=list(
+                            student_base_model_config_ids
+                        ),
+                        quantization_schemes=list(quantization_schemes),
+                        chain_ids_ordered=[],
+                        provisioning_run_id=None,
+                        provisioning_model_names=None,
+                        setup_error_ref=None,
+                        status="preparing",
+                        created_at=now,
+                        started_at=now,
+                    )
+                )
+                session.commit()
+        except IntegrityError:
+            # A concurrent request won the unique idempotency-key insert.
+            with Session(engine) as session:
+                winner = (
+                    session.query(TrainingSuite)
+                    .filter_by(project_id=project_id, idempotency_key=idempotency_key)
+                    .one()
+                )
+                if not _request_matches_suite(
+                    winner,
+                    student_base_model_config_ids=list(student_base_model_config_ids),
+                    training_preset=training_preset,
+                    include_auto_labeled=include_auto_labeled,
+                    export_field_mode=export_field_mode,
+                    quantization_schemes=list(quantization_schemes),
+                    enable_lora=enable_lora,
+                ):
+                    return (
+                        "conflict: this idempotency key belongs to a Training "
+                        "Suite with a different request body"
+                    )
+                return _suite_snapshot_response(session, project_id, winner)
+    else:
+        suite_id = attempt_suite_id
+        with Session(engine) as session:
+            suite = session.get(TrainingSuite, suite_id)
+            if suite is None or suite.project_id != project_id:
+                return f"not found: TrainingSuite {suite_id}"
+            if retrying_failed_upload:
+                claimed = (
+                    session.query(TrainingSuite)
+                    .filter_by(training_suite_id=suite_id, status="failed")
+                    .update(
+                        {
+                            TrainingSuite.status: "preparing",
+                            TrainingSuite.setup_error_ref: None,
+                            TrainingSuite.completed_at: None,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                if claimed != 1:
+                    session.rollback()
+                    current = session.get(TrainingSuite, suite_id)
+                    assert current is not None
+                    return _suite_snapshot_response(session, project_id, current)
+                session.commit()
+                suite = session.get(TrainingSuite, suite_id)
+                assert suite is not None
+            elif suite.status not in {"provisioning", "preparing"}:
+                return (
+                    f"conflict: TrainingSuite {suite_id} is no longer waiting for setup"
+                )
+            else:
+                suite.status = "preparing"
+                suite.setup_error_ref = None
+                suite.completed_at = None
+                session.commit()
+            linked_training_export_id = suite.training_dataset_export_id
+            linked_evaluation_export_id = suite.evaluation_dataset_export_id
+
+    def _fail_setup(error: str) -> str:
+        _set_suite_setup_status(
+            project_id,
+            suite_id,
+            settings,
+            status="failed",
+            error=error,
+        )
+        return error
+
     try:
         # ── Phase 1b: build + persist the dataset exports ───────────────
-        # create_dataset_export gzip-tars every training/eval image and
+        # persist_dataset_export_in_session gzip-tars every training/eval image and
         # hashes the finished archive — CPU + disk I/O proportional to
         # total image bytes — so each call runs in a worker thread and
         # commits in its own short-lived session (write discipline: no
-        # write transaction across long work; no long work on the event
-        # loop). The export rows commit here: a later upload or chain
-        # failure leaves standalone DatasetExport rows, the same shape
-        # the exports API produces, keeping the DB consistent with the
-        # archive files already on disk. selection_filters pins the
-        # Phase-1a Guidance snapshot: both exports MUST render the
+        # write transaction across long work; no long work on the event loop).
+        # Each row and its link to the durable preparing suite commit together
+        # before upload, so a transfer retry reuses the same frozen object
+        # keys. selection_filters pins the Phase-1a Guidance snapshot:
+        # both exports MUST render the
         # identical human turn — without it, each build re-reads
         # active_guidance_id and a mid-flight Guidance activation could
         # split the pair.
         training_tier = "combined" if include_auto_labeled else "verified_only"
 
-        def _build_export(intent: str, tier: str) -> dict[str, Any] | str:
-            return create_dataset_export(
-                project_id,
-                dataset_intent=intent,
-                label_tier_filter=tier,
-                export_field_mode=export_field_mode,
-                selection_filters={"guidance_id": active_guidance_id},
-                settings=settings,
+        def _build_and_link_export(
+            intent: str,
+            tier: str,
+            *,
+            training: bool,
+        ) -> dict[str, Any] | str:
+            """Commit one completed export and its suite link atomically."""
+            export_id: str | None = None
+            committed = False
+            try:
+                with Session(engine) as session:
+                    result = persist_dataset_export_in_session(
+                        session,
+                        project_id,
+                        dataset_intent=intent,
+                        label_tier_filter=tier,
+                        export_field_mode=export_field_mode,
+                        selection_filters={
+                            "guidance_id": active_guidance_id,
+                            "training_suite_request_checksum": setup_request_checksum,
+                        },
+                        settings=settings,
+                    )
+                    if isinstance(result, str):
+                        return result
+                    export_id = result["dataset_export_id"]
+                    target = (
+                        TrainingSuite.training_dataset_export_id
+                        if training
+                        else TrainingSuite.evaluation_dataset_export_id
+                    )
+                    linked = (
+                        session.query(TrainingSuite)
+                        .filter(
+                            TrainingSuite.training_suite_id == suite_id,
+                            TrainingSuite.project_id == project_id,
+                            TrainingSuite.status == "preparing",
+                            target.is_(None),
+                        )
+                        .update(
+                            {target: export_id},
+                            synchronize_session=False,
+                        )
+                    )
+                    if linked != 1:
+                        session.rollback()
+                        return (
+                            f"conflict: TrainingSuite {suite_id} is no longer "
+                            f"waiting to link its {intent} export"
+                        )
+                    session.commit()
+                    committed = True
+                    return result
+            finally:
+                if export_id is not None and not committed:
+                    cleanup_dataset_export_artifacts(
+                        project_id,
+                        export_id,
+                        settings=settings,
+                    )
+
+        def _load_linked_export(
+            export_id: str,
+            *,
+            intent: str,
+            tier: str,
+        ) -> dict[str, Any] | str:
+            with Session(engine) as session:
+                record = session.get(DatasetExport, export_id)
+                if record is None or record.project_id != project_id:
+                    return (
+                        f"conflict: linked {intent} DatasetExport {export_id} "
+                        "is unavailable; start a new suite with a new "
+                        "idempotency key"
+                    )
+                if (
+                    record.status != "completed"
+                    or record.dataset_intent != intent
+                    or record.label_tier_filter != tier
+                    or record.export_field_mode != export_field_mode
+                    or record.guidance_id != active_guidance_id
+                ):
+                    return (
+                        f"conflict: linked {intent} DatasetExport {export_id} "
+                        "no longer matches this frozen Training Suite; start "
+                        "a new suite with a new idempotency key"
+                    )
+                filters_raw: Any = record.selection_definition_snapshot.get(
+                    "selection_filters"
+                )
+                filters = (
+                    cast("dict[str, Any]", filters_raw)
+                    if isinstance(filters_raw, dict)
+                    else None
+                )
+                if (
+                    filters is None
+                    or filters.get("training_suite_request_checksum")
+                    != setup_request_checksum
+                ):
+                    return (
+                        f"conflict: linked {intent} DatasetExport {export_id} "
+                        "does not match this Training Suite request; start a "
+                        "new suite with a new idempotency key"
+                    )
+                return _dataset_export_setup_data(record)
+
+        if linked_training_export_id is None:
+            train_export = await asyncio.to_thread(
+                _build_and_link_export,
+                "training",
+                training_tier,
+                training=True,
+            )
+            if isinstance(train_export, str):
+                return _fail_setup(train_export)
+        else:
+            train_export = _load_linked_export(
+                linked_training_export_id,
+                intent="training",
+                tier=training_tier,
+            )
+            if isinstance(train_export, str):
+                return _fail_setup(train_export)
+        if train_export["example_count"] < 1:
+            return _fail_setup(
+                "validation: No exportable training examples remain under "
+                "the active Guidance. Continue labeling and retry."
             )
 
-        train_export = await asyncio.to_thread(_build_export, "training", training_tier)
-        if isinstance(train_export, str):
-            return train_export
-        eval_export = await asyncio.to_thread(
-            _build_export, "evaluation", "verified_only"
-        )
-        if isinstance(eval_export, str):
-            return eval_export
-
-        # Sidecar annotations.json paths — required by the cosmos-rl
-        # spec contract (annotation_path must be a separate JSON URL
-        # from media_path; see _upload_export_archive docstring).
-        training_annotations_local = train_export["artifact_refs"].get(
-            "annotations_path"
-        )
-        eval_annotations_local = eval_export["artifact_refs"].get("annotations_path")
-        if not training_annotations_local or not eval_annotations_local:
-            raise RuntimeError(
-                "Dataset export returned no annotations_path for "
-                "training or evaluation — refusing to build the chain"
+        if linked_evaluation_export_id is None:
+            eval_export = await asyncio.to_thread(
+                _build_and_link_export,
+                "evaluation",
+                "verified_only",
+                training=False,
+            )
+            if isinstance(eval_export, str):
+                return _fail_setup(eval_export)
+        else:
+            eval_export = _load_linked_export(
+                linked_evaluation_export_id,
+                intent="evaluation",
+                tier="verified_only",
+            )
+            if isinstance(eval_export, str):
+                return _fail_setup(eval_export)
+        if eval_export["example_count"] < required_test_pool_count:
+            return _fail_setup(
+                "validation: Test Pool export has "
+                f"{eval_export['example_count']} of {required_test_pool_count} "
+                "required held-out evaluation examples. Continue labeling "
+                "and retry."
             )
 
         # ── Phase 1c: upload exports to the TAO workspace S3 ────────────
@@ -1551,9 +2136,18 @@ async def create_training_suite(
         # Chains reference the TAO-readable spec URI, never the
         # Blueprint-local archive path.
         async def _upload_one(
-            export: dict[str, Any], annotations_local: str | None, kind: str
+            export: dict[str, Any],
+            kind: str,
         ) -> UploadResult | str:
             with Session(engine) as upload_session:
+                current_suite = upload_session.get(TrainingSuite, suite_id)
+                if current_suite is None:
+                    return f"not found: TrainingSuite {suite_id}"
+                if current_suite.status != "preparing":
+                    return (
+                        f"conflict: TrainingSuite {suite_id} is "
+                        f"{current_suite.status}, not preparing"
+                    )
                 export_row = (
                     upload_session.query(DatasetExport)
                     .filter_by(dataset_export_id=export["dataset_export_id"])
@@ -1562,37 +2156,29 @@ async def create_training_suite(
                 upload = await _upload_export_archive(
                     session=upload_session,
                     export_row=export_row,
-                    archive_path=Path(export["artifact_refs"]["archive_path"]),
                     deployment_config=tao_deployment_config,
                     upload_archive=_upload_archive,
                     s3_client=_s3_client,
-                    annotations_path=(
-                        Path(annotations_local) if annotations_local else None
-                    ),
+                    settings=settings,
                 )
                 if not upload.success:
-                    # Reaching the TAO workspace S3 failed — an infra
-                    # problem, not the SME's input. Return the
-                    # tao_unreachable token (→ 503) instead of raising into
-                    # the catch-all that would mislabel it a 400.
                     logger.error("%s dataset upload failed: %s", kind, upload.error)
                     return (
-                        f"tao_unreachable: {kind.lower()} dataset upload "
-                        f"failed: {upload.error}"
+                        f"{_DATASET_UPLOAD_FAILURE_TOKEN} {kind} dataset upload "
+                        f"failed: {upload.error}. Re-export incomplete or "
+                        "inconsistent artifacts, retry transient transfers, "
+                        "or repair the TAO workspace storage configuration "
+                        "before retrying."
                     )
                 upload_session.commit()
                 return upload
 
-        train_upload = await _upload_one(
-            train_export, training_annotations_local, "Training"
-        )
+        train_upload = await _upload_one(train_export, "Training")
         if isinstance(train_upload, str):
-            return train_upload
-        eval_upload = await _upload_one(
-            eval_export, eval_annotations_local, "Evaluation"
-        )
+            return _fail_setup(train_upload)
+        eval_upload = await _upload_one(eval_export, "Evaluation")
         if isinstance(eval_upload, str):
-            return eval_upload
+            return _fail_setup(eval_upload)
 
         # cosmos-rl needs annotation_path as a separate JSON URL.
         # ``media_path`` points at the PARENT directory of the
@@ -1658,31 +2244,36 @@ async def create_training_suite(
                 session, project_id, list(student_base_model_config_ids)
             )
             if err is not None:
-                return err
+                return _fail_setup(err)
+            suite = session.get(TrainingSuite, suite_id)
+            if suite is None or suite.project_id != project_id:
+                return f"not found: TrainingSuite {suite_id}"
+            if suite.status != "preparing":
+                return (
+                    f"conflict: TrainingSuite {suite_id} is no longer waiting for setup"
+                )
+            missing_base = next(
+                (model for model in models if not model.tao_base_experiment_id),
+                None,
+            )
+            if missing_base is not None:
+                logger.error(
+                    "Training suite: ModelConfig %s (%s) has null "
+                    "tao_base_experiment_id",
+                    missing_base.model_config_id,
+                    missing_base.model_name,
+                )
+                return _fail_setup(
+                    f"validation: ModelConfig {missing_base.model_config_id} "
+                    f"({missing_base.model_name}) has null "
+                    "tao_base_experiment_id — run training preflight to "
+                    "provision the base experiment first"
+                )
             chain_ids_ordered = []
             first_chain_train_job: TAOJob | None = None
             for mc in models:
                 base_experiment_id = mc.tao_base_experiment_id
-                if not base_experiment_id:
-                    # A resolvable precondition (the base experiment isn't
-                    # provisioned), not an internal bug — return a validation
-                    # error string (→ 400) rather than raising into the 500
-                    # path. Preflight (tao_base_experiment_ready) is the
-                    # spec-mandated gate; this is the last line of defence.
-                    # Returning exits the `with Session` with nothing
-                    # committed, so no chain rows are persisted.
-                    logger.error(
-                        "Training suite: ModelConfig %s (%s) has null "
-                        "tao_base_experiment_id",
-                        mc.model_config_id,
-                        mc.model_name,
-                    )
-                    return (
-                        f"validation: ModelConfig {mc.model_config_id} "
-                        f"({mc.model_name}) has null tao_base_experiment_id "
-                        "— run training preflight to provision the base "
-                        "experiment first"
-                    )
+                assert base_experiment_id is not None
                 hyperparameters = resolve_training_preset(
                     training_preset, mc.model_name
                 )
@@ -1713,45 +2304,12 @@ async def create_training_suite(
                 if first_chain_train_job is None:
                     # chain_sequence=1 is the train job; jobs[0] by construction.
                     first_chain_train_job = jobs[0]
-            if _provisioning_suite_id is not None:
-                suite_id = _provisioning_suite_id
-                suite = session.get(TrainingSuite, suite_id)
-                if suite is None or suite.project_id != project_id:
-                    return f"not found: TrainingSuite {suite_id}"
-                if suite.status not in {"provisioning", "preparing"}:
-                    return (
-                        f"conflict: TrainingSuite {suite_id} is no longer "
-                        "waiting for setup"
-                    )
-                suite.guidance_id = active_guidance_id
-                suite.training_dataset_export_id = train_export["dataset_export_id"]
-                suite.evaluation_dataset_export_id = eval_export["dataset_export_id"]
-                suite.chain_ids_ordered = chain_ids_ordered
-                suite.setup_error_ref = None
-                suite.status = "initialized"
-            else:
-                suite_id = generate_uuid4()
-                suite = TrainingSuite(
-                    training_suite_id=suite_id,
-                    project_id=project_id,
-                    idempotency_key=idempotency_key,
-                    guidance_id=active_guidance_id,
-                    training_preset=training_preset,
-                    export_field_mode=export_field_mode,
-                    include_auto_labeled=include_auto_labeled,
-                    training_dataset_export_id=train_export["dataset_export_id"],
-                    evaluation_dataset_export_id=eval_export["dataset_export_id"],
-                    selected_student_base_model_config_ids=list(
-                        student_base_model_config_ids
-                    ),
-                    quantization_schemes=list(quantization_schemes),
-                    chain_ids_ordered=chain_ids_ordered,
-                    provisioning_run_id=None,
-                    provisioning_model_names=None,
-                    setup_error_ref=None,
-                    status="initialized",
-                )
-                session.add(suite)
+            suite.guidance_id = active_guidance_id
+            suite.training_dataset_export_id = train_export["dataset_export_id"]
+            suite.evaluation_dataset_export_id = eval_export["dataset_export_id"]
+            suite.chain_ids_ordered = chain_ids_ordered
+            suite.setup_error_ref = None
+            suite.status = "initialized"
 
             first_chain_first_job_id = (
                 first_chain_train_job.tao_job_id if first_chain_train_job else None
@@ -1772,30 +2330,52 @@ async def create_training_suite(
                 .scalar()
             )
             if active_gid_now != active_guidance_id:
-                return (
+                error = (
                     "conflict: the active Guidance changed while the "
                     "training datasets were being built — start the "
                     "training suite again to use the new Guidance."
                 )
+                session.rollback()
+                return _fail_setup(error)
 
             session.commit()
+    except asyncio.CancelledError:
+        _fail_interrupted_suite_setup(
+            project_id,
+            suite_id,
+            settings,
+            reason="Backend shutdown or request cancellation",
+        )
+        raise
     except ValueError as exc:
         # Genuine input/validation error (the export and upload services
         # raise ValueError for malformed inputs) → 400.
         logger.exception("Training suite creation rejected input")
-        return f"validation: training suite creation failed: {exc}"
-    except Exception:
+        return _fail_setup(f"validation: training suite creation failed: {exc}")
+    except Exception as exc:
         # A transport/DB/programming failure is NOT a client validation
-        # error. Let it propagate so FastAPI returns 500 (the `with
-        # Session` context manager rolls back on the way out) instead of
-        # mislabeling every failure a 400. Upload/reachability failures are
-        # already returned as tao_unreachable (503) above.
+        # error. Persist the failed preparation owner, then let the exception
+        # propagate so FastAPI returns 500 instead of mislabeling it a 400.
         logger.exception("Training suite creation failed unexpectedly")
+        _set_suite_setup_status(
+            project_id,
+            suite_id,
+            settings,
+            status="failed",
+            error=f"Training job preparation failed: {type(exc).__name__}: {exc}",
+        )
         raise
 
     # ── Phase 2: kickoff first chain's first train job ─────────────────
     suite_status = "running"
-    if first_chain_first_job_id is not None:
+    with Session(engine) as session:
+        current_suite = session.get(TrainingSuite, suite_id)
+        canceled_before_kickoff = (
+            current_suite is not None and current_suite.status == "canceled"
+        )
+    if canceled_before_kickoff:
+        suite_status = "canceled"
+    elif first_chain_first_job_id is not None:
         # advance_on_failure=False: a first-job submission failure fails the
         # whole suite here (below); it must NOT cross-advance to the next chain
         # the way a mid-chain failure does.
@@ -1807,6 +2387,8 @@ async def create_training_suite(
         )
         if kickoff == "failed":
             suite_status = "failed"
+        elif kickoff == "canceled":
+            suite_status = "canceled"
         elif kickoff.startswith(("not found", "conflict", "validation")):
             # Should not happen for a freshly created not_started job, but
             # log defensively. We do NOT roll back — the TrainingSuite is
@@ -1824,11 +2406,14 @@ async def create_training_suite(
             session.query(TrainingSuite).filter_by(training_suite_id=suite_id).first()
         )
         if suite is not None:
-            suite.status = suite_status
-            suite.started_at = now
-            if suite_status == "failed":
-                suite.completed_at = now
-            session.commit()
+            if suite.status == "canceled":
+                suite_status = "canceled"
+            else:
+                suite.status = suite_status
+                suite.started_at = now
+                if suite_status == "failed":
+                    suite.completed_at = now
+                session.commit()
 
     # ── Build response ─────────────────────────────────────────────────
     with Session(engine) as session:
@@ -2098,11 +2683,9 @@ def recover_interrupted_training_suite_setups(settings: Settings) -> int:
                 .all()
             )
             for suite in suites:
+                error = _interrupted_setup_error(suite, reason="Backend restart")
                 suite.status = "failed"
-                suite.setup_error_ref = (
-                    "Backend restart interrupted Training Jobs setup. "
-                    "Return to Student Training and start a new suite."
-                )
+                suite.setup_error_ref = error
                 suite.completed_at = utc_now()
                 recovered += 1
             if suites:
@@ -2128,20 +2711,15 @@ async def _upload_export_archive(
     *,
     session: Session,
     export_row: DatasetExport,
-    archive_path: Path,
     deployment_config: TAODeploymentConfig,
     upload_archive: UploadArchiveFn | None,
     s3_client: Any | None,
-    annotations_path: Path | None = None,
+    settings: Settings,
 ) -> UploadResult:
     """Drive ``upload_dataset_archive`` with an optional test-supplied hook.
 
-    ``annotations_path`` is a sidecar JSON file alongside the .tar.gz that
-    Cosmos-RL needs as a separate URL for ``annotation_path``: pointing
-    annotation_path at the same .tar.gz URL as media_path crashes the
-    cosmos-rl worker with FileNotFoundError because TAO's URL→path
-    mapping resolves both to the extracted directory rather than the
-    JSON file.
+    Artifact paths come only from ``export_row`` so the frozen DatasetExport
+    remains the source of truth for both representations.
     """
     fn: UploadArchiveFn = (
         upload_archive
@@ -2151,7 +2729,14 @@ async def _upload_export_archive(
     if s3_client is None and upload_archive is None:
         # Production path: build the real boto3 S3 client. Only done
         # when neither the upload hook nor client is injected.
-        s3_client = build_s3_client(deployment_config)
+        try:
+            s3_client = build_s3_client(deployment_config, settings=settings)
+        except ValueError as exc:
+            return UploadResult(
+                success=False,
+                dataset_export_id=export_row.dataset_export_id,
+                error=f"Workspace S3 client configuration failed: {exc}",
+            )
     # Guard above guarantees a client when no override hook is set; the
     # hook path supplies its own client (used by tests / mocks).
     assert s3_client is not None or upload_archive is not None
@@ -2159,8 +2744,7 @@ async def _upload_export_archive(
     return await fn(
         session,
         dataset_export=export_row,
-        archive_path=archive_path,
         deployment_config=deployment_config,
         s3_client=s3_client,  # pyright: ignore[reportArgumentType] — narrowed by the assert above; pyright cannot prove the upload_archive branch
-        annotations_path=annotations_path,
+        settings=settings,
     )

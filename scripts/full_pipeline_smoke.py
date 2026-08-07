@@ -19,12 +19,18 @@ Usage::
     # Direct CLI (requires a backend already running and an NVIDIA_API_KEY).
     uv run python scripts/full_pipeline_smoke.py \\
         --backend-url http://127.0.0.1:8000 \\
-        --image-source-dir /tmp/my-images \\
+        --image-source-dir deploy/example-images \\
+        --image-limit 15 \\
         --label-count 10
 
     # Library use (closing-smoke calls into this for Phase E):
     from scripts.full_pipeline_smoke import run_full_pipeline_smoke
     result = await run_full_pipeline_smoke(...)
+
+``--image-source-dir`` accepts either a flat image directory or an RPS-style
+directory with ``rock/``, ``paper/``, and ``scissors/`` children. The selected
+cohort is deterministic and balanced across the inferred gesture classes when
+the source contains enough images.
 
 The script emits ``{evidence_dir}/full_pipeline_smoke_acceptance.json`` with
 per-step status + counts + checksums for inclusion in
@@ -35,6 +41,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import io
 import json
 import logging
 import sys
@@ -42,6 +50,7 @@ import tarfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from email.message import Message
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -251,20 +260,32 @@ def _now_iso() -> str:
 
 
 def _ground_truth_for_image(image_path: Path) -> dict[str, Any]:
-    """Synthesize a ground-truth label from the image filename.
+    """Infer deterministic RPS ground truth from a path.
 
-    The smoke is hardware-independent — we don't need real images. The
-    convention is: filename starts with one of "rock_", "paper_",
-    "scissors_". For arbitrary images, hash-bucket the filename so the
-    smoke is deterministic.
+    A nearest class-named parent directory takes priority, which supports the
+    canonical ``{rock,paper,scissors}/image.png`` layout. Flat directories may
+    use ``rock_*``/``paper_*``/``scissors_*`` or the bundled dataset's
+    ``testrock*``/``testpaper*``/``testscissors*`` stems. Arbitrary filenames
+    retain the deterministic fallback used by the smoke.
     """
-    name = image_path.stem.lower()
+    for parent in image_path.parents:
+        parent_name = parent.name.casefold()
+        if parent_name in _GESTURE_VALUES:
+            return {"gesture": parent_name}
+
+    name = image_path.stem.casefold()
     for value in _GESTURE_VALUES:
-        if name.startswith(value):
+        if name.startswith(f"{value}_") or name.startswith(f"test{value}"):
             return {"gesture": value}
     # Deterministic fallback bucketing.
     bucket = sum(ord(c) for c in name) % len(_GESTURE_VALUES)
     return {"gesture": _GESTURE_VALUES[bucket]}
+
+
+def _example_key_for_image(image_path: Path) -> str:
+    """Return a separator-free key derived from the absolute resolved path."""
+    resolved_path = image_path.resolve().as_posix()
+    return hashlib.sha256(resolved_path.encode("utf-8")).hexdigest()
 
 
 async def _wait_for_run_terminal(
@@ -358,13 +379,13 @@ async def _step_ingest(
     mirrors the AutoRun convention so the labeling step can recover it
     without re-reading filenames.
     """
-    items = []
+    items: list[dict[str, Any]] = []
     for p in image_paths:
         resolved = p.resolve()
-        gt = _ground_truth_for_image(p)
+        gt = _ground_truth_for_image(resolved)
         items.append(
             {
-                "example_key": resolved.stem,
+                "example_key": _example_key_for_image(resolved),
                 "storage_ref": str(resolved),
                 "source_metadata": {
                     "full_pipeline_smoke_ground_truth": gt,
@@ -377,26 +398,60 @@ async def _step_ingest(
         json={"examples": items},
         timeout=120.0,
     )
-    # 202 Accepted is the endpoint's SUCCESS code (routers/examples.py):
-    # rows persist synchronously, pHash/embeddings compute in background.
-    if resp.status_code not in (200, 201, 202):
+    # 202 Accepted is the endpoint's exact success code: rows persist
+    # synchronously, then pHash/embeddings compute in the background.
+    if resp.status_code != 202:
         return StepResult(
             "ingest", False, detail=f"HTTP {resp.status_code}: {resp.text[:300]}"
         )
     body = resp.json()
-    accepted = int(
-        body.get("accepted_count")
-        or len(body.get("results", []))
-        or len([r for r in body.get("results", []) if r.get("ok")])
-    )
-    if accepted == 0:
+    results = body.get("results")
+    expected_keys = {item["example_key"] for item in items}
+    if len(expected_keys) != len(items):
         return StepResult(
             "ingest",
             False,
-            detail=f"no examples accepted from {len(image_paths)} paths",
-            metrics=body,
+            detail="input paths generated duplicate example keys",
+            metrics={"requested": len(items), "unique_keys": len(expected_keys)},
         )
-    return StepResult("ingest", True, metrics={"accepted": accepted})
+    if not isinstance(results, list):
+        return StepResult(
+            "ingest",
+            False,
+            detail="202 response did not contain a results array",
+            metrics={"requested": len(items)},
+        )
+    actual_keys = {
+        result.get("example_key") for result in results if isinstance(result, dict)
+    }
+    created = sum(
+        1
+        for result in results
+        if isinstance(result, dict) and result.get("status") == "created"
+    )
+    if (
+        len(results) != len(items)
+        or actual_keys != expected_keys
+        or created != len(items)
+    ):
+        statuses = [
+            result.get("status") if isinstance(result, dict) else "invalid"
+            for result in results
+        ]
+        return StepResult(
+            "ingest",
+            False,
+            detail=(
+                f"expected {len(items)} per-item created results; got "
+                f"{len(results)} results with {created} created"
+            ),
+            metrics={
+                "requested": len(items),
+                "created": created,
+                "statuses": statuses,
+            },
+        )
+    return StepResult("ingest", True, metrics={"accepted": created})
 
 
 async def _step_save_guidance(client: httpx.AsyncClient, project_id: str) -> StepResult:
@@ -454,8 +509,19 @@ async def _step_label_loop(
     project_id: str,
     examples: list[dict[str, Any]],
     image_paths: list[Path],
+    expected_count: int,
 ) -> StepResult:
     """Drive `/proposals` + `/labels` per example via the synthetic SME."""
+    if len(examples) != expected_count:
+        return StepResult(
+            "label_loop",
+            False,
+            detail=(
+                f"queried {len(examples)} unlabeled examples; expected {expected_count}"
+            ),
+            metrics={"queried": len(examples), "requested": expected_count, "saved": 0},
+        )
+
     schema_fields = _DEFAULT_GUIDANCE_FIELDS
     template_fn = _make_template_rationale(schema_fields)
 
@@ -516,7 +582,12 @@ async def _step_label_loop(
             edit += 1
     return StepResult(
         "label_loop",
-        saved == len(examples),
+        saved == expected_count,
+        detail=(
+            ""
+            if saved == expected_count
+            else f"saved {saved} labels; expected {expected_count}"
+        ),
         metrics={"saved": saved, "accept": accept, "edit": edit},
     )
 
@@ -615,8 +686,8 @@ async def _step_dataset_export(
     *,
     project_id: str,
     export_field_mode: str,
-) -> tuple[StepResult, str | None]:
-    """Export a Cosmos-RL training dataset; return path to artifact."""
+) -> tuple[StepResult, bytes | None]:
+    """Export and download a Cosmos-RL training dataset through the public API."""
     payload = {
         "dataset_intent": "training",
         "export_field_mode": export_field_mode,
@@ -666,37 +737,106 @@ async def _step_dataset_export(
                 None,
             )
         export = poll.json()
-    if export.get("status") == "failed":
+    if export.get("status") != "completed":
         return (
             StepResult(
                 "dataset_export",
                 False,
-                detail=f"export failed: {export.get('status_reason')}",
+                detail=(
+                    f"export ended with status {export.get('status')}: "
+                    f"{export.get('status_reason')}"
+                ),
             ),
             None,
         )
     artifact_refs = export.get("artifact_refs") or {}
-    archive_path = artifact_refs.get("archive_path") or artifact_refs.get("archive_ref")
+    expected_checksum = artifact_refs.get("checksum_sha256")
+    archive_ref = artifact_refs.get("archive_path") or artifact_refs.get("archive_ref")
+    expected_filename = Path(archive_ref).name if isinstance(archive_ref, str) else None
+    download = await client.get(
+        f"/v1/projects/{project_id}/dataset_exports/{export_id}/archive",
+        timeout=120.0,
+    )
+    download_ok, download_detail = _validate_archive_download(
+        download,
+        expected_checksum=expected_checksum,
+        expected_filename=expected_filename,
+    )
+    metrics = {
+        "dataset_export_id": export_id,
+        "example_count": export.get("example_count"),
+        "checksum_sha256": expected_checksum,
+    }
+    if not download_ok:
+        return (
+            StepResult(
+                "dataset_export",
+                False,
+                detail=f"archive download validation failed: {download_detail}",
+                metrics=metrics,
+            ),
+            None,
+        )
     return (
         StepResult(
             "dataset_export",
             True,
-            metrics={
-                "dataset_export_id": export["dataset_export_id"],
-                "example_count": export.get("example_count"),
-                "checksum_sha256": artifact_refs.get("checksum_sha256"),
-            },
+            detail=download_detail,
+            metrics={**metrics, "download_bytes": len(download.content)},
         ),
-        archive_path,
+        download.content,
     )
 
 
-def _validate_cosmos_rl_archive(archive_path: Path) -> tuple[bool, str]:
+def _validate_archive_download(
+    response: httpx.Response,
+    *,
+    expected_checksum: str | None,
+    expected_filename: str | None,
+) -> tuple[bool, str]:
+    """Validate the public archive response and its integrity metadata."""
+    if response.status_code != 200:
+        return False, f"HTTP {response.status_code}: {response.text[:300]}"
+    if response.headers.get("content-type") != "application/gzip":
+        return (
+            False,
+            f"unexpected Content-Type {response.headers.get('content-type')!r}",
+        )
+
+    disposition_value = response.headers.get("content-disposition", "")
+    disposition = Message()
+    disposition["content-disposition"] = disposition_value
+    filename = disposition.get_filename()
+    if disposition.get_content_disposition() != "attachment":
+        return False, f"unexpected Content-Disposition {disposition_value!r}"
+    if not filename or not filename.lower().endswith(".tar.gz"):
+        return False, f"download filename is not a .tar.gz archive: {filename!r}"
+    if not expected_filename:
+        return False, "export record did not include an archive filename"
+    if filename != expected_filename:
+        return (
+            False,
+            f"download filename {filename!r} does not match export {expected_filename!r}",
+        )
+
+    if not expected_checksum:
+        return False, "export record did not include checksum_sha256"
+    header_checksum = response.headers.get("x-checksum-sha256")
+    if header_checksum != expected_checksum:
+        return (
+            False,
+            "X-Checksum-SHA256 does not match the export record checksum",
+        )
+    actual_checksum = hashlib.sha256(response.content).hexdigest()
+    if actual_checksum != expected_checksum:
+        return False, "downloaded archive bytes do not match checksum_sha256"
+    return True, f"downloaded and checksum-validated {len(response.content)} bytes"
+
+
+def _validate_cosmos_rl_archive(archive_bytes: bytes) -> tuple[bool, str]:
     """Cosmos-RL dataset format: top-level JSON array of {id, images, conversations}."""
-    if not archive_path.exists():
-        return False, f"archive not found at {archive_path}"
     try:
-        with tarfile.open(archive_path, "r:gz") as tf:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tf:
             try:
                 annotations_member = tf.getmember("annotations.json")
             except KeyError:
@@ -833,6 +973,7 @@ async def run_full_pipeline_smoke(
                 project_id=project_id,
                 examples=examples,
                 image_paths=paths_to_ingest,
+                expected_count=label_count,
             )
             result.steps.append(s5)
             result.label_count = s5.metrics.get("saved", 0)
@@ -857,7 +998,7 @@ async def run_full_pipeline_smoke(
             # an expected mechanical outcome, not a smoke failure.
 
             # Step 9 + 10: dataset_export + Cosmos-RL format validation
-            s9, archive_path = await _step_dataset_export(
+            s9, archive_bytes = await _step_dataset_export(
                 client,
                 project_id=project_id,
                 export_field_mode=export_field_mode,
@@ -866,8 +1007,8 @@ async def run_full_pipeline_smoke(
             if s9.ok:
                 result.dataset_example_count = s9.metrics.get("example_count") or 0
                 result.dataset_export_sha = s9.metrics.get("checksum_sha256")
-                if archive_path:
-                    valid, detail = _validate_cosmos_rl_archive(Path(archive_path))
+                if archive_bytes is not None:
+                    valid, detail = _validate_cosmos_rl_archive(archive_bytes)
                     result.cosmos_rl_format_validated = valid
                     result.steps.append(
                         StepResult(
@@ -881,7 +1022,7 @@ async def run_full_pipeline_smoke(
                         StepResult(
                             "validate_cosmos_rl_format",
                             False,
-                            detail="dataset_export response did not include archive_path",
+                            detail="dataset export did not return downloaded archive bytes",
                         )
                     )
 
@@ -924,9 +1065,26 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--image-source-dir",
         type=Path,
         required=True,
-        help="Directory of images to ingest. Backend must have read access.",
+        help=(
+            "Flat image directory or RPS-style root with rock/, paper/, and "
+            "scissors/ children. Backend must have read access."
+        ),
     )
-    p.add_argument("--label-count", type=int, default=10)
+    p.add_argument(
+        "--image-limit",
+        type=int,
+        default=None,
+        help=(
+            "Maximum images in the deterministic, roughly class-balanced "
+            "ingest cohort. Defaults to --label-count."
+        ),
+    )
+    p.add_argument(
+        "--label-count",
+        type=int,
+        default=10,
+        help="Number of selected images to review (default: 10).",
+    )
     p.add_argument(
         "--export-field-mode",
         choices=("all", "aux_and_core", "core_only"),
@@ -952,17 +1110,56 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Override the auto-generated project name.",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.image_limit is not None and args.image_limit <= 0:
+        p.error("--image-limit must be greater than zero")
+    if args.image_limit is not None and args.image_limit < args.label_count:
+        p.error("--image-limit must be greater than or equal to --label-count")
+    return args
 
 
 def _gather_image_paths(image_dir: Path, max_count: int) -> list[Path]:
+    """Discover images recursively and choose a deterministic balanced cohort."""
+    if max_count <= 0:
+        raise ValueError("max_count must be greater than zero")
+
     suffixes = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
     files = sorted(
-        p for p in image_dir.iterdir() if p.is_file() and p.suffix.lower() in suffixes
+        (
+            p
+            for p in image_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in suffixes
+        ),
+        key=lambda path: (
+            path.relative_to(image_dir).as_posix().casefold(),
+            path.relative_to(image_dir).as_posix(),
+        ),
     )
     if not files:
         raise SystemExit(f"no supported images found in {image_dir}")
-    return files[:max_count]
+
+    by_gesture: dict[str, list[Path]] = {value: [] for value in _GESTURE_VALUES}
+    for path in files:
+        gesture = _ground_truth_for_image(path)["gesture"]
+        by_gesture[gesture].append(path)
+
+    selected: list[Path] = []
+    bucket_indexes: dict[str, int] = dict.fromkeys(_GESTURE_VALUES, 0)
+    while len(selected) < max_count:
+        added = False
+        for value in _GESTURE_VALUES:
+            index = bucket_indexes[value]
+            bucket = by_gesture[value]
+            if index >= len(bucket):
+                continue
+            selected.append(bucket[index])
+            bucket_indexes[value] += 1
+            added = True
+            if len(selected) == max_count:
+                break
+        if not added:
+            break
+    return selected
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -971,7 +1168,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
     )
     args = _parse_args(argv if argv is not None else sys.argv[1:])
-    image_paths = _gather_image_paths(args.image_source_dir, max_count=args.label_count)
+    image_limit = args.image_limit if args.image_limit is not None else args.label_count
+    image_paths = _gather_image_paths(args.image_source_dir, max_count=image_limit)
     evidence_dir = args.evidence_dir or (
         Path.home()
         / ".vlm_feedback_loop"

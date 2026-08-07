@@ -66,13 +66,14 @@ def build_auth_headers(
 def build_endpoint_auth_headers(
     auth_mode: str | None,
     credential: str | None,
-) -> dict[str, str]:
-    """Auth headers for an outbound NIM call, tolerant of a missing credential.
+) -> dict[str, str] | None:
+    """Resolve auth for a service-side NIM dispatch.
 
     The single builder for every service-side NIM dispatch (interactive
-    proposal, evaluation, batch labeling, rationale regeneration). Unlike
-    :func:`build_auth_headers` it returns ``{}`` when no credential is
-    configured instead of raising.
+    proposal, evaluation, batch labeling, rationale regeneration). ``None`` is
+    an explicit dispatch-blocking result for a bearer endpoint with no
+    credential; :func:`chat_completions` converts it into an endpoint error
+    without opening a network connection.
 
     ``auth_mode == "none"`` (self-hosted / local system-managed NIMs)
     returns ``{}`` even when a credential is incidentally present, so a
@@ -80,11 +81,13 @@ def build_endpoint_auth_headers(
     no-auth endpoint. Only ``bearer`` (hosted NVIDIA endpoints) attaches an
     ``Authorization`` header.
     """
-    if auth_mode == "none":
+    if auth_mode in (None, "none"):
         return {}
-    if not credential:
-        return {}
-    return {"Authorization": f"Bearer {credential}"}
+    if auth_mode == "bearer":
+        if not credential:
+            return None
+        return {"Authorization": f"Bearer {credential}"}
+    raise ValueError(f"Unknown auth_mode: {auth_mode!r}")
 
 
 # ── list_models ─────────────────────────────────────────────────────────────
@@ -185,7 +188,7 @@ class NimChatCompletionsResult:
 
 async def chat_completions(
     base_url: str,
-    auth_headers: dict[str, str],
+    auth_headers: dict[str, str] | None,
     model: str,
     messages: list[dict[str, Any]],
     deadline_s: float,
@@ -199,6 +202,15 @@ async def chat_completions(
     directly into the request body — needed by capability probes and
     Teacher invocation.
     """
+    if auth_headers is None:
+        return NimChatCompletionsResult(
+            success=False,
+            error=(
+                "Endpoint credential is not configured; configure "
+                "NVIDIA_API_KEY or select a no-auth self-hosted endpoint"
+            ),
+        )
+
     # ``base_url`` already includes the API root (e.g. ``.../v1``) by contract,
     # so we append only the path segment — not ``/v1/chat/completions``.
     url = f"{base_url.rstrip('/')}/chat/completions"
@@ -341,21 +353,48 @@ async def create_embeddings(
 
     # Success — parse and reorder by index
     resp: Any = result.body
-    if not isinstance(resp, dict) or "data" not in resp:
+    if not isinstance(resp, dict):
+        return NimEmbeddingsResult(
+            success=False,
+            error="Unexpected response format from /embeddings",
+            status_code=result.status_code,
+        )
+    resp_dict = cast("dict[str, Any]", resp)
+    data_value = resp_dict.get("data")
+    if not isinstance(data_value, list):
         return NimEmbeddingsResult(
             success=False,
             error="Unexpected response format from /embeddings",
             status_code=result.status_code,
         )
 
-    data_items = cast("list[dict[str, Any]]", resp["data"])
+    data_items_raw = cast("list[Any]", data_value)
+
+    def valid_embedding_item(item: Any) -> bool:
+        if not isinstance(item, dict):
+            return False
+        typed_item = cast("dict[str, Any]", item)
+        vector = typed_item.get("embedding")
+        vector_items = cast("list[Any]", vector) if isinstance(vector, list) else []
+        return (
+            isinstance(typed_item.get("index", 0), int)
+            and isinstance(vector, list)
+            and all(isinstance(value, (int, float)) for value in vector_items)
+        )
+
+    if any(not valid_embedding_item(item) for item in data_items_raw):
+        return NimEmbeddingsResult(
+            success=False,
+            error="Unexpected response format from /embeddings",
+            status_code=result.status_code,
+        )
+    data_items = cast("list[dict[str, Any]]", data_items_raw)
     # Sort by index to guarantee input-order alignment
     sorted_items = sorted(data_items, key=lambda x: x.get("index", 0))
     embeddings: list[list[float]] = [
         cast("list[float]", item["embedding"]) for item in sorted_items
     ]
 
-    resp_dict = cast("dict[str, Any]", resp)
     return NimEmbeddingsResult(
         success=True,
         embeddings=embeddings,

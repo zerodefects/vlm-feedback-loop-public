@@ -14,8 +14,8 @@
  * (``/projects/:id/settings/nim``).
  *
  * Note: that header link and the page's own heading both read
- * "NIM Configuration", so page-loaded gates below assert on the
- * heading (a non-link text node), not the nav link.
+ * "NIM Configuration", so page-loaded gates below use the heading role,
+ * not an element-type selector tied to either implementation.
  *
  * Core rules pinned here:
  *   - The page renders even on a fully-configured machine (it never
@@ -34,6 +34,7 @@ import { MemoryRouter, Routes, Route } from "react-router-dom";
 import type { ReactNode } from "react";
 import { NIMConnectionPage } from "@/pages/NIMConnectionPage";
 import { ProjectSetupLayout } from "@/pages/ProjectSetupLayout";
+import { ApiError } from "@/api/client";
 import type {
   EnvironmentResponse,
   LocalNimGpuConflict,
@@ -47,9 +48,12 @@ const mockFetchEnvironment = vi.fn();
 const mockTestConnection = vi.fn();
 const mockTestNgcCredential = vi.fn();
 const mockTestNvidiaCredential = vi.fn();
+const mockConfigureSelfHostedEmbedding = vi.fn();
+const mockConfigureSelfHostedTeacher = vi.fn();
 const mockRunPreflight = vi.fn();
 const mockDeployLocalNim = vi.fn();
 const mockListLocalNimDeployments = vi.fn();
+const mockStopLocalNim = vi.fn();
 const mockParseLocalNimGpuConflict = vi.fn();
 const mockFetchModelConfigs = vi.fn();
 const mockGenerateActionRequest = vi.fn();
@@ -79,9 +83,14 @@ vi.mock("@/api/nim", () => ({
   testConnection: (...args: unknown[]) => mockTestConnection(...args),
   testNgcCredential: (...args: unknown[]) => mockTestNgcCredential(...args),
   testNvidiaCredential: (...args: unknown[]) => mockTestNvidiaCredential(...args),
+  configureSelfHostedEmbedding: (...args: unknown[]) =>
+    mockConfigureSelfHostedEmbedding(...args),
+  configureSelfHostedTeacher: (...args: unknown[]) =>
+    mockConfigureSelfHostedTeacher(...args),
   runPreflight: (...args: unknown[]) => mockRunPreflight(...args),
   deployLocalNim: (...args: unknown[]) => mockDeployLocalNim(...args),
   listLocalNimDeployments: (...args: unknown[]) => mockListLocalNimDeployments(...args),
+  stopLocalNim: (...args: unknown[]) => mockStopLocalNim(...args),
   parseLocalNimGpuConflict: (...args: unknown[]) =>
     mockParseLocalNimGpuConflict(...args),
   generateActionRequest: (...args: unknown[]) => mockGenerateActionRequest(...args),
@@ -227,6 +236,13 @@ function localTeacherEnvironment(
     local_deploy_available: true,
     nvidia_api_key_configured: true,
     ngc_api_key_configured: true,
+    embedding_deployment: {
+      model_name: "nvidia/llama-nemotron-embed-vl-1b-v2",
+      nim_container_image: "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0",
+      gpu_memory_minimum_gb: 24,
+      fits: true,
+      provider: "none",
+    },
     local_deployable_models: LOCAL_MODELS,
     recommended_teacher_mode: "local",
     recommended_embedding_mode: "hosted",
@@ -248,6 +264,23 @@ describe("NIMConnectionPage", () => {
     mockFetchModelConfigs.mockResolvedValue({ items: [] });
     mockListLocalNimDeployments.mockResolvedValue({ items: [] });
     mockParseLocalNimGpuConflict.mockReturnValue(null);
+    mockTestNgcCredential.mockResolvedValue({ success: true });
+    mockTestNvidiaCredential.mockResolvedValue({ success: true });
+    mockConfigureSelfHostedTeacher.mockResolvedValue({
+      endpoint: {
+        endpoint_id: "self-hosted-endpoint",
+        endpoint_mode: "self_hosted",
+      },
+      model_config_id: "mc-teacher",
+      model_name: "nvidia/test-teacher",
+    });
+    mockConfigureSelfHostedEmbedding.mockResolvedValue({
+      embedding_deployment_config_id: "embedding",
+      provider: "self_hosted_nvclip",
+      model_name: "nvidia/llama-nemotron-embed-vl-1b-v2",
+      embedding_dim: 2048,
+      endpoint_url: "http://embedding.internal:8000/v1",
+    });
   });
 
   // Even when both services are fully configured, the page renders
@@ -270,7 +303,7 @@ describe("NIMConnectionPage", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText("NIM Configuration", { selector: ":not(a)" }),
+        screen.getByRole("heading", { name: "NIM Configuration" }),
       ).toBeInTheDocument();
     });
     expect(screen.queryByTestId("project-index")).toBeNull();
@@ -293,7 +326,7 @@ describe("NIMConnectionPage", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText("NIM Configuration", { selector: ":not(a)" }),
+        screen.getByRole("heading", { name: "NIM Configuration" }),
       ).toBeInTheDocument();
     });
 
@@ -302,7 +335,75 @@ describe("NIMConnectionPage", () => {
     expect(screen.getByText(/A100 80 GB/)).toBeInTheDocument();
   });
 
+  it("validates only the registry credential when every effective service is local", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      localTeacherEnvironment({ recommended_embedding_mode: "local" }),
+    );
+    const { Wrapper } = createWrapper();
+
+    render(<div />, { wrapper: Wrapper });
+
+    await waitFor(() => {
+      expect(mockTestNgcCredential).toHaveBeenCalledTimes(1);
+    });
+    expect(mockTestNvidiaCredential).not.toHaveBeenCalled();
+  });
+
+  it("validates only the hosted credential when every effective service is hosted", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      localTeacherEnvironment({
+        recommended_teacher_mode: "hosted",
+        recommended_embedding_mode: "hosted",
+      }),
+    );
+    const { Wrapper } = createWrapper();
+
+    render(<div />, { wrapper: Wrapper });
+
+    await waitFor(() => {
+      expect(mockTestNvidiaCredential).toHaveBeenCalledTimes(1);
+    });
+    expect(mockTestNgcCredential).not.toHaveBeenCalled();
+  });
+
+  it("shows pHash diversity without validating an unused hosted key", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      localTeacherEnvironment({ recommended_embedding_mode: "none" }),
+    );
+    const { Wrapper } = createWrapper();
+
+    render(<div />, { wrapper: Wrapper });
+
+    expect(await screen.findByText("pHash diversity (no NIM)")).toBeInTheDocument();
+    expect(
+      screen.getByText(/image review remains diverse through pHash/i),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(mockTestNgcCredential).toHaveBeenCalledTimes(1);
+    });
+    expect(mockTestNvidiaCredential).not.toHaveBeenCalled();
+  });
+
   // --- Hosted override ---
+
+  it("keeps the hosted-key value copy aligned with the current Teacher roster", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      makeEnv({
+        recommended_teacher_mode: "hosted",
+        recommended_embedding_mode: "hosted",
+      }),
+    );
+    const { Wrapper } = createWrapper();
+
+    render(<div />, { wrapper: Wrapper });
+
+    expect(
+      await screen.findByText(
+        /instant access to Mistral Medium, Step, and Nemotron\./i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Mistral Large 3, Qwen, Cosmos/i)).toBeNull();
+  });
 
   it("shows API key field in hosted override when key not configured", async () => {
     mockFetchEnvironment.mockResolvedValue(
@@ -420,6 +521,182 @@ describe("NIMConnectionPage", () => {
     });
   });
 
+  it("persists a tested self-hosted Teacher and returns to the project", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      makeEnv({
+        recommended_teacher_mode: "hosted",
+        recommended_embedding_mode: "none",
+      }),
+    );
+    mockFetchModelConfigs.mockResolvedValue({
+      items: [makeModelConfig("mc-teacher", "nvidia/test-teacher")],
+    });
+    mockTestConnection.mockResolvedValue({
+      success: true,
+      models: ["nvidia/test-teacher"],
+    });
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<div />, { wrapper: Wrapper });
+
+    await user.click((await screen.findAllByRole("button", { name: /Configure/i }))[0]);
+    await user.click(screen.getByRole("button", { name: /Self-hosted/i }));
+    await user.type(
+      screen.getByRole("textbox", { name: /Base URL/i }),
+      "http://nim.internal:8000/v1",
+    );
+    await user.click(screen.getByRole("button", { name: /Test Connection/i }));
+
+    expect(
+      await screen.findByRole("combobox", { name: "Self-hosted Teacher model" }),
+    ).toHaveTextContent("nvidia/test-teacher");
+    await user.click(screen.getByRole("button", { name: /^Save/i }));
+
+    await waitFor(() => {
+      expect(mockConfigureSelfHostedTeacher).toHaveBeenCalledWith("test-pid", {
+        base_url: "http://nim.internal:8000/v1",
+        model_config_id: "mc-teacher",
+      });
+    });
+    expect(await screen.findByTestId("project-index")).toBeInTheDocument();
+  });
+
+  it("requires a real embedding test and durably saves the endpoint", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      makeEnv({
+        recommended_teacher_mode: "hosted",
+        recommended_embedding_mode: "none",
+      }),
+    );
+    mockTestConnection.mockResolvedValue({ success: true });
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<div />, { wrapper: Wrapper });
+
+    await user.click((await screen.findAllByRole("button", { name: /Configure/i }))[1]);
+    await user.click(screen.getByRole("button", { name: /Self-hosted/i }));
+    const save = screen.getByRole("button", { name: /^Save/i });
+    expect(save).toBeDisabled();
+    await user.type(
+      screen.getByRole("textbox", { name: /Base URL/i }),
+      "http://embedding.internal:8000/v1",
+    );
+    const embeddingTestButton = screen
+      .getAllByRole("button", { name: /Test Connection/i })
+      .find((button) => !(button as HTMLButtonElement).disabled);
+    expect(embeddingTestButton).toBeDefined();
+    await user.click(embeddingTestButton!);
+
+    await waitFor(() => {
+      expect(mockTestConnection).toHaveBeenCalledWith({
+        base_url: "http://embedding.internal:8000/v1",
+        auth_mode: "none",
+        probe_kind: "embeddings",
+      });
+    });
+    expect(save).toBeEnabled();
+    await user.click(save);
+
+    await waitFor(() => {
+      expect(mockConfigureSelfHostedEmbedding).toHaveBeenCalledWith({
+        base_url: "http://embedding.internal:8000/v1",
+      });
+    });
+    expect(await screen.findByTestId("project-index")).toBeInTheDocument();
+  });
+
+  it("does not save a self-hosted endpoint whose models are absent from the catalog", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      makeEnv({
+        recommended_teacher_mode: "hosted",
+        recommended_embedding_mode: "none",
+      }),
+    );
+    mockFetchModelConfigs.mockResolvedValue({
+      items: [makeModelConfig("mc-teacher", "nvidia/test-teacher")],
+    });
+    mockTestConnection.mockResolvedValue({
+      success: true,
+      models: ["unknown/model"],
+    });
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<div />, { wrapper: Wrapper });
+
+    await user.click((await screen.findAllByRole("button", { name: /Configure/i }))[0]);
+    await user.click(screen.getByRole("button", { name: /Self-hosted/i }));
+    await user.type(
+      screen.getByRole("textbox", { name: /Base URL/i }),
+      "http://nim.internal:8000/v1",
+    );
+    await user.click(screen.getByRole("button", { name: /Test Connection/i }));
+
+    expect(
+      await screen.findByText(
+        /did not report a vision Teacher in this project's model catalog/i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Save/i })).toBeDisabled();
+    expect(mockConfigureSelfHostedTeacher).not.toHaveBeenCalled();
+  });
+
+  it("keeps the page open and explains a structured self-hosted save failure", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      makeEnv({
+        recommended_teacher_mode: "hosted",
+        recommended_embedding_mode: "none",
+      }),
+    );
+    mockFetchModelConfigs.mockResolvedValue({
+      items: [makeModelConfig("mc-teacher", "nvidia/test-teacher")],
+    });
+    mockTestConnection.mockResolvedValue({
+      success: true,
+      models: ["nvidia/test-teacher"],
+    });
+    mockConfigureSelfHostedTeacher.mockRejectedValue(
+      new ApiError(
+        409,
+        JSON.stringify({
+          detail: {
+            code: "model_in_active_use",
+            message:
+              "Cannot change this Teacher endpoint while it is used by an active run.",
+          },
+        }),
+      ),
+    );
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<div />, { wrapper: Wrapper });
+
+    await user.click((await screen.findAllByRole("button", { name: /Configure/i }))[0]);
+    await user.click(screen.getByRole("button", { name: /Self-hosted/i }));
+    await user.type(
+      screen.getByRole("textbox", { name: /Base URL/i }),
+      "http://nim.internal:8000/v1",
+    );
+    await user.click(screen.getByRole("button", { name: /Test Connection/i }));
+    await screen.findByRole("combobox", { name: "Self-hosted Teacher model" });
+    await user.click(screen.getByRole("button", { name: /^Save/i }));
+
+    expect(
+      await screen.findByRole("alert", {
+        name: "",
+      }),
+    ).toHaveTextContent(
+      "Cannot change this Teacher endpoint while it is used by an active run.",
+    );
+    expect(
+      screen.getByRole("heading", { name: "NIM Configuration" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("project-index")).not.toBeInTheDocument();
+  });
+
   // --- Connection test failure ---
 
   it("shows error message after failed connection test", async () => {
@@ -468,7 +745,7 @@ describe("NIMConnectionPage", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText("NIM Configuration", { selector: ":not(a)" }),
+        screen.getByRole("heading", { name: "NIM Configuration" }),
       ).toBeInTheDocument();
     });
 
@@ -538,6 +815,7 @@ describe("NIMConnectionPage", () => {
 
     await user.click((await screen.findAllByRole("button", { name: /Configure/i }))[0]);
     const chooser = await screen.findByTestId("local-teacher-model-select");
+    expect(screen.getByRole("combobox", { name: "Local Teacher model" })).toBe(chooser);
     await user.click(chooser);
     const optionNames = (await screen.findAllByRole("option")).map(
       (option) => option.textContent,
@@ -549,6 +827,23 @@ describe("NIMConnectionPage", () => {
     expect(optionNames).toContain("Cosmos 3 Super (Reasoner)");
     expect(optionNames).toContain("Cosmos Reason2 8B");
     expect(optionNames).toContain("Cosmos Reason2 2B");
+  });
+
+  it("tells the SME that each local service requires its explicit deploy action", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      localTeacherEnvironment({ recommended_embedding_mode: "local" }),
+    );
+    mockFetchModelConfigs.mockResolvedValue({ items: LOCAL_MODEL_CONFIGS });
+    const { Wrapper } = createWrapper();
+
+    render(<div />, { wrapper: Wrapper });
+
+    expect(
+      await screen.findByText(
+        /Deploy each local service from its configuration panel/i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Both deploy while you set up Guidance/i)).toBeNull();
   });
 
   it("deploys the exact selected model and activates it only after success", async () => {
@@ -585,6 +880,9 @@ describe("NIMConnectionPage", () => {
         activate_on_success: true,
       });
     });
+    expect(
+      screen.getByRole("button", { name: "Deploy selected model" }),
+    ).toBeDisabled();
   });
 
   it("requires a named confirmation before replacing the resident NIM", async () => {
@@ -667,6 +965,196 @@ describe("NIMConnectionPage", () => {
     });
   });
 
+  it("deploys local embeddings from the post-onboarding configuration panel", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      localTeacherEnvironment({ recommended_embedding_mode: "none" }),
+    );
+    mockDeployLocalNim.mockResolvedValue({
+      disposition: "queued",
+      deployment: {
+        local_nim_deployment_id: "embedding-deployment",
+        status: "starting",
+      },
+      preflight: { all_passed: true, checks: [] },
+    });
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<div />, { wrapper: Wrapper });
+
+    await user.click((await screen.findAllByRole("button", { name: /Configure/i }))[1]);
+    await user.click(screen.getByTestId("embeddings-mode-local"));
+    await user.click(screen.getByRole("button", { name: "Deploy embedding NIM" }));
+
+    await waitFor(() => {
+      expect(mockDeployLocalNim).toHaveBeenCalledWith("test-pid", {
+        role: "embedding",
+        gpu_assignment: undefined,
+        replace_resident: false,
+      });
+    });
+    expect(
+      screen.getByRole("button", { name: "Embedding NIM starting" }),
+    ).toBeDisabled();
+  });
+
+  it("names a free GPU reserved for the local Teacher", async () => {
+    mockFetchEnvironment.mockResolvedValue(
+      localTeacherEnvironment({
+        embedding_deployment: {
+          model_name: "nvidia/llama-nemotron-embed-vl-1b-v2",
+          nim_container_image: "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0",
+          gpu_memory_minimum_gb: 24,
+          fits: false,
+          provider: "none",
+        },
+        active_local_nim_residents: [],
+      }),
+    );
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<div />, { wrapper: Wrapper });
+
+    await user.click((await screen.findAllByRole("button", { name: /Configure/i }))[1]);
+    await user.click(screen.getByTestId("embeddings-mode-local"));
+
+    expect(screen.getByText("24+ GB GPU reserved for Teacher")).toBeInTheDocument();
+    expect(
+      screen.getByText(/A compatible GPU is free but reserved/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/No compatible GPU is currently free/i),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Deploy embedding NIM" })).toBeEnabled();
+  });
+
+  it("names the occupied resident before replacing it with local embeddings", async () => {
+    const conflictError = new Error("gpu occupied");
+    const conflict: LocalNimGpuConflict = {
+      code: "gpu_exhausted",
+      message: "All compatible GPUs are occupied.",
+      can_replace: true,
+      matches_requested_model: false,
+      resident: {
+        project_id: "rps-id",
+        project_name: "Populated RPS",
+        local_nim_deployment_id: "omni-deployment",
+        role: "teacher",
+        model_name: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        nim_container_image:
+          "nvcr.io/nim/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:1.7.0-variant",
+        gpu_assignment: "device=0",
+        status: "running",
+      },
+    };
+    mockFetchEnvironment.mockResolvedValue(
+      localTeacherEnvironment({
+        recommended_embedding_mode: "none",
+        active_local_nim_residents: [conflict.resident!],
+      }),
+    );
+    mockDeployLocalNim.mockRejectedValueOnce(conflictError).mockResolvedValueOnce({
+      disposition: "queued",
+      deployment: {
+        local_nim_deployment_id: "embedding-deployment",
+        status: "starting",
+      },
+      preflight: { all_passed: true, checks: [] },
+    });
+    mockParseLocalNimGpuConflict.mockImplementation((error) =>
+      error === conflictError ? conflict : null,
+    );
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<div />, { wrapper: Wrapper });
+
+    await user.click((await screen.findAllByRole("button", { name: /Configure/i }))[1]);
+    await user.click(screen.getByTestId("embeddings-mode-local"));
+    await user.click(screen.getByRole("button", { name: "Deploy embedding NIM" }));
+
+    expect(
+      await screen.findByText(/Nemotron 3 Nano Omni is running on device=0/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/project “Populated RPS”/i)).toBeInTheDocument();
+    expect(mockDeployLocalNim).toHaveBeenCalledTimes(1);
+
+    await user.click(
+      screen.getByRole("button", { name: "Stop and deploy embeddings" }),
+    );
+
+    await waitFor(() => {
+      expect(mockDeployLocalNim).toHaveBeenNthCalledWith(2, "test-pid", {
+        role: "embedding",
+        gpu_assignment: "device=0",
+        replace_resident: true,
+      });
+    });
+    expect(screen.getByText("24+ GB GPU available")).toBeInTheDocument();
+    expect(
+      screen.queryByText(/A different NIM currently occupies host GPU capacity/i),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/No compatible GPU is currently free/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("stops a project-owned local embedding deployment", async () => {
+    const embeddingResident = {
+      project_id: "test-pid",
+      project_name: "Test Project",
+      local_nim_deployment_id: "embedding-deployment",
+      role: "embedding",
+      model_name: "nvidia/llama-nemotron-embed-vl-1b-v2",
+      nim_container_image: "nvcr.io/nim/nvidia/llama-nemotron-embed-vl-1b-v2:2.0.0",
+      gpu_assignment: "device=0",
+      status: "running",
+    };
+    mockFetchEnvironment.mockResolvedValue(
+      localTeacherEnvironment({
+        recommended_embedding_mode: "local",
+        active_local_nim_residents: [embeddingResident],
+      }),
+    );
+    mockListLocalNimDeployments.mockResolvedValue({
+      items: [
+        {
+          ...embeddingResident,
+          status_reason: null,
+          container_name: "vlm-embed-test",
+          container_id: "container-id",
+          host_port: 8001,
+          endpoint_url: "http://localhost:8001/v1",
+          model_config_id: "embedding-config",
+          deployed_at: "2026-08-04T12:00:00Z",
+          stopped_at: null,
+          created_at: "2026-08-04T11:58:00Z",
+        },
+      ],
+    });
+    mockStopLocalNim.mockResolvedValue({
+      ...embeddingResident,
+      status: "stopped",
+    });
+    const { Wrapper } = createWrapper();
+    const user = userEvent.setup();
+
+    render(<div />, { wrapper: Wrapper });
+
+    expect(
+      await screen.findByText(/local, no rate limits · one NIM per GPU/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/doesn't compete with the Teacher/i)).toBeNull();
+
+    await user.click((await screen.findAllByRole("button", { name: /Configure/i }))[1]);
+    await user.click(await screen.findByRole("button", { name: "Stop embedding NIM" }));
+
+    await waitFor(() => {
+      expect(mockStopLocalNim).toHaveBeenCalledWith("test-pid", "embedding-deployment");
+    });
+  });
+
   // --- Missing credentials inline ---
 
   it("renders inline NVIDIA API Key CredentialInput when key not configured", async () => {
@@ -743,7 +1231,7 @@ describe("NIMConnectionPage", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText(/GPU insufficient for local Teacher \(need >56 GB\)/i),
+        screen.getByText(/GPU insufficient for local Teacher \(need at least 56 GB\)/i),
       ).toBeInTheDocument();
     });
   });

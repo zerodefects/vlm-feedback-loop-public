@@ -19,6 +19,7 @@ import {
   cancelBatchLabelRun,
   getSchemaInvalidManifest,
   createDatasetExport,
+  datasetExportArchiveUrl,
 } from "@/api/batch";
 
 const { fetchMock, lastCall } = setupFetchMock();
@@ -101,5 +102,13 @@ describe("createDatasetExport", () => {
       export_field_mode: "core_only",
       batch_label_run_id: "run-1",
     });
+  });
+});
+
+describe("datasetExportArchiveUrl", () => {
+  it("builds the same-origin archive download path and escapes IDs", () => {
+    expect(datasetExportArchiveUrl("project/one", "export two")).toBe(
+      "/v1/projects/project%2Fone/dataset_exports/export%20two/archive",
+    );
   });
 });

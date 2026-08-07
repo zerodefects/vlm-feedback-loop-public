@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from conftest import make_settings
 from vlm_feedback_loop.services.image_transport import (
     prepare_images,
     read_and_normalize,
@@ -140,6 +141,19 @@ class TestReadAndNormalize:
         with pytest.raises(ValueError, match="Cannot open image"):
             read_and_normalize(str(bad))
 
+    def test_denies_image_outside_current_root(self, tmp_path):
+        image_root = tmp_path / "allowed"
+        image_root.mkdir()
+        outside = tmp_path / "outside.png"
+        Image.new("RGB", (10, 10)).save(outside)
+        settings = make_settings(
+            tmp_path / "workspace",
+            IMAGE_ROOT=str(image_root),
+        )
+
+        with pytest.raises(PermissionError, match="outside IMAGE_ROOT"):
+            read_and_normalize(str(outside), settings=settings)
+
 
 # ── to_base64_data_url ─────────────────────────────────────────────────────
 
@@ -172,6 +186,22 @@ class TestPrepareImages:
         assert img.format_transmitted == "image/png"
         assert img.content_part["type"] == "image_url"
         assert img.content_part["image_url"]["url"].startswith("data:image/png;base64,")
+
+    @pytest.mark.asyncio
+    async def test_policy_denial_aborts_required_image_batch(self, tmp_path):
+        image_root = tmp_path / "allowed"
+        image_root.mkdir()
+        outside = tmp_path / "outside.png"
+        Image.new("RGB", (10, 10)).save(outside)
+        settings = make_settings(
+            tmp_path / "workspace",
+            IMAGE_ROOT=str(image_root),
+        )
+
+        result = await prepare_images([str(outside)], settings=settings)
+
+        assert result.success is False
+        assert "outside IMAGE_ROOT" in (result.images[0].error or "")
 
     @pytest.mark.asyncio
     async def test_large_image_still_inline(self, large_png_path):
@@ -229,9 +259,13 @@ class TestPrepareImages:
         seen: list[int] = []
         real = image_transport.read_and_normalize
 
-        def spy(storage_ref, max_longest_edge=None):
+        def spy(storage_ref, max_longest_edge=None, *, settings=None):
             seen.append(threading.get_ident())
-            return real(storage_ref, max_longest_edge=max_longest_edge)
+            return real(
+                storage_ref,
+                max_longest_edge=max_longest_edge,
+                settings=settings,
+            )
 
         monkeypatch.setattr(image_transport, "read_and_normalize", spy)
 

@@ -44,6 +44,7 @@ class _MockState:
             "gesture": "rock",
         }
         self.embedding_dim: int = 2048
+        self.chat_requests: list[dict[str, Any]] = []
         self.embeddings_requests: list[dict[str, Any]] = []
 
 
@@ -64,6 +65,13 @@ def _make_handler(state: _MockState) -> type[BaseHTTPRequestHandler]:
             except json.JSONDecodeError:
                 payload = None
             if self.path.startswith("/v1/chat/completions"):
+                state.chat_requests.append(
+                    {
+                        "path": self.path,
+                        "headers": dict(self.headers.items()),
+                        "body": payload,
+                    }
+                )
                 # Echo back a deterministic schema-valid label JSON — the
                 # closing-smoke's handoff re-execution round-trip consumes this.
                 content = json.dumps(state.label_payload)
@@ -194,6 +202,11 @@ class MockNIMServer:
     def set_embedding_dim(self, dim: int) -> None:
         """Override the /v1/embeddings vector dimension (default 2048)."""
         self._state.embedding_dim = dim
+
+    @property
+    def chat_requests(self) -> list[dict[str, Any]]:
+        """Captured /v1/chat/completions requests."""
+        return list(self._state.chat_requests)
 
     @property
     def embeddings_requests(self) -> list[dict[str, Any]]:

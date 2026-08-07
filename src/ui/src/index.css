@@ -284,6 +284,16 @@ html {
   height: 14px;
 }
 
+/* Tailwind's native form reset paints a transparent focus ring after the
+   generic .glass-input:focus rule. Restore an unmistakable keyboard-focus
+   outline for the compact choice controls after that reset. */
+.glass-input[type="checkbox"]:focus-visible,
+.glass-input[type="radio"]:focus-visible {
+  outline: 2px solid var(--accent-green);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+
 /* Native <select> chrome: replace the OS caret with a Blueprint-themed
    chevron so the control reads as Blueprint-native inside a glass card.
    The SVG is inlined (no extra HTTP request) and coloured via

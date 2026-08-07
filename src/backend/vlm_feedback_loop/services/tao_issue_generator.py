@@ -26,7 +26,7 @@ from vlm_feedback_loop.db.models.tao_job import TAOJob
 from vlm_feedback_loop.services.action_requests import register_generator
 from vlm_feedback_loop.services.project_service import get_project_engine
 from vlm_feedback_loop.services.tao_job_service import (
-    extract_actionable_failure_from_logs,
+    effective_tao_job_error_ref,
 )
 
 
@@ -171,18 +171,6 @@ def _generate_tao_issue(
                 )
 
                 dataset_export_ids = [str(x) for x in job.dataset_export_ids]
-                error_ref = job.error_ref
-                logs_text = (job.outputs or {}).get("tao_logs_text")
-                actionable_error = extract_actionable_failure_from_logs(
-                    logs_text if isinstance(logs_text, str) else None
-                )
-                if actionable_error and (
-                    not error_ref
-                    or error_ref.strip().lower()
-                    == f"{job.action} action failed for cosmos-rl"
-                ):
-                    error_ref = actionable_error
-
                 job_fields = {
                     "tao_external_job_id": job.tao_external_job_id,
                     "action": job.action,
@@ -190,7 +178,7 @@ def _generate_tao_issue(
                     "training_preset": job_config.get("training_preset"),
                     "training_policy_type": job.training_policy_type,
                     "status": job.status,
-                    "error_ref": error_ref,
+                    "error_ref": effective_tao_job_error_ref(job),
                     "epoch": epoch,
                     "dataset_export_ids": dataset_export_ids,
                     "tao_release_version": job_config.get("tao_release_version"),

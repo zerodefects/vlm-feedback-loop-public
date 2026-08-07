@@ -13,6 +13,8 @@ By default the command:
 * requires a clean source checkout;
 * verifies every tracked top-level path is classified;
 * removes private evidence and private agent configuration;
+* strips source-host authority, dataset, and companion-checkout assumptions
+  from the public agent-instruction twins;
 * excludes the optional AutoRun operator feature and its dedicated tests;
 * runs public-readiness checks before changing the destination; and
 * refuses to write into a non-empty destination.
@@ -91,9 +93,12 @@ PRIVATE_TOP_LEVEL: Final = frozenset({".claude", ".codex"})
 EXCLUDED_PATHS: Final = (
     PurePosixPath(".claude"),
     PurePosixPath(".codex"),
+    PurePosixPath("docs/live-release-acceptance.md"),
     PurePosixPath("docs/internal"),
     PurePosixPath("docs/fixtures/pinned"),
+    PurePosixPath("scripts/prepare_training_clone.py"),
     PurePosixPath("scripts/research"),
+    PurePosixPath("tests/unit/test_prepare_training_clone.py"),
 )
 AUTORUN_EXCLUDED_PATHS: Final = (
     PurePosixPath("src/backend/vlm_feedback_loop/cli_autorun.py"),
@@ -112,14 +117,19 @@ AUTORUN_EXCLUDED_PATHS: Final = (
 )
 AUTORUN_BLOCK_START: Final = "<!-- public-export:exclude-autorun:start -->"
 AUTORUN_BLOCK_END: Final = "<!-- public-export:exclude-autorun:end -->"
+SOURCE_ONLY_BLOCK_START: Final = "<!-- public-export:exclude-source-only:start -->"
+SOURCE_ONLY_BLOCK_END: Final = "<!-- public-export:exclude-source-only:end -->"
 AUTORUN_CONDITIONAL_TEXT_PATHS: Final = (
     PurePosixPath("AGENTS.md"),
     PurePosixPath("CLAUDE.md"),
     PurePosixPath("README.md"),
-    PurePosixPath("docs/AdvancedTests.md"),
     PurePosixPath("docs/Engineering_Spec.md"),
     PurePosixPath("docs/Engineering_Spec_Brief.md"),
     PurePosixPath("docs/Overview.md"),
+)
+SOURCE_ONLY_TEXT_PATHS: Final = (
+    PurePosixPath("AGENTS.md"),
+    PurePosixPath("CLAUDE.md"),
 )
 
 
@@ -281,6 +291,28 @@ def process_autorun_documentation(
         target.write_text(text, encoding="utf-8")
 
 
+def remove_source_only_documentation(snapshot_root: Path) -> None:
+    """Remove private-machine contributor instructions from public twins."""
+
+    for relative in SOURCE_ONLY_TEXT_PATHS:
+        target = snapshot_root.joinpath(*relative.parts)
+        if not target.is_file():
+            continue
+        text = target.read_text(encoding="utf-8")
+        start_count = text.count(SOURCE_ONLY_BLOCK_START)
+        end_count = text.count(SOURCE_ONLY_BLOCK_END)
+        if start_count != end_count:
+            raise ExportError(
+                f"Unbalanced source-only export markers in {relative.as_posix()}"
+            )
+        pattern = re.compile(
+            rf"\n?{re.escape(SOURCE_ONLY_BLOCK_START)}.*?"
+            rf"{re.escape(SOURCE_ONLY_BLOCK_END)}\n?",
+            flags=re.DOTALL,
+        )
+        target.write_text(pattern.sub("\n", text), encoding="utf-8")
+
+
 def _is_excluded_from_readiness_scan(relative: PurePosixPath) -> bool:
     return relative == SCRIPT_RELATIVE_PATH
 
@@ -425,6 +457,28 @@ def find_readiness_issues(snapshot_root: Path) -> list[ReadinessIssue]:
             code=code,
             pattern=pattern,
             message=message,
+        )
+        if issue is not None:
+            issues.append(issue)
+
+    source_only_agent_pattern = re.compile(
+        r"Full sudo on this machine|Unrestricted filesystem access"
+        r"|~/vlm-ui-inspector|~/Retail-Agentic-Commerce"
+        r"|developer-machine resources|public-export:exclude-source-only"
+    )
+    for relative in SOURCE_ONLY_TEXT_PATHS:
+        path = snapshot_root.joinpath(*relative.parts)
+        if not path.is_file():
+            continue
+        issue = _first_pattern_issue(
+            relative,
+            path.read_text(encoding="utf-8"),
+            code="source-only-agent-instructions",
+            pattern=source_only_agent_pattern,
+            message=(
+                "public agent instructions must not assume private machine "
+                "authority, datasets, or companion checkouts"
+            ),
         )
         if issue is not None:
             issues.append(issue)
@@ -610,6 +664,7 @@ def build_snapshot(
         snapshot_root,
         exclude_autorun=exclude_autorun,
     )
+    remove_source_only_documentation(snapshot_root)
     return snapshot_root
 
 
@@ -705,7 +760,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"Candidate: {stats.file_count} files, {_format_size(stats.byte_count)}"
             )
-            excluded = ", ".join(f"{path.as_posix()}/**" for path in EXCLUDED_PATHS)
+            excluded = ", ".join(path.as_posix() for path in EXCLUDED_PATHS)
             print(f"Excluded: {excluded}")
             print(
                 "AutoRun: "

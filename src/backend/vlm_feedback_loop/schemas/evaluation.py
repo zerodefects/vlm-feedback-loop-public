@@ -19,10 +19,9 @@ class EvaluationRunCreateRequest(BaseModel):
 
     icl_mode: Literal["enabled", "disabled"] = "enabled"
     structured_generation_mode: Literal["auto", "prompt_only"] | None = None
-    # Diagnostic per-run override for the project's ICL_MAX_EXAMPLES setting.
-    # When None, falls back to settings.ICL_MAX_EXAMPLES. Runtime-only:
-    # carried through start_evaluation_run -> _execute_evaluation -> run_config
-    # as a memory-only kwarg, NOT persisted on RunRecord (no migration).
+    # Diagnostic per-run override for the deployment's ICL_MAX_EXAMPLES
+    # setting. The effective value is persisted in runtime_config_snapshot so
+    # delayed execution cannot observe a later process-config change.
     icl_max_examples: int | None = Field(default=None, ge=1)
     # Diagnostic per-run override that restricts the ICL candidate POOL (not
     # the injected K) to the first ``icl_candidate_limit`` Edits in stable
@@ -32,8 +31,7 @@ class EvaluationRunCreateRequest(BaseModel):
     # of those p are injected. When None (default), the full candidate pool is
     # used. Applied UPSTREAM of selection in
     # _invoke_for_evaluation (first-N by ``Label.labeled_at`` ascending).
-    # Runtime-only: carried through start_evaluation_run -> _execute_evaluation
-    # -> run_config as a memory-only kwarg, NOT persisted on RunRecord.
+    # Persisted in runtime_config_snapshot with the other semantic controls.
     icl_candidate_limit: int | None = Field(default=None, ge=1)
     # Diagnostic per-run override for the provider-aware eval concurrency
     # (EVAL_CONCURRENCY_HOSTED / EVAL_CONCURRENCY_SELF_HOSTED). The provider-
@@ -49,12 +47,10 @@ class EvaluationRunCreateRequest(BaseModel):
     # at the first failure, always keep >=1, then cap at icl_max_examples.
     # Large effective K when the pool has many close same-class neighbors,
     # small when it doesn't. None/None (default) = the deployment defaults
-    # (settings ICL_SIM_GAP / ICL_ABS_THRESHOLD). Runtime-only: threaded
-    # through start_evaluation_run -> _execute_evaluation -> run_config ->
-    # invoke_teacher -> select_icl_examples, NOT persisted on RunRecord (no
-    # migration). The effective per-query K is recorded as
-    # ``icl_images_attached_count`` on each OperationRecord, so the sweep
-    # harness can aggregate avg-K from there.
+    # (settings ICL_SIM_GAP / ICL_ABS_THRESHOLD). The effective controls are
+    # persisted in runtime_config_snapshot. The effective per-query K is
+    # recorded as ``icl_images_attached_count`` on each OperationRecord, so the
+    # sweep harness can aggregate avg-K from there.
     icl_sim_gap: float | None = Field(default=None, ge=0.0)
     icl_abs_threshold: float | None = Field(default=None, ge=-1.0, le=1.0)
     # Diagnostic per-run override for the generation preset (Output Stability:
@@ -62,14 +58,14 @@ class EvaluationRunCreateRequest(BaseModel):
     # project's labeling_generation_preset_key. Validated against
     # settings.LABELING_PRESETS in start_evaluation_run (the preset set is
     # operator-configurable, so this is a str, not a Literal). Unlike the other
-    # diagnostic fields this one IS snapshotted onto the RunRecord so the audit
-    # trail reflects the effective preset.
+    # diagnostic controls, the key also has a dedicated RunRecord column so
+    # the audit trail and configuration-change trigger expose it directly.
     generation_preset_key: str | None = None
     # Diagnostic per-run override for the Thinking toggle. When None, the
     # run inherits the project default (thinking_default_on). Like
-    # generation_preset_key (and unlike the runtime-only fields above), this IS
-    # snapshotted onto RunRecord.thinking_mode_effective so the audit trail and
-    # the config-change trigger reflect the effective mode. Models whose
+    # generation_preset_key, this also has a dedicated
+    # RunRecord.thinking_mode_effective column so the audit trail and the
+    # config-change trigger expose it directly. Models whose
     # thinking_toggle_mode is "none"/"always_on_reasoning" ignore it at resolve
     # time (prompt_service.resolve_thinking_fields no-ops) — safe to pass.
     thinking_on: bool | None = None

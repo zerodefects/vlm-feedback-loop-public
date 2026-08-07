@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Operation Records persisted during the evaluation canceling window
-must be marked ``ignored_due_to_run_cancellation=True``.
+"""Cancellation preserves the authority boundary on Operation Records.
 
 The cancellation flow is two-phase:
   1. Run transitions to ``canceling``; new per-example dispatches stop.
@@ -10,9 +9,9 @@ The cancellation flow is two-phase:
      will complete and persist their Operation Records *during* the
      canceling window — the run is canceled but the records are real.
 
-The spec says these records MUST NOT contribute to authoritative
-metrics, but MAY be retained for audit. The implementation flags them
-on transition to ``canceled`` via ``_finalize_canceled``.
+The outcome transaction marks only late results ignored. The run finalizer
+must preserve that classification instead of bulk-reclassifying earlier
+authoritative evidence.
 
 A regression that loses the ``ignored_*`` flag would silently corrupt
 the next evaluation's diff against this run, because canceled records
@@ -100,16 +99,14 @@ def _add_op_record(
 
 
 class TestIgnoredDueToRunCancellation:
-    """``_finalize_canceled`` must flag late-completing OperationRecords."""
+    """``_finalize_canceled`` preserves outcome-time authority decisions."""
 
     @pytest.mark.asyncio
-    async def test_records_inflight_during_cancel_get_flagged(self, tmp_path):
+    async def test_finalizer_preserves_the_operation_authority_boundary(self, tmp_path):
         engine, _ = _setup_project(tmp_path)
         rid = _add_run(engine, status="canceling")
-        # Two records that completed during the canceling window —
-        # neither was flagged at insert time.
-        inv_a = _add_op_record(engine, evaluation_run_id=rid, ignored=False)
-        inv_b = _add_op_record(engine, evaluation_run_id=rid, ignored=False)
+        pre_cancel = _add_op_record(engine, evaluation_run_id=rid, ignored=False)
+        crossing_cancel = _add_op_record(engine, evaluation_run_id=rid, ignored=True)
 
         await _finalize_canceled(engine, PID, rid)
 
@@ -122,16 +119,15 @@ class TestIgnoredDueToRunCancellation:
             )
         assert run.status == "canceled"
         assert run.completed_at is not None
-        # Both late-completing records are now marked non-authoritative.
-        assert all(r.ignored_due_to_run_cancellation for r in recs)
-        flagged = {r.inference_invocation_id for r in recs}
-        assert {inv_a, inv_b}.issubset(flagged)
+        authority = {
+            row.inference_invocation_id: row.ignored_due_to_run_cancellation
+            for row in recs
+        }
+        assert authority == {pre_cancel: False, crossing_cancel: True}
 
     @pytest.mark.asyncio
     async def test_already_flagged_records_are_idempotent(self, tmp_path):
-        # Pre-flagged records aren't re-touched (the .is_(False) filter
-        # in the bulk update means the second cancel pass is a no-op,
-        # which keeps repeated cancels safe).
+        # Finalization preserves the outcome-time marker across replay.
         engine, _ = _setup_project(tmp_path)
         rid = _add_run(engine, status="canceling")
         already_flagged = _add_op_record(engine, evaluation_run_id=rid, ignored=True)

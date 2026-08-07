@@ -18,9 +18,8 @@ For each model in ``SEEDED_MODELS`` below:
    models, sends the same prompt plus a 512×512 RGB PNG probe image;
    asserts HTTP 200.
 
-Then runs the three capability probes against ``nvidia/cosmos-reason2-8b``
-and ``nvidia/cosmos-reason2-2b`` (the user's primary target) and reports
-resolved capability status.
+Then runs the three capability probes against every hosted-compatible seeded
+Teacher and compares the observed statuses with the canonical seed catalog.
 
 Exit 0 on all-green. Exit 1 on any failure. The script prints a concise
 one-line summary per model plus a final verdict line.
@@ -43,6 +42,12 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "src" / "backend"))
 
+from vlm_feedback_loop.model_catalog_constants import (  # noqa: E402
+    MISTRAL_MEDIUM_3_5,
+    NEMOTRON_3_NANO_OMNI_REASONING,
+    NEMOTRON_NANO_12B_VL,
+    STEP_3_7_FLASH,
+)
 from vlm_feedback_loop.services import nim_client  # noqa: E402
 from vlm_feedback_loop.services.model_config_service import (  # noqa: E402
     generate_probe_image_data_url,
@@ -55,7 +60,10 @@ from vlm_feedback_loop.services.project_service import (  # noqa: E402
 )
 
 HOSTED_BASE_URL = "https://integrate.api.nvidia.com/v1"
-DEADLINE_S = 60.0
+# Hosted cold latency has exceeded 60 seconds for the Mistral alternates.
+# Match the product's interactive deadline so reachability is not mislabeled
+# solely because the smoke carried a tighter undocumented timeout.
+DEADLINE_S = 180.0
 
 
 @dataclass
@@ -68,6 +76,9 @@ class SeededModel:
     visual_budget_mode: (
         str  # none | mm_processor_size | mm_processor_tiles | mm_processor_pixels
     )
+    structured_generation_support: str
+    thinking_toggle_support: str
+    visual_budget_support: str
 
 
 # Which catalog models this smoke covers (a smoke-scope decision); the
@@ -75,12 +86,10 @@ class SeededModel:
 # ``services/project_service.py::SEEDED_MODEL_CATALOG`` so they can never
 # drift from the backend.
 _COVERED_MODEL_NAMES = (
-    "nvidia/cosmos-reason2-8b",
-    "nvidia/cosmos-reason2-2b",
-    "minimaxai/minimax-m3",
-    "stepfun-ai/step-3.7-flash",
-    "mistralai/mistral-large-3-675b-instruct-2512",
-    "nvidia/nemotron-nano-12b-v2-vl",
+    MISTRAL_MEDIUM_3_5,
+    STEP_3_7_FLASH,
+    NEMOTRON_NANO_12B_VL,
+    NEMOTRON_3_NANO_OMNI_REASONING,
 )
 _CATALOG_BY_NAME = {entry["model_name"]: entry for entry in SEEDED_MODEL_CATALOG}
 _MISSING_FROM_CATALOG = [
@@ -97,6 +106,11 @@ SEEDED_MODELS: list[SeededModel] = [
         supports_image_input=bool(_CATALOG_BY_NAME[name]["supports_image_input"]),
         thinking_toggle_mode=str(_CATALOG_BY_NAME[name]["thinking_toggle_mode"]),
         visual_budget_mode=str(_CATALOG_BY_NAME[name]["visual_budget_mode"]),
+        structured_generation_support=str(
+            _CATALOG_BY_NAME[name]["structured_generation_support"]
+        ),
+        thinking_toggle_support=str(_CATALOG_BY_NAME[name]["thinking_toggle_support"]),
+        visual_budget_support=str(_CATALOG_BY_NAME[name]["visual_budget_support"]),
     )
     for name in _COVERED_MODEL_NAMES
 ]
@@ -194,31 +208,30 @@ async def probe_image(model: str, auth_headers: dict[str, str]) -> tuple[bool, s
     return False, f"empty content; finish={result.finish_reason}"
 
 
-async def run_cosmos_capability_probes(
-    model: str,
+async def run_capability_probes(
+    seeded_model: SeededModel,
     auth_headers: dict[str, str],
-    thinking_mode: str,
-    visual_mode: str,
 ) -> dict[str, str]:
-    """Runs the three capability probes against a Cosmos Reason2 model."""
+    """Run the three standard probes against one hosted seeded Teacher."""
     structured = await probe_structured_generation(
         base_url=HOSTED_BASE_URL,
         auth_headers=auth_headers,
-        model_name=model,
+        model_name=seeded_model.name,
         deadline_s=DEADLINE_S,
+        thinking_toggle_mode=seeded_model.thinking_toggle_mode,
     )
     thinking = await probe_thinking_toggle(
         base_url=HOSTED_BASE_URL,
         auth_headers=auth_headers,
-        model_name=model,
-        thinking_toggle_mode=thinking_mode,
+        model_name=seeded_model.name,
+        thinking_toggle_mode=seeded_model.thinking_toggle_mode,
         deadline_s=DEADLINE_S,
     )
     visual = await probe_visual_budget(
         base_url=HOSTED_BASE_URL,
         auth_headers=auth_headers,
-        model_name=model,
-        visual_budget_mode=visual_mode,
+        model_name=seeded_model.name,
+        visual_budget_mode=seeded_model.visual_budget_mode,
         deadline_s=DEADLINE_S,
     )
     return {
@@ -277,40 +290,42 @@ async def main() -> int:
         print(line)
         results.append((m.name, (listed and text_ok and image_ok), text_summary))
 
-    # Capability probes — Cosmos Reason2 only (user's primary target).
-    print("\nCapability probes — Cosmos Reason2 (primary target):")
+    # Capability probes — every hosted-compatible seeded Teacher. A provider
+    # change is a release-relevant catalog drift, so compare each result with
+    # the backend's canonical seed rather than merely printing it.
+    print("\nCapability probes — hosted seeded Teachers:")
+    capability_results: list[tuple[str, bool]] = []
     for m in SEEDED_MODELS:
-        if not m.name.startswith("nvidia/cosmos-reason2-"):
-            continue
-        caps = await run_cosmos_capability_probes(
-            m.name, auth_headers, m.thinking_toggle_mode, m.visual_budget_mode
-        )
+        caps = await run_capability_probes(m, auth_headers)
+        expected = {
+            "structured_generation": m.structured_generation_support,
+            "thinking_toggle": m.thinking_toggle_support,
+            "visual_budget": m.visual_budget_support,
+        }
+        matches = caps == expected
+        capability_results.append((m.name, matches))
         print(
-            f"  {m.name}: structured={caps['structured_generation']} "
+            f"  {'✓' if matches else '✗'} {m.name}: "
+            f"structured={caps['structured_generation']} "
             f"thinking={caps['thinking_toggle']} "
-            f"visual_budget={caps['visual_budget']}"
+            f"visual_budget={caps['visual_budget']} expected={expected}"
         )
 
     # Final verdict.
     print()
     green = sum(1 for _, ok, _ in results if ok)
     total = len(results)
-    cosmos_ok = all(
-        ok for name, ok, _ in results if name.startswith("nvidia/cosmos-reason2-")
-    )
-    if green == total:
-        print(f"✓ ALL GREEN — {green}/{total} models reachable.")
+    caps_green = sum(1 for _, ok in capability_results if ok)
+    if green == total and caps_green == total:
+        print(
+            f"✓ ALL GREEN — {green}/{total} models reachable; "
+            f"{caps_green}/{total} capability snapshots match."
+        )
         return 0
-    if cosmos_ok:
-        print(
-            f"⚠ Cosmos Reason2 2B+8B OK, but {total - green}/{total} other model(s) failed. "
-            "Cosmos is the primary target — non-zero exit to flag the partial miss."
-        )
-    else:
-        print(
-            f"✗ Cosmos Reason2 FAILURE — {green}/{total} total green; "
-            "investigate before declaring the fix complete."
-        )
+    print(
+        f"✗ HOSTED SEED FAILURE — reachable={green}/{total}; "
+        f"capability snapshots={caps_green}/{total}."
+    )
     return 1
 
 

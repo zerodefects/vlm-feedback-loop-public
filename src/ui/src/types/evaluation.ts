@@ -42,6 +42,47 @@ export interface EvaluationMetrics {
   overall: MetricsBucket;
   returning: MetricsBucket | null;
   new: MetricsBucket | null;
+  benchmarks?: ServingBenchmarkResult[];
+  benchmark_workload?: ServingBenchmarkWorkload;
+}
+
+export interface ServingBenchmarkResult {
+  concurrency: number;
+  status?: "passed" | "failed";
+  latency_p50_ms: number | null;
+  latency_p90_ms: number | null;
+  latency_p99_ms: number | null;
+  request_throughput_rps?: number | null;
+  attempted_request_count?: number;
+  successful_request_count?: number;
+  failed_request_count?: number;
+  failure_rate?: number | null;
+  input_tokens_mean?: number | null;
+  output_tokens_mean?: number | null;
+  driver?: string;
+  driver_version?: string;
+  failure_reason?: string | null;
+}
+
+export interface ServingBenchmarkWorkload {
+  version?: string;
+  workload_hash?: string;
+  pool_id?: string;
+  pool_member_count?: number;
+  selected_count?: number;
+  selection_policy?: string;
+  guidance_id?: string;
+  guidance_schema_hash?: string;
+  prompt_hash?: string | null;
+  inference_contract?: Record<string, unknown>;
+  visual_budget_params?: Record<string, unknown>;
+  output_limit_mode?: string;
+  kv_cache_reuse?: string;
+  driver?: { name?: string; version?: string };
+  tokenizer?: string;
+  application_version?: string;
+  code_revision?: string | null;
+  created_at?: string;
 }
 
 export interface MetricsBucket {
@@ -87,7 +128,7 @@ export interface EvaluationRunCreateResponse {
 
 // ── Trigger Status ─────────────────────────────────────────────────────────
 
-export interface TriggerInfo {
+interface TriggerInfo {
   is_active: boolean;
   dismissed: boolean;
   message: string;
