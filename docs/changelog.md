@@ -1,5 +1,9 @@
 # Changelog
 
+- 2026-08-07: The README's opening project-loop image is now cropped to
+  the focused first-run card, renamed `project-loop.png`, and the superseded
+  first-run guidance screenshot has been removed.
+
 - 2026-08-07: NVIDIA API-key setup now recognizes a hosted `429 Too Many
   Requests` response as proof that the bearer cleared authentication instead
   of falsely rejecting a fresh key. Invalid keys still fail on `401`/`403`;
