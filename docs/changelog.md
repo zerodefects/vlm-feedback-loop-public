@@ -1,5 +1,9 @@
 # Changelog
 
+- 2026-08-07: The README now opens with the first-run Projects screen and its
+  Propose, Review, Refine, Optimize, and Deploy loop, giving new users the
+  Blueprint's workflow before setup details.
+
 - 2026-08-07: The curated independent public export now omits the
   NVIDIA-organization-only SonarQube delegate. GitHub resolves a private
   reusable workflow before evaluating its job-level repository-owner guard,

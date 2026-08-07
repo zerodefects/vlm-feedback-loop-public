@@ -8,7 +8,7 @@ Build an image-labeling workflow in which expert corrections improve the next
 Vision Language Model (VLM) request immediately, then measure when the workflow
 is ready for batch labeling and optional Student-model training.
 
-![Interactive VLM Feedback Loop labeling workflow](docs/images/ftue-rps-guidance.png)
+![Interactive VLM Feedback Loop first-run project screen](docs/images/ftue-project-loop.png)
 
 This repository is an open reference application that integrates NVIDIA NIM,
 NVIDIA NeMo Retriever, and NVIDIA TAO. It includes a working web UI, API,
